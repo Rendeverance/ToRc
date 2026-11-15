@@ -70,7 +70,7 @@ Qwen3.6-35B-A3B Q4_0, a 4k-token prompt and a 128-token reply, in tokens a secon
 | Two Snapdragon X mini PCs (32 GB each) over USB4, CPU + NPU + GPU | 406 | 49 |
 | One of them, CPU + NPU + GPU | 262 | 49 |
 | Desktop, i5-12600K, CPU only | 182 | 41 |
-| The same desktop, llama.cpp b12360 at its best thread count | 107 | 20 |
+| The same desktop, llama.cpp b12360 at its best thread count | 107 | 21 |
 
 **Bigger than memory: Qwen3.8 Flash Next, a 107 GB file, on the same two boxes with 64 GB of RAM between them, the
 experts that don't fit read from the SSDs as they are needed. About 66 tokens a second reading a 16k-token prompt and
