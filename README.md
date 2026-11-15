@@ -2,6 +2,8 @@
 
 # ToRc
 
+[![CI](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml/badge.svg)](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml)
+
 *By Rendeverance.*
 
 ToRc started by accident. I had two base Snapdragon X mini PCs left over after some testing on Windows on ARM, and I
