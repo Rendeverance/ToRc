@@ -1,0 +1,56 @@
+name: Release
+
+# A tag such as v0.1.0 builds the portable zip on each of the four machines and attaches them to a draft release.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  zip:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, platform: windows-x64 }
+          - { os: windows-11-arm, platform: windows-arm64 }
+          - { os: ubuntu-22.04, platform: linux-x64 }
+          - { os: ubuntu-22.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: WebKitGTK for the app
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+      - name: The engine, with the GPU tier
+        run: cargo build --profile dist --workspace --features torc-model/gpu
+      - name: The app
+        run: cargo build --release --manifest-path desktop/Cargo.toml
+      - name: The zip
+        shell: bash
+        run: |
+          ext=; [[ $RUNNER_OS == Windows ]] && ext=.exe
+          PY=$([[ $RUNNER_OS == Windows ]] && echo python || echo python3) \
+            bash desktop/package/pack.sh dist ${{ matrix.platform }} desktop/target/release/torc-desktop$ext \
+            target/dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ToRc-${{ matrix.platform }}
+          path: dist/*.zip
+
+  release:
+    needs: zip
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: A draft release with the four zips
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --draft --title "ToRc $GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"

@@ -1,0 +1,68 @@
+{
+  "about": "torc-golden's entries: model file (in the models folder given), prompt (in tools/), positions, prompt block (0: token by token), and each CPU family's BLAKE3 of the logits. See model/src/bin/dev/torc-golden.rs.",
+  "entries": [
+    {
+      "name": "qwen3.6-35b tokens",
+      "file": "qwen3.6-35b-a3b-q4_0.torc",
+      "prompt": "bench/lb_alice.txt",
+      "n": 48,
+      "block": 0,
+      "hash": {
+        "x86_64": "7290067e70fdc60d53b84227894a06d01c9494526adbd8743cd2c91a5132d1d9"
+      }
+    },
+    {
+      "name": "qwen3.6-35b blocks",
+      "file": "qwen3.6-35b-a3b-q4_0.torc",
+      "prompt": "bench/lb_alice.txt",
+      "n": 512,
+      "block": 64,
+      "hash": {
+        "x86_64": "09d197e420e3e377429ff8996cbc0be22632d1c66912d7f1e8d2ec0b8e2947ac"
+      }
+    },
+    {
+      "name": "qwen3-30b tokens",
+      "file": "qwen3-30b-a3b-instruct-2507-q4_0.torc",
+      "prompt": "bench/lb_alice.txt",
+      "n": 48,
+      "block": 0
+    },
+    {
+      "name": "qwen3-30b blocks",
+      "file": "qwen3-30b-a3b-instruct-2507-q4_0.torc",
+      "prompt": "bench/lb_alice.txt",
+      "n": 512,
+      "block": 64
+    },
+    {
+      "name": "gemma-4-26b tokens",
+      "file": "gemma-4-26b-a4b-qat-q4_0.torc",
+      "prompt": "bench/lb_alice.txt",
+      "n": 48,
+      "block": 0,
+      "gemma": true,
+      "hash": {
+        "x86_64": "fb7f262d25f84d05abc7850551c2c3278d2f75a74f735d818dd72f137d61e61d"
+      }
+    },
+    {
+      "name": "gemma-4-26b blocks",
+      "file": "gemma-4-26b-a4b-qat-q4_0.torc",
+      "prompt": "bench/lb_alice.txt",
+      "n": 512,
+      "block": 64,
+      "gemma": true,
+      "hash": {
+        "x86_64": "a768b4707da3036cf18737c3df50934695b10caf64ec7a9ca7347e0bb45743c1"
+      }
+    },
+    {
+      "name": "flash-next tokens",
+      "file": "qwen3.8-flash-next-iq4nl.torc",
+      "prompt": "bench/lb_alice.txt",
+      "n": 12,
+      "block": 0
+    }
+  ]
+}

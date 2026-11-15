@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ToRc</title>
+<style>
+  :root { --ground:#FFFFFF; --accent:#00AEEF; --line:#E3E6EA; }
+  @media (prefers-color-scheme: dark) { :root { --ground:#000000; --line:#1B2026; } }
+  html, body { margin:0; height:100%; background:var(--ground); overflow:hidden; cursor:default; user-select:none; }
+  body { display:grid; place-items:center; opacity:0; animation:in .5s ease-out .05s forwards; }
+  body.leaving { animation:out .35s ease-in forwards; }
+  @keyframes in { to { opacity:1; } }
+  @keyframes out { from { opacity:1; } to { opacity:0; } }
+  img { width:88%; height:auto; display:block; }
+  .dark { display:none; }
+  @media (prefers-color-scheme: dark) { .light { display:none; } .dark { display:block; } }
+  .bar { position:absolute; left:0; right:0; bottom:0; height:2px; background:var(--line); overflow:hidden; }
+  .bar i { position:absolute; inset:0; width:30%; background:var(--accent); animation:run 1.4s ease-in-out infinite; }
+  @keyframes run { from { transform:translateX(-100%); } to { transform:translateX(340%); } }
+  @media (prefers-reduced-motion: reduce) { * { animation-duration:0s !important; } body { opacity:1; } }
+</style>
+</head>
+<body>
+  <img class="light" src="../assets/splash-light.jpg" alt="ToRc. Big models, small machines">
+  <img class="dark" src="../assets/splash-dark.jpg" alt="ToRc. Big models, small machines">
+  <div class="bar"><i></i></div>
+</body>
+</html>

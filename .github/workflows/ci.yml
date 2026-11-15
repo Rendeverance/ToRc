@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Formatting (rustfmt.toml)
+        run: cargo fmt --all -- --check
+      - name: Lints (the few switched off are in Cargo.toml, with the reason)
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Test
+        run: cargo test --release --workspace
+      - name: Build with GPU attention
+        run: cargo build --release -p torc-model --features gpu
+      - name: Check the Windows on ARM build compiles (NEON kernels and the NPU tier)
+        run: |
+          rustup target add aarch64-pc-windows-gnullvm
+          cargo check --release --workspace --target aarch64-pc-windows-gnullvm
+      - name: The desktop app (its own workspace)
+        shell: bash
+        run: |
+          cargo fmt --manifest-path desktop/Cargo.toml -- --check
+          cargo clippy --release --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
+          cargo test --release --manifest-path desktop/Cargo.toml
+      - name: Check the app's page scripts
+        shell: bash
+        run: for f in $(git ls-files 'ui/*.js' 'desktop/*.js'); do node --check "$f" || exit 1; done
+      # rustfmt keeps code to 120 columns but leaves comments alone, so they are checked here (the UI's scripts too)
+      - name: Line width of comments and scripts
+        shell: bash
+        run: |
+          long=$( { git ls-files '*.rs' | xargs awk 'length > 120 && /^[[:space:]]*\/\// {print FILENAME":"FNR}';
+                    git ls-files 'ui/*.js' 'desktop/*.js' | xargs awk 'length > 120 {print FILENAME":"FNR}'; } )
+          [ -z "$long" ] || { echo "lines over 120 columns:"; echo "$long"; exit 1; }
+
+  # Windows on ARM, built on an ARM machine: the desktop app's HTTPS library compiles C, and an x64 machine checking
+  # for ARM has no ARM C headers to compile it with
+  windows-arm:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build, with the GPU tier as the release zips have it
+        run: cargo build --release --workspace --features torc-model/gpu
+      - name: Test
+        run: cargo test --release --workspace
+      - name: The desktop app
+        run: cargo build --release --manifest-path desktop/Cargo.toml
+
+  # Linux has run under WSL2 (README, Roadmap), not yet on bare metal
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build, with the GPU tier as the release zips have it
+        run: cargo build --release --workspace --features torc-model/gpu
+      - name: Test
+        run: cargo test --release --workspace
+      - name: The desktop app (WebKitGTK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+          cargo build --release --manifest-path desktop/Cargo.toml
+          cargo test --release --manifest-path desktop/Cargo.toml
+
+  # The engine's tests again with AddressSanitizer watching every read and write of the unsafe code (the kernels, the
+  # thread pool, the file readers). RUSTFLAGS replaces .cargo/config.toml's flags, so the CPU level is given again.
+  sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Tests under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address -C target-cpu=x86-64-v3
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          cargo test --release --target x86_64-unknown-linux-gnu \
+            -p torc-format -p torc-kernels -p torc-model -p hwscan

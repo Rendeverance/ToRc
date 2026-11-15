@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["hwscan", "format", "kernels", "model"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Rendeverance"]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+debug = 1
+
+# The zips: the release build without its debug info, which on Linux and in a Windows llvm-mingw build sits inside
+# the executables (an MSVC build keeps it in a separate .pdb)
+[profile.dist]
+inherits = "release"
+debug = 0
+strip = "debuginfo"
+
+# The lint check (cargo clippy) runs in CI. These few are switched off on purpose: the kernels and the forward pass
+# index arrays in counted loops because the indices line up lanes, rows and tiles across several arrays at once, and
+# rewriting them as iterators changes the code the compiler makes on the hottest paths; a kernel takes its buffers
+# and shapes as plain arguments rather than a struct made for one call.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+explicit_counter_loop = "allow"
+too_many_arguments = "allow"
+# a type used in one place (a heap of merge candidates, a worker's mark slots, a scratch pool) reads better spelled
+# out where it is used than behind a name made for it; the ones used in more than one place have a name
+type_complexity = "allow"
+# kernel and layer loops read fixed-size blocks with chunks_exact on purpose, the form their hot paths are written and
+# measured in
+chunks_exact_to_as_chunks = "allow"
+# min/max and `!(a < b)` are written as they are for what they do with NaN, which clamp and partial_cmp change
+manual_clamp = "allow"
+neg_cmp_op_on_partial_ord = "allow"

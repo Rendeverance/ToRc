@@ -1,0 +1,4 @@
+# x86-64, Windows or Linux: AVX2, FMA and F16C (x86-64-v3, Haswell and later). The x86 kernels are written for
+# them, and without FMA every f32::mul_add would be a call to a software fmaf.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]

@@ -1,0 +1,78 @@
+[package]
+name = "torc-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The forward pass: block dispatch over a ToRc file"
+
+[lib]
+name = "model"
+
+[dependencies]
+torc-format = { path = "../format" }
+torc-kernels = { path = "../kernels" }
+blake3 = { version = "1", features = ["rayon", "pure"] }
+rayon = "1"
+memmap2 = "0.9"
+serde_json = { version = "1", features = ["preserve_order"] }
+# the opt-in GPU attention tier (gpu.rs): MIT / Apache-2.0
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"], optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true }
+
+[features]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# The developer tools: checks, benchmarks and probes used while working on ToRc (src/bin/dev). The programs for
+# using it are the rest of src/bin.
+[[bin]]
+name = "npubench"
+path = "src/bin/dev/npubench.rs"
+
+[[bin]]
+name = "npucheck"
+path = "src/bin/dev/npucheck.rs"
+
+[[bin]]
+name = "poolbench"
+path = "src/bin/dev/poolbench.rs"
+
+[[bin]]
+name = "readprobe"
+path = "src/bin/dev/readprobe.rs"
+
+[[bin]]
+name = "torc-gemma"
+path = "src/bin/dev/torc-gemma.rs"
+
+[[bin]]
+name = "torc-oss"
+path = "src/bin/dev/torc-oss.rs"
+
+[[bin]]
+name = "torc-golden"
+path = "src/bin/dev/torc-golden.rs"
+
+[[bin]]
+name = "torc-gpubench"
+path = "src/bin/dev/torc-gpubench.rs"
+
+[[bin]]
+name = "torc-kl"
+path = "src/bin/dev/torc-kl.rs"
+
+[[bin]]
+name = "torc-probe"
+path = "src/bin/dev/torc-probe.rs"
+
+[[bin]]
+name = "torc-tok"
+path = "src/bin/dev/torc-tok.rs"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "torc-repeat"
+path = "src/bin/dev/torc-repeat.rs"

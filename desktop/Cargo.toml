@@ -1,0 +1,29 @@
+[package]
+name = "torc-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Rendeverance"]
+description = "The ToRc desktop app: the page in ui/renderer on a Rust shell"
+
+# its own workspace: the engine's doesn't build the app
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde_json = "1"
+# MCP over HTTP, and the downloads of ToolFunnel (npm) and Node (nodejs.org)
+ureq = "2"
+flate2 = "1"
+sha2 = "0.10"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,69 @@
+# Autotuning
+
+Each machine gets the settings measured best on it, for each model, instead of rules picked on mine. `torc-tune`
+measures them once and keeps them; the server reads them at start. An environment variable always wins over a tuned
+value.
+
+## What is tuned
+
+`torc-tune <model> [threads|auto] [ctx]` tunes three settings, in this order, each from the values already chosen:
+
+| Setting | Candidates | Phase it moves |
+|---|---|---|
+| prompt block size | the built-in rule, half and double it, then on by doubling or halving while each step is faster | prompt |
+| work split of the expert products | even (the default) or guided | prompt |
+| threads a reply uses | all of them, or one a core on a part with two threads a core | decode |
+
+The reply threads are tuned apart from the prompt's because the best count for reading a prompt is not the best for
+writing a reply: decode is bound by memory, and a core's second thread only competes for it. On Linux this step is
+skipped for now, since the engine can't see the cores there (README, Running).
+
+One more value is learned by the server rather than by `torc-tune`: with the GPU tier on, the GPU's share of each
+block's attention, measured on the first long prompts and kept in the same file (GUIDE, Making it fast).
+
+Run it with the server's environment (`TORC_NPU`, and `TORC_PIPE` with the worker up for two machines): the result
+is kept per layout, one machine or two, NPU or CPU, since the best block changes with both.
+
+## How a setting is measured
+
+1. **The real model and fixed inputs.** Three fixed texts (prose, code and a story), each read as prompts of 600
+   and 1800 tokens with one decoded token after, through the same code path the server runs. A kernel benchmark
+   does not see the cache, the pool or the memory traffic of the other layers, so it can pick the wrong value.
+2. **Warm only.** The first run of each candidate is discarded.
+3. **Alternating order.** Candidates run A B C, C B A, A B C, so a drift over the session (heat, the cache filling, a
+   background task) falls on both sides equally. The score of a candidate is the median of its runs.
+4. **A margin to move.** A candidate replaces the default only if it is better by more than the run-to-run spread
+   measured on the default itself, by at least 2.5%, and is no slower than the default on any of the texts. Ties
+   keep the default.
+5. **Correctness.** Every candidate's decoded logits are compared with the default's bit for bit on the CPU: none of
+   these settings may change the output, so a difference is a bug, and that candidate is not used. With the NPU on,
+   each prompt must pick the same next token.
+
+## Where results live
+
+`%LOCALAPPDATA%\torc\tune\<machine>\<model>.json` (on Linux `$XDG_CACHE_HOME/torc/tune/...`, else `~/.cache/...`).
+
+- **machine**: a hash of the CPU's identifier, the CPU count and the memory installed. A new CPU or more memory
+  means tuning again; a new engine build does not. The identifier is Windows' (`PROCESSOR_IDENTIFIER`), so on Linux
+  the key is the CPU count and the memory alone for now.
+- **model**: the file's model id, so the same model at another context finds the same result.
+- Each setting is kept with its chosen value, the scores it was chosen on and when, so a run can show why.
+
+## When it runs
+
+`torc-tune <model>`, by hand: a few minutes for a model in RAM. Start the server again afterwards; it reads the file
+once.
+
+## Planned
+
+None of this is built yet:
+
+- More settings: the thread count for the prompt, the packed-product threshold and the prefetch distance on x86,
+  the two-machine layer split, the NPU's smallest block, and the expert cache's budget.
+- The drive, for models bigger than RAM: read size, reads in flight, I/O threads and read order, tuned on the
+  drive the model sits on, with that drive in the key.
+- A second pass over the block and the threads, which interact.
+- Checks around a run: wait for a quiet machine, repeat a candidate whose runs spread too far, and measure the
+  default again at the end to catch throttling.
+- The engine build's kernels in the key, so a kernel change tunes again.
+- A first server start with no tuning file tuning in the background while idle.

@@ -1,0 +1,8 @@
+target/
+*.torc
+target-msvc/
+target-gpu/
+target-*/
+__pycache__/
+node_modules/
+desktop/gen/

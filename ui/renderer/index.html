@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ToRc</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><img class="mark" src="../assets/mark-color.png" alt=""><img class="word light" src="../assets/word-light.png" alt="ToRc"><img class="word dark" src="../assets/word-dark.png" alt="ToRc"><img class="tag light" src="../assets/tag-light.png" alt="Big models, small machines"><img class="tag dark" src="../assets/tag-dark.png" alt="Big models, small machines"></div>
+    <div class="model" id="model"><span class="dot" id="dot"></span><b id="modelName">No model loaded</b><span id="modelNote"></span></div>
+    <button class="btn primary" id="btnLoad">Load a model</button>
+    <span class="spacer"></span>
+    <div class="seg" id="view"><button data-v="chat" class="on">Chat</button><button data-v="terminal">Terminal</button></div>
+    <button class="btn" id="btnPrimers">Primers</button>
+    <button class="btn" id="btnTools">Tools</button>
+    <button class="btn" id="btnSettings">Settings</button>
+  </header>
+
+  <aside class="pane" id="pane"></aside>
+
+  <main class="stage" id="stage">
+    <div class="chat" id="chat"></div>
+    <div class="term" id="term" hidden></div>
+  </main>
+
+  <section class="compose">
+    <div class="ctxbar" id="ctxbar" hidden></div>
+    <div class="asks" id="asks"></div>
+    <div class="files" id="files"></div>
+    <div class="box">
+      <button class="btn" id="btnAttach" title="Attach text files, or drop them on the window">Attach</button>
+      <!-- Roadmap: images. The button is here so the place is kept; the engine reads text only so far -->
+      <button class="btn soon" id="btnImage" title="Images: coming soon" disabled>Image</button>
+      <textarea id="input" rows="1" placeholder="Write a message"></textarea>
+      <button class="btn primary" id="btnSend">Send</button>
+    </div>
+  </section>
+
+  <footer class="strip">
+    <div class="bar" id="bar"><i></i></div>
+    <span id="status">Idle</span>
+    <span class="spacer"></span>
+    <span id="ctxnote" class="num"></span>
+    <span id="speeds" class="num"></span>
+  </footer>
+
+  <div id="sheet"></div>
+  <script src="explain.js"></script>
+  <script src="ui.js"></script>
+  <script src="sampling.js"></script>
+  <script src="chat.js"></script>
+  <script src="pane.js"></script>
+  <script src="load.js"></script>
+  <script src="advanced.js"></script>
+  <script src="settings.js"></script>
+  <script src="tools.js"></script>
+  <script src="primers.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
