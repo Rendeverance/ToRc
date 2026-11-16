@@ -1,0 +1,49 @@
+name: Mac zip
+
+# Run by hand: builds the macos-arm64 zip from a tag's code and adds it to that tag's release (draft or not),
+# with SHA256SUMS brought up to date. For a release whose own Mac build did not run.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag, such as v0.1.1
+        required: true
+
+jobs:
+  mac:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The engine, with the GPU tier if it builds here, else without
+        id: engine
+        run: |
+          if cargo build --profile dist --workspace --features torc-model/gpu; then
+            echo "gpu=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::The GPU tier did not build on macOS; this zip is CPU only"
+            cargo build --profile dist --workspace
+            echo "gpu=no" >> "$GITHUB_OUTPUT"
+          fi
+      - name: The app
+        run: cargo build --release --manifest-path desktop/Cargo.toml
+      - name: The zip
+        run: |
+          tag=${{ inputs.tag }}
+          PY=python3 VERSION=${tag#v} bash desktop/package/pack.sh dist macos-arm64 desktop/target/release/torc-desktop \
+            target/dist .
+      - name: Into the release, with the checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${{ inputs.tag }}
+          gh release upload "$tag" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+          gh release download "$tag" --pattern SHA256SUMS --dir sums --repo "$GITHUB_REPOSITORY"
+          # a rerun replaces the Mac line rather than adding a second one
+          { grep -v macos-arm64 sums/SHA256SUMS || true; (cd dist && shasum -a 256 *.zip); } > sums/new
+          mv sums/new sums/SHA256SUMS
+          gh release upload "$tag" sums/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"

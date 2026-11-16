@@ -16,7 +16,7 @@ jobs:
           - { os: ubuntu-22.04, platform: linux-x64 }
           - { os: ubuntu-22.04-arm, platform: linux-arm64 }
           # experimental: built here but not yet tried on a Mac by us, so a failure must not hold the release back
-          - { os: macos-14, platform: macos-arm64, experimental: true }
+          - { os: macos-15, platform: macos-arm64, experimental: true }
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental == true }}
     steps:
