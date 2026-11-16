@@ -47,12 +47,13 @@ don't fit are read from the SSDs as they are needed.
 | CPU + GPU (Adreno X1-45) | 272 / 49 | 285 / 59 | 307 / 48 | 282 / 45 | 247 / 34 | 191 / 29 |  |
 | CPU + NPU + GPU (Adreno X1-45) | 352 / 51 | 378 / 59 | 406 / 49 | 370 / 50 | 310 / 32 | 229 / 30 | 86.7 / 11.3 |
 
-**Laptop: Ryzen 7 7840HS (8 cores), 32 GB DDR5-5600, RTX 4070 Laptop 8 GB**
+**Laptop: Ryzen 7 7840HS (8 cores), 32 GB DDR5-5600, Radeon 780M (integrated), RTX 4070 Laptop 8 GB**
 
 | | short | 1k | 4k | 8k | 16k | 32k |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | CPU | 169 / 33.9 | 174 / 33.1 | 165 / 34.4 | 148 / 45.1 | 128 / 22.7 | 100 / 16.6 |
 | CPU + GPU (RTX 4070 Laptop) | 173 / 32.3 | 180 / 34.3 | 169 / 35.8 | 154 / 42.5 | 149 / 22.9 | 145 / 17.9 |
+| CPU + GPU (Radeon 780M, integrated) | 174 / 31.9 | 180 / 34.5 | 168 / 38.8 | 164 / 45.6 | 154 / 22.8 | - |
 | llama.cpp (CPU) | 119 / 19.9 | 124 / 19.9 | 122 / 17.9 | 112 / 15.9 | 98.3 / 10.1 | 80.1 / 4.7 |
 
 **Desktop: Core i5-12600K (6P + 4E), 64 GB DDR5-5800, RTX 3060 12 GB**
