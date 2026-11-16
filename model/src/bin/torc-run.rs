@@ -24,6 +24,10 @@ fn main() {
         args.iter().filter(|a| !OPTIONS.iter().any(|o| a.starts_with(o)) && !FLAGS.contains(&a.as_str())).collect();
     // a pipeline or expert worker reads no tokens, so the tokens file may be left out
     let serving = args.iter().any(|a| a.starts_with("serve-pipe=") || a.starts_with("serve-ep="));
+    // a pipeline worker loads ahead only its own layers (pipe::own_layers), so it says so before the model loads
+    if args.iter().any(|a| a.starts_with("serve-pipe=")) {
+        model::pipe::set_worker();
+    }
     let raw = match pos.get(1) {
         Some(p) => std::fs::read(p).unwrap_or_else(|e| {
             eprintln!("cannot read the tokens file {p}: {e}");

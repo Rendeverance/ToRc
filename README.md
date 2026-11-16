@@ -31,7 +31,8 @@ system's WebKitGTK, which most desktops already have (if yours hasn't, on Ubuntu
 1. **Download the zip for your machine from the [Releases page](https://github.com/Rendeverance/ToRc/releases/latest)**
    and unzip it somewhere of your own, such as Documents.
 2. Open ToRc.
-3. Pick a model. A GGUF is converted once, in the app, to ToRc's format.
+3. Pick a model. A GGUF is converted once, in the app, to ToRc's format. GGUFs are on Hugging Face: search for the
+   model's name with "GGUF". Most of the speeds here are Q4_0, so that's a good place to start.
 4. Press Auto-tune once: it measures your machine and keeps the fastest settings.
 5. Load it and talk.
 
@@ -59,10 +60,11 @@ on your hardware.
 | Gemma 4 26B-A4B | `gemma4` | its own template's format |
 | gpt-oss | `gpt-oss` | its own template's format |
 
-Quant types: Q4_0, Q4_1, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4.
+Quant types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4.
 
 Any GGUF of a supported architecture should work, including fine-tunes and abliterated versions, as long as its quant
-types are in the list. The app checks before converting.
+types are in the list. The app checks the architecture before converting; check the quant types yourself for now (the
+model's page on Hugging Face lists them).
 
 ## How fast
 
@@ -102,9 +104,10 @@ with drafts on, more on long prompts.
 - **Expert cache** (`model/src/runtime/ecache_own.rs`): the routed experts of a model bigger than RAM, read from the SSD
   with overlapped I/O, warmed from a per-machine usage profile.
 - **Two boxes** (`model/src/runtime/pipe.rs`): a layer pipeline over USB4, the worker keeping its layers' state, prompts
-  overlapped block by block, the split moved between prompt and reply.
+  overlapped block by block, each machine loading only its own layers.
 - **NPU tier** (`model/src/tiers/npu.rs`, `npu_gemma.rs`): dense projections, the shared expert and the hottest experts
-  of prompt blocks on the Snapdragon NPU, overlapped with the CPU; Gemma 4 whole on the NPU.
+  of prompt blocks on the Snapdragon NPU, overlapped with the CPU; Gemma 4 whole on the NPU. It needs a ggml build with
+  the Hexagon backend, which the GenieX CLI installs (see [GUIDE.md](GUIDE.md)).
 - **GPU tier** (`model/src/tiers/gpu.rs`, the `gpu` feature, `TORC_GPU_ATTN=1`): a long prompt block's attention shared
   between a Vulkan GPU (integrated or discrete, through wgpu) and the CPU at the same time, the split following the
   two sides' measured speeds and kept for the next run. A GPU that turns out to be no gain over the CPU alone is
@@ -211,23 +214,23 @@ picked up from a saved state can differ where the model's choice is a near tie.
 
 Gemma 4 and gpt-oss go through the same server and the same three APIs, with tool calls in each model's own format
 and chats saved by the same rules. Their whole state is the attention cache, so a saved chat can be picked up at any
-point and there is no system-prompt mark. Their replies are greedy, and Gemma 4 always answers without thinking.
+point and there is no system-prompt mark. They sample as every other model does, and Gemma 4 always answers without
+thinking.
 Gemma doesn't save chats on the whole-NPU tier (`TORC_NPU=pure`), where the cache lives on the NPU. Gemma 4's output
 head is requantised to Q4_0 at load, fewer bytes a token than the file's Q6_K, so its logits are not the file's:
 `TORC_HEAD=file` keeps the file's head, `q8_0` takes the middle way.
 
 ## Roadmap
 
-- Sampling for Gemma 4 and gpt-oss. They run on their own engine path, which replies greedily (always the likeliest
-  token) for now; every other model takes temperature, top_p, top_k and the presence and frequency penalties, with
-  each maker's recommended settings by default in the desktop app.
 - Faster writing at long context: the guessed tokens checked against the attention cache together, so each extra
   guess costs as little at 16k as it does at 1k.
 - Linux on bare metal. Linux has been tested under WSL2 (Ubuntu 24.04): it builds, the tests pass, and
   Qwen3.6-35B-A3B chats and tool calls all work through `torc-server`. I haven't tested it on a bare-metal Linux install
   yet. If you can test it for me, please let me know how it goes.
-- macOS on Apple Silicon. If you have a Mac, I'm eager to hear from you: please test it and get in touch. I'd like to
-  get ToRc working on macOS too, and there's no reason the NEON kernels shouldn't work there.
+- macOS on Apple Silicon: EXPERIMENTAL. One person has built it from source and run it. The release may have a
+  macos-arm64 zip built by GitHub, but I don't have a Mac to test it myself. The zip isn't signed, so macOS will block
+  it: after unzipping, run `xattr -dr com.apple.quarantine <the ToRc folder>` in Terminal. If you have a Mac, I'm
+  eager to hear from you: please test it and get in touch.
 - Experts on the GPU. Today the GPU only takes a share of a long prompt's attention.
 - NPU and GPU together carrying the prompt with the CPU nearly free.
 - Running on the NPU and GPU alone (integrated or discrete), leaving the CPU to you, so the machine stays usable

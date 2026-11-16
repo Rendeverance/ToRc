@@ -154,7 +154,7 @@ impl Server {
         let r = self.request(
             "initialize",
             json!({"protocolVersion": PROTOCOL, "capabilities": {},
-                "clientInfo": {"name": "torc", "version": "0.1.0"}}),
+                "clientInfo": {"name": "torc", "version": env!("CARGO_PKG_VERSION")}}),
             30,
         )?;
         if let Some(Link::Http { protocol, .. }) = &mut self.link {

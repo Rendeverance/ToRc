@@ -73,7 +73,7 @@ A few things it does for you:
 
 - **Prompts aren't read twice.** The next turn of a chat reads only the new messages, and a chat you come back to later picks up from a saved state on disk. The README has the details.
 - **Drafting.** On models with an MTP block (the Qwen ones; Gemma 4 drafts with its assistant model instead, `TORC_DRAFT`), the server drafts tokens with the model's own prediction block and checks them in one pass. It decides how many to draft on each pass from what a pass costs on your machine. At the default settings the reply is the same tokens either way, just quicker.
-- **Sampling.** Greedy by default. On the Qwen family and its relatives `temperature`, `top_k` (40 unless you set it), `top_p`, `seed`, `presence_penalty` and `frequency_penalty` work as you'd expect, and a seeded reply is the same with drafting on or off. The desktop app sends each model maker's recommended settings unless you choose others (Load a model, Replies); Gemma 4 and gpt-oss are greedy only.
+- **Sampling.** Greedy by default. On every model `temperature`, `top_k` (40 unless you set it), `top_p`, `seed`, `presence_penalty` and `frequency_penalty` work as you'd expect, and a seeded reply is the same with drafting on or off. The desktop app sends each model maker's recommended settings unless you choose others (Load a model, Replies).
 - **Reply length.** A request that doesn't set `max_tokens` (or `max_output_tokens` on the Responses API) gets up to 4096 tokens, thinking included. A thinking model can use a couple of thousand of those before it answers, so if you set your own limit, leave it room.
 
 For a quick test of a Qwen model without a client, `torc-chat model.torc "Hello"` prints one reply (it writes the Qwen chat format only; for any other model, start the server).
@@ -140,7 +140,7 @@ ToRc is a focused solo build, tested hard on my own machines: two Snapdragon X m
 
 - **Windows first.** On Linux it has run under WSL2 (Ubuntu 24.04), not yet on a real machine, and `auto` threads there take every CPU, E-cores included: give the P-cores' count by hand on a hybrid CPU.
 - **One request at a time.** The server runs one conversation at once; it's built for a person, not a crowd.
-- **Gemma 4 and gpt-oss** are greedy only, and Gemma doesn't save chats on the whole-NPU tier (`TORC_NPU=pure`).
+- **Gemma 4** doesn't save chats on the whole-NPU tier (`TORC_NPU=pure`).
 - **Text the model reads can still steer it.** Control strings like `<|im_end|>` in what you paste or what a tool returns are broken before the model sees them, so they can't fake a turn (except on ERNIE, whose turns are the plain words "User:" and "Assistant:", which no marker-breaking can protect). But a page that says "ignore the user" in plain words still works on most models, mine included. Don't give a model text from the open web and tools that can do damage in the same chat.
 - **x86 has had less attention than ARM.** It builds and runs, but most of the tuning has been on the Snapdragon machines.
 - **The GPU only helps with long prompts.** It takes a share of their attention (step 6 above); the rest of the model, and every reply, stays on the CPU. This isn't a GPU inference engine.

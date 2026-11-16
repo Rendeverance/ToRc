@@ -758,10 +758,6 @@ pub struct Tokenizer {
     dropped: std::sync::atomic::AtomicUsize,
 }
 
-// SAFETY: the tokenizer is read-only after creation
-unsafe impl Send for Tokenizer {}
-unsafe impl Sync for Tokenizer {}
-
 impl Tokenizer {
     /// The tokenizer for the model at `path`, from its metadata.
     pub fn open(path: &str) -> Result<Tokenizer> {

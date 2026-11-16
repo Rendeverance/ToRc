@@ -1,18 +1,19 @@
-//! serve.rs - Gemma 4 for torc-server (chat/serve.rs). Greedy, one request at a time. A prompt that extends the last
+//! serve.rs - Gemma 4 for torc-server (chat/serve.rs), one request at a time. Replies are greedy at temperature 0, or
+//! sampled the way the Qwen engine samples (temperature, top_p, top_k, seed, penalties). A prompt that extends the last
 //! one reads only its new tokens (the cache is positional). The tiers are the same as torc-gemma's: TORC_NPU=1 (the NPU
 //! beside the CPU), TORC_NPU=pure (the whole model on the NPU), or neither (the CPU). Chats are saved to disk and
 //! loaded back as the Qwen family's are (saved.rs), except on the whole-NPU tier, whose caches are on the NPU. A
 //! request with tools gets them declared in the system turn, in Gemma 4's own format, and a call the model makes is
 //! read out of the reply and kept out of its text (both in chat.rs). TORC_DRAFT=<assistant model> turns on speculative
 //! decoding with Gemma 4's drafter (gemma_mtp.rs): up to TORC_DRAFT_N drafts a round (default 3), each verified by the
-//! target's greedy pick, so the reply is the same tokens as without it. How many drafts a round gets: TORC_DRAFT_P=p
+//! target's own pick, so the reply is the same tokens as without it. How many drafts a round gets: TORC_DRAFT_P=p
 //! (default 0.9) ends a round at the first draft the drafter gives less than p (0 takes all of them), and
 //! TORC_DRAFT_P=plan lets the draft planner decide (plan.rs DraftPlan, as torc-server's MTP does: pass times on a
 //! fitted line, and the drafter's calibrated confidence).
 
 use super::chat::{Calls, MARKERS, NO_THOUGHT, filled, parse_call, prompt_of, prompt_with_tools};
 use crate::api::Chat;
-use crate::ops::argmax;
+use crate::models::qwen::sample::Sampling;
 use crate::serve::{Call, Reply, Serve, defused, defused_tools};
 use serde_json::Value;
 
@@ -64,6 +65,18 @@ impl Engine {
         let text = if plain { prompt_of(&msgs) } else { prompt_with_tools(&msgs, &tools) };
         ids.extend(self.tok.encode(&text, true).unwrap_or_default());
         ids
+    }
+
+    /// The next token from one row of logits. The model leaves the soft cap off (greedy doesn't need it: tanh never
+    /// changes which logit is largest), so a sampled pick or a penalised one puts it back first, into `capped`.
+    fn pick(&self, sp: &mut Sampling, row: &[f32], capped: &mut Vec<f32>) -> u32 {
+        let c = self.m.h.softcap;
+        if (sp.temp <= 0.0 && !sp.penalised()) || c <= 0.0 {
+            return sp.pick(row);
+        }
+        capped.clear();
+        capped.extend(row.iter().map(|&l| c * (l / c).tanh()));
+        sp.pick(capped)
     }
 }
 
@@ -126,7 +139,9 @@ impl Serve for Engine {
         let mut finish = "length";
         let mut pos = ids.len();
         // the next token and, when drafting, the target's hidden state before it
-        let mut t = argmax(&last) as u32;
+        let mut sp = crate::chat::serve::sampling(c);
+        let mut capped = Vec::new();
+        let mut t = self.pick(&mut sp, &last[..self.nv], &mut capped);
         let mut h = self.m.hid.clone();
         let (mut rounds, mut acc) = (0usize, 0usize);
         let (mut t_draft, mut t_ver, mut t_one, mut n_one) = (0f64, 0f64, 0f64, 0usize);
@@ -245,11 +260,16 @@ impl Serve for Engine {
                 t_one += t1.elapsed().as_secs_f64();
                 n_one += 1;
             }
-            // the drafts the target agrees with, then its own pick after them
+            // the drafts the target agrees with, then its own pick after them: one pick a position, in order, so the
+            // reply is the same tokens as without drafts
             let mut j = 0;
-            while j + 1 < nb && argmax(&last[j * self.nv..(j + 1) * self.nv]) as u32 == block[j + 1] {
+            let pick = loop {
+                let p = self.pick(&mut sp, &last[j * self.nv..(j + 1) * self.nv], &mut capped);
+                if j + 1 == nb || p != block[j + 1] {
+                    break p;
+                }
                 j += 1;
-            }
+            };
             if self.draft.is_some() {
                 // the pass's forward time (t(n)), including passes with zero drafts, and which drafts were taken
                 self.pl.record(&surv, j, nb, t_pass);
@@ -262,7 +282,7 @@ impl Serve for Engine {
             self.seen.extend_from_slice(&block[..j + 1]);
             pos += j + 1;
             queue.extend(&block[1..j + 1]);
-            t = argmax(&last[j * self.nv..(j + 1) * self.nv]) as u32;
+            t = pick;
             queue.push_back(t);
             let dm = self.m.h.d_model;
             h = self.m.hid[j * dm..(j + 1) * dm].to_vec();

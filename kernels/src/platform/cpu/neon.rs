@@ -72,7 +72,7 @@ pub unsafe fn q4_0_gemm4(
     y_stride: usize,
 ) {
     let nb = x.len() / nv;
-    assert!(nv > 0 && x.len() == nv * nb && rows % 4 == 0 && row_bytes >= nb * 8 * Q4_0_BLOCK);
+    assert!(nv > 0 && x.len() == nv * nb && rows.is_multiple_of(4) && row_bytes >= nb * 8 * Q4_0_BLOCK);
     assert!(w.len() >= rows * row_bytes);
     unsafe {
         let m15 = vdupq_n_u8(15);
@@ -466,7 +466,7 @@ pub fn q4_0_repack4(src: &[u8], row_bytes: usize, nb: usize, out: &mut [u8]) {
 #[target_feature(enable = "i8mm")]
 pub unsafe fn gemm_q4x4(w: &[u8], rows: usize, pk: &[Packed], nv: usize, nb: usize, y: *mut f32, y_stride: usize) {
     let quad = nb * 8 * Q4X4_GROUP;
-    assert!(nv > 0 && rows % 4 == 0 && pk.len() >= pack_len(nv, nb) && w.len() >= rows / 4 * quad);
+    assert!(nv > 0 && rows.is_multiple_of(4) && pk.len() >= pack_len(nv, nb) && w.len() >= rows / 4 * quad);
     static MIN8: std::sync::LazyLock<usize> =
         std::sync::LazyLock::new(|| crate::switches::num("TORC_MMLA8_MIN").unwrap_or(16));
     let r8 = if nv >= *MIN8 { rows / 8 * 8 } else { 0 };
@@ -587,7 +587,7 @@ unsafe fn gemm_q4x4_tiles<const Q: usize>(
 pub unsafe fn q4x4_matmul(w: &[u8], rows: usize, x: &[Groups32], nv: usize, y: *mut f32, y_stride: usize) {
     let nb = x.len() / nv;
     let quad = nb * 8 * Q4X4_GROUP;
-    assert!(rows % 4 == 0 && (1..=3).contains(&nv) && x.len() == nv * nb && w.len() >= rows / 4 * quad);
+    assert!(rows.is_multiple_of(4) && (1..=3).contains(&nv) && x.len() == nv * nb && w.len() >= rows / 4 * quad);
     unsafe {
         match nv {
             1 => q4x4_pass::<1>(w, rows, x, nb, y, y_stride),
@@ -695,7 +695,7 @@ impl X4 for Q8x4 {
 #[target_feature(enable = "i8mm")]
 pub unsafe fn gemm_x4<B: X4>(w: &[u8], rows: usize, pk: &[Packed], nv: usize, nb: usize, y: *mut f32, y_stride: usize) {
     let quad = nb * 8 * B::GROUP;
-    assert!(nv > 0 && rows % 4 == 0 && pk.len() >= pack_len(nv, nb) && w.len() >= rows / 4 * quad);
+    assert!(nv > 0 && rows.is_multiple_of(4) && pk.len() >= pack_len(nv, nb) && w.len() >= rows / 4 * quad);
     static MIN8: std::sync::LazyLock<usize> =
         std::sync::LazyLock::new(|| crate::switches::num("TORC_MMLA8_MIN").unwrap_or(16));
     let r8 = if nv >= *MIN8 { rows / 8 * 8 } else { 0 };
@@ -810,7 +810,7 @@ unsafe fn gemm_x4_tiles<B: X4, const Q: usize>(
 pub unsafe fn x4_matmul<B: X4>(w: &[u8], rows: usize, x: &[Groups32], nv: usize, y: *mut f32, y_stride: usize) {
     let nb = x.len() / nv;
     let quad = nb * 8 * B::GROUP;
-    assert!(rows % 4 == 0 && (1..=3).contains(&nv) && x.len() == nv * nb && w.len() >= rows / 4 * quad);
+    assert!(rows.is_multiple_of(4) && (1..=3).contains(&nv) && x.len() == nv * nb && w.len() >= rows / 4 * quad);
     unsafe {
         match nv {
             1 => x4_pass::<B, 1>(w, rows, x, nb, y, y_stride),
@@ -1854,7 +1854,9 @@ pub fn delta_rule_h(
     dim: usize,
 ) {
     let rows = v.len();
-    assert!(dim % 16 == 0 && dim <= 256 && rows % 4 == 0 && o.len() == rows && state.len() >= rows * dim);
+    assert!(
+        dim.is_multiple_of(16) && dim <= 256 && rows.is_multiple_of(4) && o.len() == rows && state.len() >= rows * dim
+    );
     assert!(q.len() >= dim && k.len() >= dim);
     // SAFETY: NEON and the FP16 conversions are baseline on aarch64, and every access is inside the asserted lengths
     unsafe {
@@ -2645,7 +2647,7 @@ pub unsafe fn gemm_q6k(
     y: *mut f32,
     y_stride: usize,
 ) {
-    assert!(nv > 0 && rows % 4 == 0 && row_bytes >= nb * Q6_K_BLOCK && pk.len() >= pack_q6_len(nv, nb));
+    assert!(nv > 0 && rows.is_multiple_of(4) && row_bytes >= nb * Q6_K_BLOCK && pk.len() >= pack_q6_len(nv, nb));
     assert!(w.len() >= rows * row_bytes);
     let np = nv.div_ceil(2);
     unsafe {
@@ -2834,7 +2836,7 @@ unsafe fn gemm_q45k_t<const FIVE: bool>(
     y_stride: usize,
 ) {
     let bs = if FIVE { Q5_K_BLOCK } else { Q4_K_BLOCK };
-    assert!(nv > 0 && rows % 4 == 0 && row_bytes >= nb * bs && pk.len() >= pack_k_len(nv, nb));
+    assert!(nv > 0 && rows.is_multiple_of(4) && row_bytes >= nb * bs && pk.len() >= pack_k_len(nv, nb));
     assert!(w.len() >= rows * row_bytes);
     let np = nv.div_ceil(2);
     unsafe {
@@ -2955,7 +2957,7 @@ pub unsafe fn gemm_q45k_lay(
     y_stride: usize,
 ) {
     let quad = nb * q45k_lay_bytes(five);
-    assert!(nv > 0 && rows % 4 == 0 && pk.len() >= pack_k_len(nv, nb) && w.len() >= rows / 4 * quad);
+    assert!(nv > 0 && rows.is_multiple_of(4) && pk.len() >= pack_k_len(nv, nb) && w.len() >= rows / 4 * quad);
     static MIN8: std::sync::LazyLock<usize> =
         std::sync::LazyLock::new(|| crate::switches::num("TORC_KMM8_MIN").unwrap_or(8));
     let r8 = if nv >= *MIN8 { rows / 8 * 8 } else { 0 };
@@ -3003,7 +3005,10 @@ pub unsafe fn q45k_lay_matmul(
 ) {
     let nb = x.len() / nv;
     assert!(
-        rows % 4 == 0 && (1..=3).contains(&nv) && x.len() == nv * nb && w.len() >= rows / 4 * nb * q45k_lay_bytes(five)
+        rows.is_multiple_of(4)
+            && (1..=3).contains(&nv)
+            && x.len() == nv * nb
+            && w.len() >= rows / 4 * nb * q45k_lay_bytes(five)
     );
     unsafe {
         match (five, nv) {
@@ -3256,7 +3261,7 @@ unsafe fn q6_lay_ops(g0: *const u8, g: usize, t: usize) -> [int8x16_t; 2] {
 #[target_feature(enable = "i8mm")]
 pub unsafe fn gemm_q6_lay(w: &[u8], rows: usize, pk: &[PackedQ6], nv: usize, nb: usize, y: *mut f32, y_stride: usize) {
     let quad = nb * Q6_LAY_BYTES;
-    assert!(nv > 0 && rows % 4 == 0 && pk.len() >= pack_q6_len(nv, nb) && w.len() >= rows / 4 * quad);
+    assert!(nv > 0 && rows.is_multiple_of(4) && pk.len() >= pack_q6_len(nv, nb) && w.len() >= rows / 4 * quad);
     static MIN8: std::sync::LazyLock<usize> =
         std::sync::LazyLock::new(|| crate::switches::num("TORC_KMM8_MIN").unwrap_or(8));
     let r8 = if nv >= *MIN8 { rows / 8 * 8 } else { 0 };
@@ -3376,7 +3381,12 @@ unsafe fn gemm_q6_lay_t<const Q: usize>(
 #[target_feature(enable = "dotprod")]
 pub unsafe fn q6_lay_matmul(w: &[u8], rows: usize, x: &[BlockQ8K], nv: usize, y: *mut f32, y_stride: usize) {
     let nb = x.len() / nv;
-    assert!(rows % 4 == 0 && (1..=3).contains(&nv) && x.len() == nv * nb && w.len() >= rows / 4 * nb * Q6_LAY_BYTES);
+    assert!(
+        rows.is_multiple_of(4)
+            && (1..=3).contains(&nv)
+            && x.len() == nv * nb
+            && w.len() >= rows / 4 * nb * Q6_LAY_BYTES
+    );
     unsafe {
         match nv {
             1 => q6_lay_pass::<1>(w, rows, x, nb, y, y_stride),
@@ -3439,7 +3449,7 @@ pub fn delta_rule_f32(
     dim: usize,
 ) {
     let rows = v.len();
-    assert!(dim % 16 == 0 && o.len() >= rows && state.len() >= rows * dim && q.len() >= dim && k.len() >= dim);
+    assert!(dim.is_multiple_of(16) && o.len() >= rows && state.len() >= rows * dim && q.len() >= dim && k.len() >= dim);
     assert!(src.is_none_or(|s| s.len() >= rows * dim));
     const R: usize = 4;
     let rr = rows / R * R;

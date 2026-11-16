@@ -283,6 +283,48 @@ pub fn shard() -> Option<(usize, usize)> {
     SHARD.get().copied()
 }
 
+/// Set by torc-run before it loads the model to serve a pipeline's later layers (serve-pipe=).
+static WORKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_worker() {
+    WORKER.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set by Model::load before the weights load, for a model that runs over the pipeline (other architectures ignore
+/// TORC_PIPE and run every layer here).
+static PIPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_piped() {
+    PIPED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The layers this machine runs on a pipeline, for what it loads ahead of use: the expert cache's warm set and budget,
+/// and the NPU's hot experts. TORC_CACHE_LAYERS=a-b when it is given. Otherwise a shard's layers, or, on the main
+/// machine of a model that pipelines (TORC_PIPE, without TORC_PIPE_PULL or TORC_PIPE_FALLBACK, which can leave it
+/// running every layer alone), 0..S + 2, and on the worker S - 2..L, S being TORC_PIPE_SPLIT or half the layers. The
+/// two layers either side cover a split learned a layer or two off S; for two machines that differ, set
+/// TORC_PIPE_SPLIT (or TORC_CACHE_LAYERS on each). None otherwise: the machine loads every layer, as one machine does.
+pub fn own_layers(n_layer: usize) -> Option<(usize, usize)> {
+    if let Some(v) = crate::switches::get("TORC_CACHE_LAYERS") {
+        let (a, b) = v.split_once('-')?;
+        let (a, b) = (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?.min(n_layer));
+        return (a < b).then_some((a, b));
+    }
+    if let Some((a, b)) = shard() {
+        return Some((a.min(n_layer), b.min(n_layer)));
+    }
+    let worker = WORKER.load(std::sync::atomic::Ordering::Relaxed);
+    let main = PIPED.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::switches::given("TORC_PIPE")
+        && !crate::switches::on("TORC_PIPE_PULL")
+        && !crate::switches::on("TORC_PIPE_FALLBACK");
+    if !worker && !main {
+        return None;
+    }
+    let s = crate::switches::num::<usize>("TORC_PIPE_SPLIT").unwrap_or(n_layer / 2).min(n_layer);
+    Some(if worker { (s.saturating_sub(2), n_layer) } else { (0, (s + 2).min(n_layer)) })
+}
+
 /// The first layer the worker runs: a shard's end on the main machine (TORC_PIPE_SPLIT must agree), else
 /// TORC_PIPE_SPLIT, else the balance measured on an earlier run of a model of this shape (save_split), else half the
 /// layers.

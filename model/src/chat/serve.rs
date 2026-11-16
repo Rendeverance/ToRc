@@ -26,6 +26,19 @@ pub fn is_too_long(e: &format::Error) -> bool {
     e.0.starts_with(TOO_LONG)
 }
 
+/// How a request's reply picks its tokens: its temperature, top_p, top_k (40 when not given), seed (the time when not
+/// given) and penalties. Temperature 0 with no penalty is greedy.
+pub fn sampling(c: &Chat) -> crate::models::qwen::sample::Sampling {
+    let seed = c.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)
+    });
+    // the generator's state can't be 0, so seed 0 starts from a fixed constant instead
+    let rng = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+    let mut sp = crate::models::qwen::sample::Sampling::new(c.temperature, c.top_p, c.top_k.unwrap_or(40), rng);
+    sp.penalties(c.presence_penalty, c.frequency_penalty);
+    sp
+}
+
 /// The calls as OpenAI's tool_calls list (the arguments as JSON text), which is what the API writers take.
 pub fn tool_calls(calls: &[Call]) -> Value {
     Value::Array(

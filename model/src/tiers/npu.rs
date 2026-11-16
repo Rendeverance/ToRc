@@ -128,15 +128,9 @@ mod imp {
         Ok(c.into_iter().map(|v| v.min(u32::MAX as u64) as u32).collect())
     }
 
-    /// This machine's layers on a pipeline (TORC_CACHE_LAYERS=a-b, as the expert cache reads it), else all of them.
+    /// This machine's layers on a pipeline (pipe::own_layers), else all of them.
     fn own_layers(n_layer: u32) -> std::ops::Range<u32> {
-        crate::switches::get("TORC_CACHE_LAYERS")
-            .and_then(|v| {
-                let (a, b) = v.split_once('-')?;
-                Some(a.parse::<u32>().ok()?..b.parse::<u32>().ok()?.min(n_layer))
-            })
-            .filter(|r| !r.is_empty())
-            .unwrap_or(0..n_layer)
+        crate::pipe::own_layers(n_layer as usize).map_or(0..n_layer, |(a, b)| a as u32..b as u32)
     }
 
     /// Builds the tier: the dense products and, with k > 0, the k most used experts of each layer (by the profile).

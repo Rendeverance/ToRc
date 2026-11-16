@@ -63,7 +63,7 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_CACHE_MB` | setting | expert cache budget (`0` off; by default on when the file does not fit in memory) |
-| `TORC_CACHE_LAYERS` | setting | `a-b`: warm only those layers from the usage file |
+| `TORC_CACHE_LAYERS` | setting | `a-b`: the layers this machine loads ahead (expert cache warm set, NPU hot experts); on two machines each one's own half by default ([TWO-BOX.md](TWO-BOX.md)) |
 | `TORC_IO`, `TORC_IO_THREADS`, `TORC_IO_DEPTH`, `TORC_IO_PIECE_KB`, `TORC_IO_SORT`, `TORC_IO_BUFFERED` | development: `TORC_IO`, `TORC_IO_BUFFERED`; the rest setting | how expert reads are issued ([EXPERT-CACHE.md](EXPERT-CACHE.md)) |
 | `TORC_OWN`, `TORC_OWN_LARGE`, `TORC_OWN_PREFETCH` | development: `TORC_OWN`; the rest setting | an owned copy of the weights that are always in memory; that copy on large pages (it turns the copy on too); `0` turns the expert cache's read-ahead off |
 | `TORC_LARGE_PAGES`, `TORC_EXPERTS_LARGE`, `TORC_KLAY`, `TORC_KLAY_HEAD`, `TORC_KLAY_LARGE`, `TORC_KLAY_LAZY`, `TORC_KLAY_Q6` | setting: `TORC_LARGE_PAGES`, `TORC_EXPERTS_LARGE`, `TORC_KLAY_LARGE`; the rest development | large pages for the expert cache (on by default on Windows, `0` turns them off), for the experts of a model that fits, and for the laid-out copies of K-quant matrices (ARM) |

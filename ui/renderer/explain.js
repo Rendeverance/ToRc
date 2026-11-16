@@ -27,8 +27,8 @@ window.EXPLAIN = {
     'memory less the rest of the model and a 6 GB margin. Bigger isn’t always better: too big and the machine ' +
     'starts paging. Set 0 to turn it off. EXPERT-CACHE.md has the details.',
   TORC_CACHE_LAYERS:
-    'Warms only some layers from the usage file, written a-b. For two machines, where each one only ' +
-    'holds part of the model.',
+    'The layers this machine loads ahead, written a-b: its cache warm set and the NPU’s hot experts. On two ' +
+    'machines each one takes its own half by default, so set it only to override that.',
   TORC_WARM:
     'Whether the model’s file is read into memory at load. By default it is when the model fits. 0 skips it ' +
     'for a quicker start and a slower first prompt, 1 forces it, and wait does it before the server takes requests.',

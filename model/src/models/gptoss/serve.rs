@@ -1,4 +1,5 @@
-//! serve.rs - gpt-oss for torc-server (chat/serve.rs). Greedy, one request at a time. A prompt that extends the last
+//! serve.rs - gpt-oss for torc-server (chat/serve.rs), one request at a time. Replies are greedy at temperature 0, or
+//! sampled the way the Qwen engine samples (temperature, top_p, top_k, seed, penalties). A prompt that extends the last
 //! one reads only its new tokens (the cache is positional).
 //!
 //! The prompt is the harmony format: a system message (the model's identity, its knowledge cutoff, the reasoning effort
@@ -11,7 +12,6 @@
 
 use super::chat::{Channels, prompt};
 use crate::api::Chat;
-use crate::ops::argmax;
 use crate::serve::{Call, Reply, Serve};
 use serde_json::Value;
 
@@ -76,8 +76,9 @@ impl Serve for Engine {
         let mut finish = "length";
         let mut reader = Channels::new();
         let mut pos = ids.len();
+        let mut sp = crate::chat::serve::sampling(c);
         loop {
-            let t = argmax(&last) as u32;
+            let t = sp.pick(&last);
             n_out += 1;
             if self.stops.contains(&t) {
                 finish = "stop";

@@ -18,17 +18,15 @@ const SAMPLING = [
     think: [0.6, 0.95, 20],
     plain: [0.7, 0.8, 20],
   },
-  // Gemma 4 and gpt-oss run on an engine path that is greedy only so far: their makers' settings are kept for when it
-  // samples, and the note says so
   {
     is: (a) => a === 'gemma4',
-    name: 'Gemma 4 (Google model card; greedy for now: this engine path does not sample yet)',
+    name: 'Gemma 4 (Google model card)',
     think: [1.0, 0.95, 64],
     plain: [1.0, 0.95, 64],
   },
   {
     is: (a) => a === 'gpt-oss',
-    name: 'gpt-oss (OpenAI; greedy for now: this engine path does not sample yet)',
+    name: 'gpt-oss (OpenAI)',
     think: [1.0, 1.0, 0],
     plain: [1.0, 1.0, 0],
   },

@@ -129,10 +129,8 @@ impl ExpertCache {
         } else {
             let seen = usage.as_deref().and_then(|p| usage_read(p, Some(&model), n_layer, n_expert).ok());
             seen.map(|c| c.into_iter().map(|v| v.min(u32::MAX as u64) as u32).collect::<Vec<u32>>()).map(|mut c| {
-                if let Some((a, b)) = crate::switches::get("TORC_CACHE_LAYERS").and_then(|v| {
-                    let (a, b) = v.split_once('-')?;
-                    Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
-                }) {
+                // on a pipeline, only this machine's layers (pipe::own_layers)
+                if let Some((a, b)) = crate::pipe::own_layers(n_layer as usize) {
                     for (l, row) in c.chunks_mut(n_expert as usize).enumerate() {
                         if l < a || l >= b {
                             row.fill(0);

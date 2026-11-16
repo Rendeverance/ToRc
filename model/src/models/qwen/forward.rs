@@ -169,6 +169,10 @@ impl Model {
                 eprintln!("load: {what} at {:.1} s", tl.elapsed().as_secs_f64());
             }
         };
+        // before the weights load: the expert cache and the NPU load only this machine's layers on a pipeline
+        // (pipe::own_layers), which needs to know the model pipelines and whether the file is a shard
+        crate::pipe::set_piped();
+        crate::pipe::set_shard(path);
         let w = Weights::load(path)?;
         say("weights");
         let h = Hparams::from_file(&w.file)?;
@@ -182,7 +186,6 @@ impl Model {
             w.file.tensors.len(),
             n_ctx,
         );
-        crate::pipe::set_shard(path);
         let mut layers = Vec::with_capacity(h.n_layer as usize);
         for l in 0..h.n_layer {
             let group = w

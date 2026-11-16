@@ -1,0 +1,27 @@
+name: Results
+description: Speeds from your machine, measured with tools/bench (see RESULTS.md).
+title: "Results: <your CPU>, <model>"
+labels: [results]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for measuring. RESULTS.md says how. Attach the `torc-bench.csv` it wrote, and open it first to check
+        it holds nothing you'd rather keep to yourself.
+  - type: textarea
+    id: csv
+    attributes:
+      label: torc-bench.csv
+      description: Drag the file in here.
+    validations:
+      required: true
+  - type: textarea
+    id: limits
+    attributes:
+      label: Anything that limits the machine
+      description: A power limit, a small case, a laptop on battery, other work running. Leave it empty if none.
+  - type: input
+    id: name
+    attributes:
+      label: Name for the table
+      description: How you'd like to be credited, or leave it empty.

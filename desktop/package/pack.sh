@@ -7,12 +7,15 @@
 set -euo pipefail
 out=$1 plat=$2 app=$3 bin=$4 repo=$5 PY=${PY:-python3}
 ext=; [[ $plat == windows-* ]] && ext=.exe
-name=ToRc-0.1.0-$plat
+# the version: VERSION if set (the release workflow passes the tag's), else the desktop app's own
+ver=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/desktop/Cargo.toml" | head -1 | tr -d '\r')}
+name=ToRc-$ver-$plat
 root=$out/$name
 mkdir -p "$root"/{chats,data,docs,engine,mcps,models,primers,tools,workspace}
 cp "$app" "$root/ToRc$ext"
 for e in torc-server torc-run torc-tune torc hwscan; do cp "$bin/$e$ext" "$root/engine/"; done
-[[ -z $ext ]] && strip --strip-debug "$root/ToRc" "$root"/engine/*
+# (macOS: the cargo profiles already strip, and a re-strip would break the binaries' ad-hoc signature)
+if [[ -z $ext && $plat != macos-* ]]; then strip --strip-debug "$root/ToRc" "$root"/engine/*; fi
 dlls=
 for dll in libunwind.dll WebView2Loader.dll; do
   for from in "$(dirname "$app")" "$bin"; do

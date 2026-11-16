@@ -44,7 +44,7 @@ a time and resets between runs.
 | `TORC_PIPE_SPLIT=S` | learned | the first layer the worker runs; otherwise the balance learned on earlier runs of a model of this shape (saved in ToRc's cache folder, %LOCALAPPDATA%\torc or ~/.cache/torc, running mean), else half |
 | `block=N` (torc-run) | - | prompt block size: smaller blocks keep both machines busy |
 | `TORC_PIPE_PULL=1` | off | gen mode: after the prompt, pull the worker's layer states back and reply on this machine alone |
-| `TORC_CACHE_LAYERS=a-b` | all | warm only those layers' experts from the profile (a machine's own half) |
+| `TORC_CACHE_LAYERS=a-b` | this machine's half | the layers a machine loads ahead: its expert cache's warm set and its NPU's hot experts. By default the main machine takes 0 to S + 2 and the worker S - 2 to the end (S from `TORC_PIPE_SPLIT`, else half), so a split learned a layer or two off S is still covered; for two machines that differ, set `TORC_PIPE_SPLIT`. With `TORC_PIPE_PULL` or `TORC_PIPE_FALLBACK` the main machine loads every layer |
 
 ## When to use which
 

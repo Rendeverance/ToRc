@@ -521,8 +521,8 @@ pub(crate) fn one_caller() -> std::sync::MutexGuard<'static, ()> {
 /// A pointer the pool's tasks write through, each task to its own disjoint range.
 #[derive(Clone, Copy)]
 pub struct SyncPtr<T>(pub *mut T);
-unsafe impl<T> Send for SyncPtr<T> {}
-unsafe impl<T> Sync for SyncPtr<T> {}
+unsafe impl<T: Send> Send for SyncPtr<T> {}
+unsafe impl<T: Send> Sync for SyncPtr<T> {}
 
 impl<T> SyncPtr<T> {
     pub fn new(s: &mut [T]) -> SyncPtr<T> {

@@ -65,11 +65,10 @@ model without a client: `torc-chat model.torc "Hello"` (ChatML only; for other f
 from another site is refused whatever `TORC_HOST` says; non-browser clients send no Origin and are not affected.
 
 The server handles one conversation at a time. Greedy decoding by default; `temperature`, `top_k`, `top_p`, `seed`,
-`presence_penalty` and `frequency_penalty` are honoured. Gemma 4 and gpt-oss are served the same way, greedy only,
-with tool calls and saved chats (not on Gemma's
-whole-NPU tier). Every model takes tools: GLM, LFM2, Gemma 4 and gpt-oss in their own templates' call formats, the
-Qwen models in Qwen3.5's, ERNIE and Moonlight (whose templates have none) in Qwen2.5's JSON format. The server hands
-back OpenAI-style `tool_calls` whatever the format.
+`presence_penalty` and `frequency_penalty` are honoured. Gemma 4 and gpt-oss are served the same way, with tool
+calls and saved chats (not on Gemma's whole-NPU tier). Every model takes tools: GLM, LFM2, Gemma 4 and gpt-oss in
+their own templates' call formats, the Qwen models in Qwen3.5's, ERNIE and Moonlight (whose templates have none) in
+Qwen2.5's JSON format. The server hands back OpenAI-style `tool_calls` whatever the format.
 
 Control strings in user and tool messages (`<|im_end|>`, `<|im_start|>system`, `<|turn>`) are broken with a word
 joiner before the prompt is built (Tokenizer::defuse), so a tool result or a fetched page cannot forge a turn (ERNIE

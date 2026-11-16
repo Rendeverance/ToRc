@@ -370,16 +370,12 @@ impl Weights {
                 let ple =
                     w.file.tensors.iter().find(|t| t.name == "per_layer_token_embd.weight").map_or(0, |t| t.bytes);
                 let res = w.file.resident.bytes - ple;
-                // a pipeline machine (TORC_CACHE_LAYERS=a-b) only touches its own layers' resident weights: their share
+                // a pipeline machine (pipe::own_layers) only touches its own layers' resident weights: their share
                 // (+ 1 GB for the embeddings and the head) plus a 3 GB margin; a single machine touches all of them,
                 // plus 6 GB
                 let nl = w.file.blocks.iter().map(|b| b.layer + 1).max().unwrap_or(1).max(1) as u64;
-                let span = crate::switches::get("TORC_CACHE_LAYERS")
-                    .and_then(|v| {
-                        let (a, b) = v.split_once('-')?;
-                        Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
-                    })
-                    .map(|(a, b)| b.min(nl).saturating_sub(a))
+                let span = crate::pipe::own_layers(nl as usize)
+                    .map(|(a, b)| (b as u64).min(nl).saturating_sub(a as u64))
                     .filter(|&k| k > 0 && k < nl);
                 let (own, margin) = match span {
                     Some(k) => (res * k / nl + (1 << 30), 3u64 << 30),
