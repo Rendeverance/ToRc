@@ -192,8 +192,14 @@ pub fn init(n: usize) -> &'static Pool {
         }
         // TORC_PIN=0: no thread is pinned, and the process is held to the fastest class's CPUs instead,
         // so the OS can move a worker off a core that something else (a scanner, a sensor poller) takes for a moment.
-        // Pinned, every sweep waits for that one worker
-        let pin = !crate::switches::is("TORC_PIN", "0");
+        // Pinned, every sweep waits for that one worker.
+        // Pinned by default on Windows only: there the engine reads the core classes and pins to the right CPUs. On
+        // Linux and macOS it can't see them yet, so pinning would place workers blind (slow cores on a big.LITTLE
+        // part), and the OS's scheduler does better. TORC_PIN=1 pins there too.
+        let pin = match crate::switches::get("TORC_PIN") {
+            Some(v) => v != "0",
+            None => cfg!(windows),
+        };
         let own = Some(OwnPool::new(pin.then_some(&cpus[..]), n));
         #[cfg(windows)]
         unsafe {

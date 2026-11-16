@@ -45,6 +45,9 @@ jobs:
 
   release:
     needs: zip
+    # runs even when a zip job did not (the experimental Mac one may get no machine, which GitHub reports as a
+    # cancelled job): the four required zips are checked below instead
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -57,6 +60,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          v=${GITHUB_REF_NAME#v}
+          for p in windows-x64 windows-arm64 linux-x64 linux-arm64; do
+            [[ -f dist/ToRc-$v-$p.zip ]] || { echo "the $p zip is missing: no release" >&2; exit 1; }
+          done
           (cd dist && sha256sum *.zip > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS --draft --title "ToRc $GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY"

@@ -82,7 +82,9 @@ Change one thing at a time and measure each change (section 7). In this order:
 
 1. `torc-tune model.torc` picks the prompt block size for this machine and saves it where the server finds it. Run it
    with the same settings the server will use (NPU and GPU on, second machine up).
-2. Threads: `auto` is usually right. On a hybrid Intel CPU also try the P-cores only, one thread per core.
+2. Threads: `auto` is usually right. On a hybrid Intel CPU also try the P-cores only, one thread per core. Worker
+   threads are pinned to cores on Windows and left to the OS on Linux and macOS, where the engine can't yet see
+   which cores are fast; `TORC_PIN=1` (pin) or `TORC_PIN=0` (don't) is worth one measured try either way.
 3. ARM: `TORC_Q4X4=1` and `TORC_ATTN_TILE=1` are off by default on the Qwen models and often help; try both.
 4. Snapdragon X NPU: `TORC_NPU=1` reads prompts faster. On one machine torc-server counts the experts in use and the NPU
    takes the most used ones from the next load on (the first session is slower than later ones; `TORC_NPU_HOT=0` turns

@@ -19,7 +19,7 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_POOL` | development | worker pool implementation |
-| `TORC_PIN` | development | `0` leaves worker threads unpinned (pinned by default) |
+| `TORC_PIN` | development | `0` leaves worker threads unpinned, `1` pins them; pinned by default on Windows only (Linux and macOS leave it to the OS) |
 | `TORC_DECODE_THREADS` | setting | threads a reply step uses (the decode width; default: the tuned `decode_threads`, else all). On a part with two threads a core, one a core can write faster while the prompt still reads on all |
 | `TORC_SPREAD` | development | `0` uses CPUs 0..n instead of spreading over the fastest cores |
 | `TORC_SPIN_US` | development | microseconds a worker spins before it parks (default 200) |

@@ -48,9 +48,10 @@ fn timings((pn, ps, ft, rn, rs): (usize, f64, f64, usize, f64)) -> Value {
 }
 
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &str) {
+    // the charset named: a client that guesses (Windows PowerShell 5.1 reads ISO-8859-1) shows UTF-8 text wrongly
     let _ = write!(
         s,
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
 }
