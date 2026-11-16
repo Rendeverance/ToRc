@@ -2,7 +2,7 @@
 
 # ToRc
 
-[![CI](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml/badge.svg)](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#licence)
+[![CI](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml/badge.svg)](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#licence) [![Release](https://img.shields.io/github/v/release/Rendeverance/ToRc)](https://github.com/Rendeverance/ToRc/releases/latest)
 
 *By Rendeverance.*
 
