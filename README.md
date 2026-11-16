@@ -28,7 +28,8 @@ window is Microsoft's WebView2, which Windows 11 and an up-to-date Windows 10 al
 system's WebKitGTK, which most desktops already have (if yours hasn't, on Ubuntu 22.04 or later and Debian 12 or later:
 `sudo apt install libwebkit2gtk-4.1-0`). If you can unzip a file, you can run your own model on your own machine:
 
-1. Download the zip for your machine from the Releases page and unzip it somewhere of your own, such as Documents.
+1. **Download the zip for your machine from the [Releases page](https://github.com/Rendeverance/ToRc/releases/latest)**
+   and unzip it somewhere of your own, such as Documents.
 2. Open ToRc.
 3. Pick a model. A GGUF is converted once, in the app, to ToRc's format.
 4. Press Auto-tune once: it measures your machine and keeps the fastest settings.
