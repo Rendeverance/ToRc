@@ -61,6 +61,16 @@ don't fit are read from the SSDs as they are needed.
 | CPU + GPU (RTX 3060) | 192 / 39 | 197 / 41 | 183 / 43 | 170 / 51 | 161 / 27 | 147 / 22 |
 | llama.cpp (CPU) | 112 / 24 | 112 / 23 | 107 / 21 | 101 / 18 | 90 / 14 | 74 / 9 |
 
+**Workstation: Core i9-13900K (8P + 16E), 96 GB DDR5-6000, 8 threads for both engines**
+
+| | short | 1k | 4k | 8k | 16k | 32k |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| CPU | 255 / 40.6 | 264 / 52.4 | 246 / 45.7 | 223 / 47.3 | 193 / 32.8 | 149 / 31.2 |
+| CPU + GPU (Radeon AI PRO R9700*) | 258 / 41.6 | 266 / 53.4 | 249 / 45.3 | 256 / 47.8 | 257 / 34.7 | 248 / 30.8 |
+| llama.cpp (CPU) | 143 / 26.5 | 154 / 26.4 | 143 / 24.2 | 133 / 21.1 | 116 / 15.6 | 91.4 / 7.5 |
+
+*The R9700 takes a share of attention only; the experts stay on the CPU.
+
 ## Qwen3-30B-A3B-Instruct-2507 (Q4_0)
 
 **One Snapdragon X mini PC: X1-26-100 (8 Oryon cores), 32 GB, Hexagon NPU, Adreno X1-45**
