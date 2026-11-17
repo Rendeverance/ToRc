@@ -2,7 +2,7 @@
 
 # ToRc
 
-[![CI](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml/badge.svg)](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#licence) [![Release](https://img.shields.io/github/v/release/Rendeverance/ToRc)](https://github.com/Rendeverance/ToRc/releases/latest)
+[![CI](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml/badge.svg)](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#licence) [![Release](https://img.shields.io/github/v/release/Rendeverance/ToRc)](https://github.com/Rendeverance/ToRc/releases/latest) [![Works with ToolFunnel](https://img.shields.io/badge/works%20with-ToolFunnel-8250df)](https://github.com/Rendeverance/toolfunnel)
 
 *By Rendeverance.*
 
@@ -22,6 +22,13 @@ against the version before it.
 It runs on Windows and Linux, on x86-64 (AVX2, AVX-VNNI or AVX512-VNNI) and ARM64 (NEON, dotprod, i8mm). If you have
 a Snapdragon NPU it reads prompts with it, a Vulkan GPU takes a share of a long prompt's attention, and a second
 machine can join in as a pipeline worker.
+
+**ToRc is more than just an engine.** The zip contains a small app that lets you easily and quickly convert a model,
+tune it to your machine and start chatting right away, with saved chats, primers, tool calling and MCP. You can add
+your own MCP servers, or put them behind [ToolFunnel](https://github.com/Rendeverance/toolfunnel), my MCP and local
+tool gateway. ToolFunnel is great for small models because it provides a lean register of tools and MCP servers and
+gates every call through your own policy hooks, so you get not only tool use but hooks with your models, without
+drowning a local model's small context.
 
 > [!IMPORTANT]
 > **Linux and macOS support is currently experimental.** Windows has had extensive testing, on x86-64 and on
