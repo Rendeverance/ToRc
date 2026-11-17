@@ -25,8 +25,8 @@ machine can join in as a pipeline worker.
 
 **ToRc is more than just an engine.** The zip contains a small app that lets you easily and quickly convert a model,
 tune it to your machine and start chatting right away, with saved chats, primers, tool calling and MCP. You can add
-your own MCP servers, or put them behind [ToolFunnel](https://github.com/Rendeverance/toolfunnel), my MCP and local
-tool gateway. ToolFunnel is great for small models because it provides a lean register of tools and MCP servers and
+your own MCP servers, or put them behind [ToolFunnel](https://github.com/Rendeverance/toolfunnel), my **zero-dependency**
+MCP and local tool gateway. ToolFunnel is great for small models because it provides a lean register of tools and MCP servers and
 gates every call through your own policy hooks, so you get not only tool use but hooks with your models, without
 drowning a local model's small context.
 
