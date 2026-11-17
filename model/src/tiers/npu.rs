@@ -23,7 +23,7 @@ pub struct Ffn {
     pub y: *mut f32,
 }
 
-#[cfg(all(target_arch = "aarch64", windows))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 mod imp {
     use super::{Ffn, Mat};
     use crate::weights::Weights;
@@ -233,7 +233,7 @@ mod imp {
         );
         // every weight is used once here (64 zero rows; the dense products one per graph, and a layer's hot experts one
         // graph), so a prompt's first block does not pay for their first use. TORC_NPU_WARM=0 skips this
-        if crate::switches::get("TORC_NPU_WARM").map_or(true, |v| v != "0") {
+        if crate::switches::get("TORC_NPU_WARM").is_none_or(|v| v != "0") {
             let t = std::time::Instant::now();
             for &(_, id, rows, cols) in &pending {
                 let x = vec![0f32; 64 * cols];
@@ -413,7 +413,7 @@ mod imp {
     }
 }
 
-#[cfg(not(all(target_arch = "aarch64", windows)))]
+#[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux"))))]
 mod imp {
     use super::{Ffn, Mat};
     pub fn load(_: &crate::weights::Weights, _: u32, _: &[u32]) {}

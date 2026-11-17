@@ -22,7 +22,7 @@ pub(crate) use chat::uniflags;
 pub use chat::{api, serve, tok};
 pub use kernels::switches;
 pub use layers::{act, attn, fattn, mla, moe, ops, rec};
-#[cfg(all(target_arch = "aarch64", windows))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 pub use models::gemma::npu_gemma;
 pub use models::gemma::{gemma, gemma_mtp};
 pub use models::gptoss::gptoss;
@@ -85,10 +85,18 @@ unsafe extern "system" {
     fn SetThreadAffinityMask(h: *mut core::ffi::c_void, mask: usize) -> usize;
 }
 
+/// First thing in each program's main, while it has one thread: points the NPU's DSP loader at its libraries
+/// (ADSP_LIBRARY_PATH, see ggml::set_dsp_path). Does nothing where there is no NPU tier.
+pub fn set_npu_env() {
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
+    kernels::ggml::set_dsp_path();
+}
+
 /// Starts the compute pool: one worker per core, each pinned to its core. Left unpinned, Windows moves the workers
-/// around and the big products lose about a quarter of their bandwidth. TORC_PIN=0 leaves them unpinned.
+/// around and the big products lose about a quarter of their bandwidth. TORC_PIN=0 leaves them unpinned. Off Windows
+/// they are left to the OS unless TORC_PIN=1 (as pool::init).
 pub fn init_threads(n: usize) {
-    let pin = crate::switches::get("TORC_PIN").map(|v| v != "0").unwrap_or(true);
+    let pin = crate::switches::get("TORC_PIN").map(|v| v != "0").unwrap_or(cfg!(windows));
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .start_handler(move |i| {
@@ -97,6 +105,10 @@ pub fn init_threads(n: usize) {
                 unsafe {
                     SetThreadAffinityMask(GetCurrentThread(), 1usize << (i % usize::BITS as usize));
                 }
+            }
+            #[cfg(target_os = "linux")]
+            if pin {
+                crate::pool::pin_linux(i as i32);
             }
             let _ = (i, pin);
         })

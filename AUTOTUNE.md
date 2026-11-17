@@ -6,17 +6,25 @@ value.
 
 ## What is tuned
 
-`torc-tune <model> [threads|auto] [ctx]` tunes three settings, in this order, each from the values already chosen:
+`torc-tune <model> [threads|auto] [ctx]` tunes four settings, in this order, each from the values already chosen:
 
 | Setting | Candidates | Phase it moves |
 |---|---|---|
 | prompt block size | the built-in rule, half and double it, then on by doubling or halving while each step is faster | prompt |
 | work split of the expert products | even (the default) or guided | prompt |
+| pinning | each thread held to one CPU, or left to the OS | prompt and decode |
 | threads a reply uses | all of them, or one a core on a part with two threads a core | decode |
 
 The reply threads are tuned apart from the prompt's because the best count for reading a prompt is not the best for
 writing a reply: decode is bound by memory, and a core's second thread only competes for it. On Linux this step is
 skipped for now, since the engine can't see the cores there (README, Running).
+
+Pinning is measured because neither way wins everywhere: pinned threads keep their caches, but a pinned thread also
+waits when something else takes its CPU for a moment. The prompts are read and 64 tokens written both ways. Windows'
+default (pinned) is kept unless the other way is faster over reading and writing together by the margin and slower on
+neither, and the server is what uses the result (`torc-run` and `torc-chat` keep the default). `TORC_PIN` set by hand
+skips the step. On Linux the step is skipped for now and the threads stay unpinned, and on macOS, where a thread
+can't be pinned, there is nothing to measure.
 
 One more value is learned by the server rather than by `torc-tune`: with the GPU tier on, the GPU's share of each
 block's attention, measured on the first long prompts and kept in the same file (GUIDE, Making it fast).

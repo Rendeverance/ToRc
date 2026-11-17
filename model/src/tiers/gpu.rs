@@ -75,12 +75,17 @@ struct Pipes {
     tq: usize,
 }
 
-/// One layer's keys, values and their scales on the GPU, laid out as in KvCache.
+/// One layer's keys, values and their scales on the GPU, laid out as in KvCache: `rows` positions for each KV head,
+/// the first of them the cache's position `base`. A full-attention layer's copy is the whole cache (base 0). A
+/// sliding-window layer's holds only the positions its window can reach, and moves on as the prompt is read: Gemma 4
+/// has 25 such layers, and a whole-context copy of each is 7 GB at 32k tokens for keys no token reads.
 struct Layer {
     k: wgpu::Buffer,
     v: wgpu::Buffer,
     ks: wgpu::Buffer,
     vs: wgpu::Buffer,
+    base: usize,
+    rows: usize,
 }
 
 /// Which kernel file a shape runs on: Kern::of is the table.
@@ -598,37 +603,53 @@ pub fn run_block(
         return None;
     }
     let cap = kv.cap;
+    let hi = pos0 + n;
     // bytes per cache number
     let eb = if k16 { 2 } else { 1 };
-    let kbytes = (nkv * cap * hd * eb) as u64;
+    // the layer's copy: made on first use (and then written from its first position), else brought up to date from
+    // gpu_lo
+    let key = (if k16 { kv.k16.as_ptr() as usize } else { kv.k.as_ptr() as usize }, cap);
+    let have = g.layers.get(&key).map(|ly| (ly.base, ly.rows));
+    // a windowed layer's copy starts at the first position this block can see, and has room for a few blocks more
+    // before it must move on (then the window's positions are written again)
+    let first = if window > 0 { pos0.saturating_sub(window) } else { 0 };
+    let (base, rows, make) = match have {
+        Some((b, r)) if window == 0 || (first >= b && hi - b <= r) => (b, r, false),
+        Some((_, r)) if hi - first <= r => (first, r, false),
+        _ if window == 0 => (0, cap, true),
+        _ => (first, cap.min(window + n + window.max(n)), true),
+    };
+    let moved = have.is_some_and(|(b, _)| b != base);
+    let kbytes = (nkv * rows * hd * eb) as u64;
     if kbytes > g.max_binding {
         return None;
     }
-    // the layer's copy: made on first use (and then written from position 0), else brought up to date from gpu_lo
-    let key = (if k16 { kv.k16.as_ptr() as usize } else { kv.k.as_ptr() as usize }, cap);
-    let lo = if g.layers.contains_key(&key) { kv.gpu_lo.min(pos0) } else { 0 };
-    if !g.layers.contains_key(&key) {
+    let lo = if make || moved { base } else { kv.gpu_lo.min(pos0).max(base) };
+    if make {
         let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let scope = g.dev.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let mk = |size: u64| {
             g.dev.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: st, mapped_at_creation: false })
         };
-        let sb = (nkv * cap * 4) as u64;
-        let ly = Layer { k: mk(kbytes), v: mk(kbytes), ks: mk(sb), vs: mk(sb) };
+        let sb = (nkv * rows * 4) as u64;
+        let ly = Layer { k: mk(kbytes), v: mk(kbytes), ks: mk(sb), vs: mk(sb), base, rows };
         g.layers.insert(key, ly);
         // a card without room for this layer's keys: nothing is done here and the CPU runs the block
         if let Some(e) = oom(scope) {
             turn_off(&mut g, &format!("the GPU has no room for another layer's keys: {e}"));
             return None;
         }
+    } else if moved {
+        g.layers.get_mut(&key).unwrap().base = base;
     }
-    let hi = pos0 + n;
     let t0 = std::time::Instant::now();
     {
         let ly = &g.layers[&key];
         for h in 0..nkv {
             let (r0, r1) = (h * cap + lo, h * cap + hi);
-            let at = (r0 * hd * eb) as u64;
+            // the copy's row for the cache's row r0
+            let g0 = h * rows + lo - base;
+            let at = (g0 * hd * eb) as u64;
             if k16 {
                 g.queue.write_buffer(&ly.k, at, bytemuck::cast_slice(&kv.k16[r0 * hd..r1 * hd]));
                 g.queue.write_buffer(&ly.v, at, bytemuck::cast_slice(&kv.v16[r0 * hd..r1 * hd]));
@@ -636,8 +657,8 @@ pub fn run_block(
                 g.queue.write_buffer(&ly.k, at, bytemuck::cast_slice(&kv.k[r0 * hd..r1 * hd]));
                 g.queue.write_buffer(&ly.v, at, bytemuck::cast_slice(&kv.v[r0 * hd..r1 * hd]));
             }
-            g.queue.write_buffer(&ly.ks, (r0 * 4) as u64, bytemuck::cast_slice(&kv.k_scale[r0..r1]));
-            g.queue.write_buffer(&ly.vs, (r0 * 4) as u64, bytemuck::cast_slice(&kv.v_scale[r0..r1]));
+            g.queue.write_buffer(&ly.ks, (g0 * 4) as u64, bytemuck::cast_slice(&kv.k_scale[r0..r1]));
+            g.queue.write_buffer(&ly.vs, (g0 * 4) as u64, bytemuck::cast_slice(&kv.v_scale[r0..r1]));
         }
     }
     let bytes = (m * qd * 4) as u64;
@@ -646,7 +667,8 @@ pub fn run_block(
     // device lost). Each slice's buffers are written just before its submission (the queue runs them in order).
     let cuts = slices(m, pos0, nh, tq, g.cap());
     let mmax = cuts.iter().map(|&(a, b)| b - a).max().unwrap_or(m);
-    let nsmax = cuts.iter().map(|&(a, b)| parts(b - a, pos0 + b, nkv, tq).0).max().unwrap_or(1);
+    // the kernel sees the copy's positions: the cache's less `base`
+    let nsmax = cuts.iter().map(|&(a, b)| parts(b - a, pos0 + b - base, nkv, tq).0).max().unwrap_or(1);
     {
         use wgpu::BufferUsages as U;
         let scope = g.dev.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
@@ -683,7 +705,7 @@ pub fn run_block(
     for &(a, b) in &cuts {
         let mc = b - a;
         let cb = (mc * qd * 4) as u64;
-        let (ns, tps) = parts(mc, pos0 + b, nkv, tq);
+        let (ns, tps) = parts(mc, pos0 + b - base, nkv, tq);
         g.queue.write_buffer(qb, 0, bytemuck::cast_slice(&q[a * qd..b * qd]));
         if qsa {
             // the slice's rows of pool flags, padded to whole words
@@ -694,8 +716,8 @@ pub fn run_block(
         }
         let pr = Params {
             n: mc as u32,
-            pos0: (pos0 + a) as u32,
-            cap: cap as u32,
+            pos0: (pos0 + a - base) as u32,
+            cap: rows as u32,
             scale,
             nh: nh as u32,
             ns: ns as u32,

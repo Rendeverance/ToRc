@@ -141,7 +141,8 @@ fn drop_pages(d: &[u8]) {
     let _ = d;
 }
 
-/// The physical memory installed, in bytes (None where it is not known).
+/// The physical memory installed, in bytes (None where it is not known). Where it is not known a model is taken not to
+/// fit, and runs through a small expert cache: several times slower than mapped whole.
 pub(crate) fn total_phys() -> Option<u64> {
     #[cfg(windows)]
     {
@@ -162,7 +163,37 @@ pub(crate) fn total_phys() -> Option<u64> {
             return Some(s.total_phys);
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Some(b) = meminfo("MemTotal:") {
+        return Some(b);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut std::ffi::c_void,
+                old_len: *mut usize,
+                new: *mut std::ffi::c_void,
+                new_len: usize,
+            ) -> i32;
+        }
+        let (mut b, mut len) = (0u64, std::mem::size_of::<u64>());
+        // SAFETY: hw.memsize is a u64, and b and len are that size
+        let r = unsafe { sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut b).cast(), &mut len, std::ptr::null_mut(), 0) };
+        if r == 0 && b > 0 {
+            return Some(b);
+        }
+    }
     avail_phys()
+}
+
+/// A line of /proc/meminfo ("MemTotal:", "MemAvailable:"), in bytes.
+#[cfg(target_os = "linux")]
+fn meminfo(key: &str) -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = s.lines().find_map(|l| l.strip_prefix(key))?.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    Some(kb << 10)
 }
 
 /// The physical memory free now, in bytes (None where it is not known).
@@ -185,6 +216,11 @@ fn avail_phys() -> Option<u64> {
         if unsafe { GlobalMemoryStatusEx(&mut s) } != 0 {
             return Some(s.avail_phys);
         }
+    }
+    // Linux: what the kernel says can be had without swapping (free memory and the file cache it would give back)
+    #[cfg(target_os = "linux")]
+    if let Some(b) = meminfo("MemAvailable:") {
+        return Some(b);
     }
     None
 }
@@ -718,5 +754,20 @@ impl Weights {
             return Ok((&a[at - base..at - base + n], &x.pack));
         }
         Ok((&self.map[at..at + n], &x.pack))
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]
+mod mem_tests {
+    #[test]
+    fn the_machines_memory_is_known() {
+        let total = super::total_phys().expect("installed memory");
+        assert!(total >= 1 << 28, "{total}");
+        // free memory is known on Windows and Linux, and is never more than what is installed
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let avail = super::avail_phys().expect("free memory");
+            assert!(avail > 0 && avail <= total, "{avail} of {total}");
+        }
     }
 }

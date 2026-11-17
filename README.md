@@ -11,6 +11,8 @@ wanted to see if I could get a big model running well on them. What I got from t
 that I wanted to see how far it would go, and it quickly became a passion project. In the end I thought it would be
 useful to others. I hope it helps you. If you want to help ToRc grow, please look at [CONTRIBUTING.md](CONTRIBUTING.md).
 
+<p align="center"><img src="docs/images/torc-demo.gif" alt="ToRc in a few seconds: download the zip, pick a model, talk to it" width="800"></p>
+
 **What is ToRc?** ToRc is a fast CPU inference engine built in Rust, primarily for mixture-of-experts language models.
 It will work with small dense models, but it shines with mixture-of-experts models. It uses its own model format. I
 built it to run big models on machines that don't have a big GPU, and to be able to trust what it says: on the CPU
@@ -21,6 +23,13 @@ It runs on Windows and Linux, on x86-64 (AVX2, AVX-VNNI or AVX512-VNNI) and ARM6
 a Snapdragon NPU it reads prompts with it, a Vulkan GPU takes a share of a long prompt's attention, and a second
 machine can join in as a pipeline worker.
 
+> [!IMPORTANT]
+> **Linux and macOS support is currently experimental.** Windows has had extensive testing, on x86-64 and on
+> Snapdragon X, and every speed in [PERFORMANCE.md](PERFORMANCE.md) was measured there. Linux and macOS build and run,
+> but they have had far less testing due to the equipment that I have access to, so you may see lower speeds or rough
+> edges (hopefully not). If you run ToRc on either, I'd really like to hear how it goes, and contributions would be
+> brilliant ([CONTRIBUTING.md](CONTRIBUTING.md)).
+
 ## Get started in a few minutes
 
 The whole of ToRc, the engine and the desktop app, is a zip of under 20 MB with nothing to install on Windows (its
@@ -29,7 +38,8 @@ system's WebKitGTK, which most desktops already have (if yours hasn't, on Ubuntu
 `sudo apt install libwebkit2gtk-4.1-0`). If you can unzip a file, you can run your own model on your own machine:
 
 1. **Download the zip for your machine from the [Releases page](https://github.com/Rendeverance/ToRc/releases/latest)**
-   and unzip it somewhere of your own, such as Documents.
+   and unzip it somewhere of your own, such as Documents. On a Mac the zip isn't signed, so macOS will block it: after
+   unzipping, run `xattr -dr com.apple.quarantine <the ToRc folder>` in Terminal.
 2. Open ToRc.
 3. Pick a model. A GGUF is converted once, in the app, to ToRc's format. GGUFs are on Hugging Face: search for the
    model's name with "GGUF". Most of the speeds here are Q4_0, so that's a good place to start.
@@ -224,9 +234,9 @@ head is requantised to Q4_0 at load, fewer bytes a token than the file's Q6_K, s
 
 - Faster writing at long context: the guessed tokens checked against the attention cache together, so each extra
   guess costs as little at 16k as it does at 1k.
-- Linux on bare metal. Linux has been tested under WSL2 (Ubuntu 24.04): it builds, the tests pass, and
-  Qwen3.6-35B-A3B chats and tool calls all work through `torc-server`. I haven't tested it on a bare-metal Linux install
-  yet. If you can test it for me, please let me know how it goes.
+- ~~Linux on bare metal.~~ Done: a user runs it on a Snapdragon X mini PC under Ubuntu, on bare metal, and it
+  builds and passes its tests under WSL2 (Ubuntu 24.04) too. The Snapdragon NPU works there as well, with llama.cpp's
+  Hexagon backend installed.
 - macOS on Apple Silicon: EXPERIMENTAL. One person has built it from source and run it. The release may have a
   macos-arm64 zip built by GitHub, but I don't have a Mac to test it myself. The zip isn't signed, so macOS will block
   it: after unzipping, run `xattr -dr com.apple.quarantine <the ToRc folder>` in Terminal. If you have a Mac, I'm

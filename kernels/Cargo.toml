@@ -1,6 +1,6 @@
 [package]
 name = "torc-kernels"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -11,3 +11,7 @@ name = "kernels"
 
 [lints]
 workspace = true
+
+# the NPU tier's C++ guard, built on Linux only (build.rs)
+[build-dependencies]
+cc = "1.8"

@@ -33,27 +33,27 @@ don't fit are read from the SSDs as they are needed.
 
 | | short | 1k | 4k | 8k | 16k | 32k | 128k |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| CPU | 169 / 54 | 173 / 62 | 156 / 48 | 134 / 44 | 117 / 30 | 96 / 29 |  |
-| CPU + NPU | 255 / 51 | 282 / 60 | 257 / 52 | 211 / 45 | 169 / 30 | 118 / 29 |  |
-| CPU + GPU (Adreno X1-45) | 181 / 54 | 179 / 60 | 163 / 53 | 151 / 46 | 131 / 34 | 108 / 29 |  |
+| CPU | 169 / 54 | 173 / 62 | 156 / 48 | 134 / 44 | 117 / 30 | 96 / 29 | 39.8 / 10.2 |
+| CPU + NPU | 255 / 51 | 282 / 60 | 257 / 52 | 211 / 45 | 169 / 30 | 118 / 29 | 43.1 / 9.5 |
+| CPU + GPU (Adreno X1-45) | 181 / 54 | 179 / 60 | 163 / 53 | 151 / 46 | 131 / 34 | 108 / 29 | 45.2 / 10.1 |
 | CPU + NPU + GPU (Adreno X1-45) | 267 / 52 | 283 / 59 | 262 / 49 | 223 / 41 | 189 / 34 | 136 / 29 | 48 / 11 |
 
 **Two Snapdragon X mini PCs over USB4: the same, 32 GB each**
 
 | | short | 1k | 4k | 8k | 16k | 32k | 128k |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| CPU | 263 / 55 | 282 / 59 | 308 / 52 | 275 / 52 | 235 / 32 | 177 / 29 |  |
-| CPU + NPU | 358 / 47 | 374 / 61 | 406 / 50 | 357 / 46 | 286 / 36 | 207 / 30 |  |
-| CPU + GPU (Adreno X1-45) | 272 / 49 | 285 / 59 | 307 / 48 | 282 / 45 | 247 / 34 | 191 / 29 |  |
+| CPU | 263 / 55 | 282 / 59 | 308 / 52 | 275 / 52 | 235 / 32 | 177 / 29 | 72.0 / 10.4 |
+| CPU + NPU | 358 / 47 | 374 / 61 | 406 / 50 | 357 / 46 | 286 / 36 | 207 / 30 | 77.2 / 10.1 |
+| CPU + GPU (Adreno X1-45) | 272 / 49 | 285 / 59 | 307 / 48 | 282 / 45 | 247 / 34 | 191 / 29 | 81.3 / 10.2 |
 | CPU + NPU + GPU (Adreno X1-45) | 352 / 51 | 378 / 59 | 406 / 49 | 370 / 50 | 310 / 32 | 229 / 30 | 86.7 / 11.3 |
 
 **Laptop: Ryzen 7 7840HS (8 cores), 32 GB DDR5-5600, Radeon 780M (integrated), RTX 4070 Laptop 8 GB**
 
 | | short | 1k | 4k | 8k | 16k | 32k |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
-| CPU | 169 / 33.9 | 174 / 33.1 | 165 / 34.4 | 148 / 45.1 | 128 / 22.7 | 100 / 16.6 |
-| CPU + GPU (RTX 4070 Laptop) | 173 / 32.3 | 180 / 34.3 | 169 / 35.8 | 154 / 42.5 | 149 / 22.9 | 145 / 17.9 |
-| CPU + GPU (Radeon 780M, integrated) | 174 / 31.9 | 180 / 34.5 | 168 / 38.8 | 164 / 45.6 | 154 / 22.8 | - |
+| CPU | 172 / 34.2 | 178 / 32.4 | 167 / 35.7 | 151 / 51.9 | 130 / 26.4 | 100 / 22.8 |
+| CPU + GPU (RTX 4070 Laptop) | 170 / 33.4 | 177 / 34.7 | 166 / 39.4 | 152 / 51.9 | 147 / 27.0 | 144 / 23.3 |
+| CPU + GPU (Radeon 780M, integrated) | 171 / 34.3 | 177 / 32.8 | 166 / 35.4 | 159 / 51.8 | 149 / 25.2 | - |
 | llama.cpp (CPU) | 119 / 19.9 | 124 / 19.9 | 122 / 17.9 | 112 / 15.9 | 98.3 / 10.1 | 80.1 / 4.7 |
 
 **Desktop: Core i5-12600K (6P + 4E), 64 GB DDR5-5800, RTX 3060 12 GB**
@@ -68,9 +68,9 @@ don't fit are read from the SSDs as they are needed.
 
 | | short | 1k | 4k | 8k | 16k | 32k |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
-| CPU | 255 / 40.6 | 264 / 52.4 | 246 / 45.7 | 223 / 47.3 | 193 / 32.8 | 149 / 31.2 |
+| CPU | 252 / 43.8 | 259 / 52.7 | 243 / 44.2 | 221 / 47.9 | 191 / 43.4 | 148 / 31.7 |
 | CPU, drafts off | 253 / 32.7 | 264 / 32.7 | 248 / 32 | 224 / 31.1 | 194 / 29.4 | 149 / 26.1 |
-| CPU + GPU (Radeon AI PRO R9700*) | 258 / 41.6 | 266 / 53.4 | 249 / 45.3 | 256 / 47.8 | 257 / 34.7 | 248 / 30.8 |
+| CPU + GPU (Radeon AI PRO R9700*) | 253 / 42.6 | 262 / 52.6 | 246 / 47.2 | 250 / 51.5 | 252 / 36.4 | 245 / 32.4 |
 | llama.cpp (CPU) | 143 / 26.5 | 154 / 26.4 | 143 / 24.2 | 133 / 21.1 | 116 / 15.6 | 91.4 / 7.5 |
 | llama.cpp (CPU, drafts on) | 151 / 25.3 | 152 / 34.1 | 143 / 23.6 | 132 / 23.4 | 113 / 16.1 | 88.4 / 4.1 |
 
@@ -95,6 +95,11 @@ don't fit are read from the SSDs as they are needed.
 | llama.cpp (CPU) | 117 / 22.2 | 119 / 21.3 | 92.8 / 12.4 | 59.9 / 6.4 | 43.1 / 2.8 | 25.3 / 1 |
 
 ## Gemma 4 26B-A4B (QAT Q4_0)
+
+A note on memory: 25 of Gemma 4's 30 layers read only the last 1024 tokens, but ToRc keeps every position's keys and
+values for them, so that a chat can be edited or regenerated from any point without reading it again. That is about
+205 KB a token: 6.7 GB at a 32k prompt, on top of the model. A long prompt therefore needs more memory with Gemma than
+with the other models here.
 
 **One Snapdragon X mini PC: X1-26-100 (8 Oryon cores), 32 GB, Hexagon NPU, Adreno X1-45**
 

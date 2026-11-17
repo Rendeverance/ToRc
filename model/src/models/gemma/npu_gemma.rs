@@ -125,7 +125,12 @@ impl GemmaNpu {
             let ctx = g.meta_ctx(n, false);
             make(ctx)?;
             // SAFETY: ctx holds only metadata tensors, and the buffer backs them all
-            let buf = unsafe { (f.ggml_backend_alloc_ctx_tensors_from_buft)(ctx, g.buft) };
+            // an exception in ggml here (a buffer the driver will not map) comes back as an error (Linux)
+            let buft = g.buft;
+            let buf = match ggml::guarded(|| unsafe { (f.ggml_backend_alloc_ctx_tensors_from_buft)(ctx, buft) }) {
+                Ok(b) => b,
+                Err(e) => return err(format!("NPU: buffer allocation failed: {e}")),
+            };
             if buf.is_null() {
                 return err("NPU: buffer allocation failed");
             }
@@ -537,7 +542,7 @@ impl GemmaNpu {
             mf[t * nkf..t * nkf + p + 1].fill(zero);
             for j in 0..nks {
                 let back = (end - 1 + r - j) % r;
-                if back <= end - 1 {
+                if back < end {
                     let q = end - 1 - back;
                     if q <= p && p - q < win {
                         ms[t * nks + j] = zero;

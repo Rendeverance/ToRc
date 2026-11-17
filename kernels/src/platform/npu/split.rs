@@ -37,11 +37,13 @@ pub struct NpuGroup {
     pub ffn_y: *mut f32,
 }
 
+#[cfg(windows)]
 #[allow(non_snake_case)]
 unsafe extern "system" {
     fn GetCurrentThread() -> *mut std::ffi::c_void;
     fn SetThreadPriority(h: *mut std::ffi::c_void, priority: i32) -> i32;
 }
+#[cfg(windows)]
 const THREAD_PRIORITY_HIGHEST: i32 = 2;
 
 /// The nodes a graph may hold (per group: an input, its products, and four for a feed-forward).
@@ -78,7 +80,7 @@ struct Out {
 }
 
 /// The backend pointer and its synchronize function, for the helper thread.
-struct Syncer(ggml::Backend, unsafe extern "C" fn(ggml::Backend));
+struct Syncer(ggml::Backend, unsafe extern "C-unwind" fn(ggml::Backend));
 // SAFETY: ggml_backend_synchronize may be called from a thread other than the one that queued the graph; only this
 // helper calls it while a graph is in flight, and the caller waits for it before doing anything else
 unsafe impl Send for Syncer {}
@@ -89,8 +91,9 @@ pub struct Npu {
     q8: bool,
     verbose: bool,
     w: Vec<Weight>,
-    wctx: Ctx,
-    wbuf: Buffer,
+    /// the weights' contexts and buffers: one of each unless TORC_NPU_BUF_MB caps a buffer's size (see upload)
+    wctx: Vec<Ctx>,
+    wbuf: Vec<Buffer>,
     galloc: Alloc,
     /// the graph in flight: its context and outputs
     gctx: Ctx,
@@ -134,7 +137,8 @@ impl Npu {
                 let s = s;
                 // above the compute pool's threads: those are pinned one per core and spin for a while after each job,
                 // so a flush waiting for one of their cores at equal priority waits for a time slice to end
-                // (TORC_NPU_HELPER_PRIO=1; opt-in)
+                // (TORC_NPU_HELPER_PRIO=1; opt-in, Windows only so far)
+                #[cfg(windows)]
                 if crate::switches::on("TORC_NPU_HELPER_PRIO") {
                     // SAFETY: plain Win32 calls on this thread
                     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
@@ -154,8 +158,8 @@ impl Npu {
             q8: env_on("TORC_NPU_Q8"),
             verbose: env_on("TORC_NPU_VERBOSE"),
             w: Vec::new(),
-            wctx: std::ptr::null_mut(),
-            wbuf: std::ptr::null_mut(),
+            wctx: Vec::new(),
+            wbuf: Vec::new(),
             galloc,
             gctx: std::ptr::null_mut(),
             out: Vec::new(),
@@ -182,7 +186,7 @@ impl Npu {
     /// w must hold the matrix and stay valid and unchanged until [`Npu::upload`] returns.
     pub unsafe fn weight(&mut self, ty: u32, w: *const u8, rows: usize, cols: usize) -> Option<i32> {
         let ty = ty as i32;
-        if !self.wctx.is_null()
+        if !self.wctx.is_empty()
             || w.is_null()
             || ![ggml::F32, ggml::F16, ggml::Q4_0, ggml::Q8_0, ggml::Q6_K].contains(&ty)
         {
@@ -190,7 +194,7 @@ impl Npu {
         }
         // TORC_NPU_Q8: Q4_0 goes in as Q8_0 with the same numbers (a Q4_0 weight is d (q - 8) with q in 0..15, and Q8_0
         // holds d and q - 8 exactly)
-        let from_q4 = ty == ggml::Q4_0 && self.q8 && cols % 32 == 0;
+        let from_q4 = ty == ggml::Q4_0 && self.q8 && cols.is_multiple_of(32);
         self.w.push(Weight {
             ty: if from_q4 { ggml::Q8_0 } else { ty },
             from_q4,
@@ -221,30 +225,90 @@ impl Npu {
     }
 
     /// Uploads every recorded weight, once, and returns (bytes, seconds).
+    #[allow(clippy::result_unit_err)]
     pub fn upload(&mut self) -> Result<(usize, f64), ()> {
         let t0 = Instant::now();
-        if self.w.is_empty() || !self.wctx.is_null() {
+        if self.w.is_empty() || !self.wctx.is_empty() {
             return Err(());
         }
         let f = &self.g.f;
-        self.wctx = self.g.meta_ctx(self.w.len() + 1, false);
-        if self.wctx.is_null() {
-            return Err(());
-        }
-        // SAFETY: tensors of this context; the sources hold their matrices (by weight's contract)
-        unsafe {
-            for w in self.w.iter_mut() {
-                w.t = (f.ggml_new_tensor_2d)(self.wctx, w.ty, w.cols as i64, w.rows as i64);
+        // TORC_NPU_BUF_MB: the largest weight buffer, in MiB (0: one buffer for all). The Linux fastrpc driver refuses
+        // to map one buffer of a whole model's dense products (~900 MiB on a 35B), so there the default is 256.
+        let cap_mb = crate::switches::num::<usize>("TORC_NPU_BUF_MB").unwrap_or(if cfg!(windows) { 0 } else { 256 });
+        let cap = if cap_mb == 0 { usize::MAX } else { cap_mb << 20 };
+        // consecutive weights, in pieces of at most cap bytes (a weight larger than cap gets a piece of its own)
+        let mut pieces: Vec<std::ops::Range<usize>> = Vec::new();
+        let (mut start, mut sum) = (0, 0usize);
+        for (i, w) in self.w.iter().enumerate() {
+            // SAFETY: a plain call
+            let nb = unsafe { (f.ggml_row_size)(w.ty, w.cols as i64) } * w.rows;
+            if i > start && sum + nb > cap {
+                pieces.push(start..i);
+                (start, sum) = (i, 0);
             }
-            self.wbuf = (f.ggml_backend_alloc_ctx_tensors_from_buft)(self.wctx, self.g.buft);
-            if self.wbuf.is_null() {
+            sum += nb;
+        }
+        pieces.push(start..self.w.len());
+        // TORC_NPU_MAX_MB: the most weight bytes to put on the NPU at all, in MiB (0, the default: no limit). The
+        // weights go up in the order they were recorded (the dense products, then the hot experts), and the pieces
+        // past the limit are left out: their weights stay on the CPU. For a driver that maps every buffer inside a
+        // small address window (the Linux fastrpc driver's is 32 bits on some chips), where one buffer too many
+        // fails and takes the session with it.
+        let max_mb = crate::switches::num::<usize>("TORC_NPU_MAX_MB").unwrap_or(0);
+        if max_mb > 0 {
+            let mut used = 0usize;
+            let mut keep = 0;
+            for r in &pieces {
+                let nb: usize = self.w[r.clone()]
+                    .iter()
+                    // SAFETY: a plain call
+                    .map(|w| unsafe { (f.ggml_row_size)(w.ty, w.cols as i64) } * w.rows)
+                    .sum();
+                if keep > 0 && used + nb > max_mb << 20 {
+                    break;
+                }
+                used += nb;
+                keep += 1;
+            }
+            if keep < pieces.len() {
+                let left = self.w.len() - pieces[keep].start;
+                eprintln!("npu: TORC_NPU_MAX_MB={max_mb}: {left} of {} weights stay on the CPU", self.w.len());
+                pieces.truncate(keep);
+            }
+        }
+        for r in pieces {
+            let ctx = self.g.meta_ctx(r.len() + 1, false);
+            if ctx.is_null() {
                 return Err(());
             }
-            // before the copies, because the HTP repacks weights as they go in
-            (f.ggml_backend_buffer_set_usage)(self.wbuf, ggml::USAGE_WEIGHTS);
+            self.wctx.push(ctx);
+            // SAFETY: tensors of this context; the sources hold their matrices (by weight's contract)
+            unsafe {
+                for w in &mut self.w[r] {
+                    w.t = (f.ggml_new_tensor_2d)(ctx, w.ty, w.cols as i64, w.rows as i64);
+                }
+                // an exception here (a buffer the driver will not map) means no NPU, not the end of the run
+                let buft = self.g.buft;
+                let buf = ggml::guarded(|| (f.ggml_backend_alloc_ctx_tensors_from_buft)(ctx, buft))
+                    .map_err(|e| eprintln!("npu: weight buffer refused: {e}"))?;
+                if buf.is_null() {
+                    return Err(());
+                }
+                self.wbuf.push(buf);
+                // before the copies, because the HTP repacks weights as they go in
+                (f.ggml_backend_buffer_set_usage)(buf, ggml::USAGE_WEIGHTS);
+            }
+        }
+        if self.verbose && self.wbuf.len() > 1 {
+            eprintln!("npu: weights in {} buffers of at most {cap_mb} MiB", self.wbuf.len());
         }
         let mut bytes = 0;
         for i in 0..self.w.len() {
+            // left out by TORC_NPU_MAX_MB: no tensor, so not on the NPU
+            if self.w[i].t.is_null() {
+                self.w[i].ok = false;
+                continue;
+            }
             let ok = [64, 256, 512].iter().all(|&n| self.supports(i, n));
             self.w[i].ok = ok;
             let w = &self.w[i];
@@ -269,9 +333,12 @@ impl Npu {
                             o[18 + k] = ((i[2 + k] >> 4) as i8 - 8) as u8;
                         }
                     }
-                    (f.ggml_backend_tensor_set)(w.t, tmp.as_ptr().cast(), 0, nb);
+                    let src = tmp.as_ptr().cast();
+                    ggml::guarded(|| (f.ggml_backend_tensor_set)(w.t, src, 0, nb))
+                        .map_err(|e| eprintln!("npu: weight upload: {e}"))?;
                 } else {
-                    (f.ggml_backend_tensor_set)(w.t, w.src.cast(), 0, nb);
+                    ggml::guarded(|| (f.ggml_backend_tensor_set)(w.t, w.src.cast(), 0, nb))
+                        .map_err(|e| eprintln!("npu: weight upload: {e}"))?;
                 }
                 bytes += nb;
             }
@@ -456,11 +523,11 @@ impl Drop for Npu {
         // SAFETY: what this object made, freed once; the session itself goes with self.g
         unsafe {
             (f.ggml_gallocr_free)(self.galloc);
-            if !self.wbuf.is_null() {
-                (f.ggml_backend_buffer_free)(self.wbuf);
+            for &b in &self.wbuf {
+                (f.ggml_backend_buffer_free)(b);
             }
-            if !self.wctx.is_null() {
-                (f.ggml_free)(self.wctx);
+            for &c in &self.wctx {
+                (f.ggml_free)(c);
             }
         }
     }

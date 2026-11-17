@@ -69,9 +69,9 @@ pub fn q4_0_dot_rows(w: &[u8], row_bytes: usize, x: &[Groups32], y: &mut [f32]) 
     }
 }
 
-#[cfg(all(target_arch = "aarch64", windows))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 pub use platform::npu::ggml;
-#[cfg(all(target_arch = "aarch64", windows))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 pub use platform::npu::split as npu;
 
 /// One step of the gated DeltaNet recurrence over rows = v.len() rows of an f32 state (qwen4exp's), in the NEON

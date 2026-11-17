@@ -362,6 +362,7 @@ fn complete(e: &mut dyn Serve, s: &mut TcpStream, a: Api, c: api::Chat) {
 }
 
 fn main() {
+    model::set_npu_env();
     // every panic's message and backtrace is appended to panic.log next to the executable, and a panic on the main
     // thread (a request's) ends the server there and then, rather than leaving the process alive with its listener
     // closed and nothing in its log. A helper thread's panic carries on as before (the NPU helper's ends only its
@@ -422,9 +423,17 @@ fn main() {
     eprintln!("torc-server: threads {threads}{}", if asked == 0 { " (auto: the fastest cores)" } else { "" });
     let ctx: usize = a.get(4).and_then(|v| v.parse().ok()).unwrap_or(8192);
     // each family answers through its own module (serve.rs), chosen by the file's architecture
-    let arch = format::read::Model::open(&a[1]).ok().and_then(|f| {
-        format::meta::Meta::parse(&f.metadata).ok().and_then(|mm| mm.str("general.architecture").map(str::to_string))
-    });
+    let meta = format::read::Model::open(&a[1]).ok().and_then(|f| format::meta::Meta::parse(&f.metadata).ok());
+    let arch = meta.as_ref().and_then(|mm| mm.str("general.architecture").map(str::to_string));
+    // a context past the one the model was made for runs, but its replies get worse past that point (llama.cpp refuses
+    // it): say so, once, where the log shows it
+    if let Some(trained) = meta.as_ref().and_then(|mm| mm.arch_u32("context_length"))
+        && ctx > trained as usize
+    {
+        eprintln!(
+            "torc-server: context {ctx} is past the {trained} tokens this model was made for: past that, replies get worse"
+        );
+    }
     let (path, name) = (a[1].as_str(), a.get(5).cloned());
     let mut e = match arch.as_deref() {
         Some("gemma4") => model::models::gemma::serve::open(path, ctx, name),
@@ -432,6 +441,8 @@ fn main() {
         // every other architecture is one of Model's (models/qwen), which refuses a file it can't run
         _ => model::models::qwen::serve::open(path, ctx, name),
     };
+    // the pinning torc-tune chose for this model on this machine, now that its tune file can be found
+    model::pool::apply_tuned_pin();
     listen(&mut *e, port);
 }
 

@@ -33,6 +33,9 @@ On Linux the app needs WebKitGTK 4.1, which most desktops already have (if yours
 Debian 12 or later: `sudo apt install libwebkit2gtk-4.1-0`). `unzip` keeps the programs executable; if whatever
 unpacked the zip did not, run `chmod +x ToRc engine/*` in this folder.
 
+On a Mac the zip isn't signed, so macOS will block it: run `xattr -dr com.apple.quarantine .` in this folder in
+Terminal once, then open `ToRc`.
+
 ## What is in here
 
 | | |
@@ -50,7 +53,9 @@ unpacked the zip did not, run `chmod +x ToRc engine/*` in this folder.
 | `docs` | the guides |
 
 To move ToRc, move the folder. To remove it, delete the folder. The folder has to be one you can write to, so keep it
-somewhere like Documents rather than Program Files.
+somewhere like Documents rather than Program Files. What the engine learns about your machine (Auto-tune's results,
+which experts a model uses most) is kept outside it, in `%LOCALAPPDATA%\torc` on Windows and `~/.cache/torc` on Linux
+and macOS: delete that folder too to remove every trace.
 
 ## Guides
 

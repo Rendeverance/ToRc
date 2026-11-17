@@ -23,11 +23,11 @@ For a feel of the speed, the Qwen3.6-35B (Q4_0) on one Snapdragon X mini PC with
 
 ## What you need
 
-- Windows 11, ARM64 or x86-64. On x86-64 the CPU needs AVX2 (Intel Haswell, AMD Zen or later). On Linux it has run under WSL2, not yet on a real machine (see Limitations).
+- Windows 11, ARM64 or x86-64. On x86-64 the CPU needs AVX2 (Intel Haswell, AMD Zen or later). Linux runs on bare metal too (Ubuntu on a Snapdragon X mini PC, tested by a user) as well as under WSL2.
 - Enough RAM for the model, or a fast SSD for the parts that don't fit (ToRc streams experts from the drive).
 - Rust (stable). On Windows on ARM, either Rust's default MSVC toolchain with the Visual Studio C++ build tools for ARM64 (the release zips are built this way), or the `aarch64-pc-windows-gnullvm` toolchain with llvm-mingw on your `PATH`.
 - Node.js 18 or newer for the benchmark script. Nothing to `npm install`.
-- For the NPU: a ggml build with the Hexagon backend (the GenieX CLI installs one) - point `TORC_NPU_DIR` at it if it isn't in the default folder.
+- For the NPU: a ggml build with the Hexagon backend (the GenieX CLI installs one) - point `TORC_NPU_DIR` at it if it isn't in the default folder. On Linux that is llama.cpp built with its Hexagon backend (`libggml.so`, with its backends and the Hexagon libraries beside it); the default folder there is `/usr/local/lib`. If the NPU stops opening after a run that crashed, reload the kernel's driver (`rmmod fastrpc && modprobe fastrpc`) or restart: a session that ended badly can leave it unable to open another.
 
 ## Building
 
@@ -40,6 +40,8 @@ cargo build --release --workspace
 ```
 
 For the GPU tier, add `--features torc-model/gpu` to the ARM line, or run `./build-x86.sh target --features torc-model/gpu`. The release zips are built with it.
+
+On Linux the same `cargo build --release --workspace` line builds it; it needs a C++ compiler as well (g++, in Ubuntu's `build-essential`), for the NPU tier's small guard that turns an exception thrown inside ggml into an error instead of a crash.
 
 The executables land in `target/release`. Built with llvm-mingw (gnullvm), they need its `libunwind.dll` next to them.
 
@@ -88,7 +90,7 @@ cargo build --release
 cargo build --release --manifest-path desktop/Cargo.toml
 ```
 
-On Linux the app needs WebKitGTK (on Ubuntu: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`). `desktop/package/pack.sh` lays the two builds out as the zip: the app, then `engine/`, `models/`, `chats/`, `primers/`, `mcps/`, `tools/`, `data/` and `docs/` beside it. Run from that folder, the app keeps everything in it; run from anywhere else, it keeps its settings in your system's folder for app data.
+On Linux the app needs WebKitGTK (on Ubuntu: `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev`). `desktop/package/pack.sh` lays the two builds out as the zip: the app, then `engine/`, `models/`, `chats/`, `primers/`, `mcps/`, `tools/`, `data/` and `docs/` beside it. Run from that folder, the app keeps its settings, chats and models in it; run from anywhere else, it keeps its settings in your system's folder for app data. Either way, what the engine learns about the machine (Auto-tune's results, expert usage, the two-machine split) goes in ToRc's cache folder, `%LOCALAPPDATA%\torc` or `~/.cache/torc`.
 
 Pick a model from the left pane: a `.torc` file, or a GGUF, which it converts once (it checks the architecture first and tells you the space it needs). Auto-tune measures your machine; then load and chat. It starts and stops torc-server itself, so there's nothing else to run. Chats are saved as plain JSON files, a primer is a Markdown file, and Advanced lists every switch in [SWITCHES.md](SWITCHES.md) with a box to set it. The built-in tools (the time, a calculator, the model's own context use, and, off until you switch them on, compacting and wake-ups) are always there; beside them are either your own MCP servers (ToRc asks you before each call one of those makes) or ToolFunnel, which it installs for you and whose tools and servers the Tools screen lists. On Windows, `node desktop/test/check.js <file.torc>` runs the real app against the real engine from a folder of its own, so it never touches yours; it drives the page through WebView2's DevTools port, which the app opens on the local machine only when `TORC_DEVTOOLS_PORT` is set.
 
@@ -99,7 +101,7 @@ ToRc's defaults are sensible, but every machine is different, and the only way t
 1. **Look at the machine first.** `hwscan` reports your cores, memory bandwidth, real clocks under load and drive speed. On Linux its inventory is mostly empty for now.
 2. **Tune the prompt block.** `torc-tune model.torc` tries the block sizes on your machine and saves the best one where the server finds it. Run it with the same settings you'll serve with (NPU and GPU on, the second machine up). A few minutes.
 3. **Threads.** `auto` is usually right. On a hybrid Intel CPU, also try the P-cores only, one thread per core.
-4. **Two ARM switches worth trying:** `TORC_Q4X4=1` and `TORC_ATTN_TILE=1`. Both are off by default on the Qwen models (Gemma turns Q4X4 on itself when the NPU is off), and both are faster on my Snapdragon machines with the 35B. Try them on yours.
+4. **Two ARM switches worth trying:** `TORC_Q4X4=1` and `TORC_ATTN_TILE=1`. Q4X4 is off by default on the Qwen models (Gemma turns it on itself when the NPU is off) and is faster on my Snapdragon machines with the 35B. The tiled attention path is on by default for the Qwen3.6-35B, where it makes replies at a long context a few percent faster with the same output, and off for the other models: try `TORC_ATTN_TILE=1` on them, or `0` on the 35B, and keep what is faster on yours.
 5. **The NPU (Snapdragon X).** `TORC_NPU=1` reads prompts faster by putting part of the work on the NPU. It isn't bit-exact (the NPU rounds differently), so it only touches prompts, never replies. Run `npucheck` first to make sure it works. On one machine it also learns which experts your work uses most and gives those to the NPU from the next time the model loads, so the second session reads faster than the first - nothing to set up.
 6. **The GPU.** In the release zips (and in a build with the GPU feature), `TORC_GPU_ATTN=1` runs part of a long prompt's attention on the GPU while the CPU does the rest. It takes the integrated GPU by default (`TORC_GPU=<part of a name>` picks another), works out how to split the work on your machine and keeps that split for next time. It only joins in once a prompt is a few thousand tokens long, and like the NPU it isn't bit-exact, so it never touches replies. `TORC_GPU_CHECK=1` compares its results with the CPU's. If the GPU turns out to be no gain over the CPU alone, ToRc switches it off for that model, says so in the log and remembers. If the card runs out of memory (a big model's keys at a long context on a small card), ToRc switches the GPU off for the rest of the run, says so in the log, and the CPU carries on. Intel integrated graphics on a desktop is that case: it is several times slower than the CPU next to it, and its driver can crash outright on some models, so if you have a graphics card name it with `TORC_GPU`, and if Intel integrated is all you have, leave this off. And because the split follows measured speed, two runs of the same prompt can give slightly different replies with the GPU on, where the model's choice is a near tie. With it off every run is identical.
 7. **Large pages** (Windows, needs the "Lock pages in memory" right for your account). `TORC_KLAY_LARGE`, `TORC_EXPERTS_LARGE` and `TORC_OWN_LARGE` help on some machines, but a machine that has been up for days can't always find the memory for them, so measure. (`TORC_EXPERTS_LARGE` does nothing with `TORC_Q4X4=1` on - the repacked copies are what get read then.)
@@ -138,7 +140,7 @@ Then:
 
 ToRc is a focused solo build, tested hard on my own machines: two Snapdragon X mini PCs, an x86 laptop and an x86 desktop. Outside of that it will have rough edges.
 
-- **Windows first.** On Linux it has run under WSL2 (Ubuntu 24.04), not yet on a real machine, and `auto` threads there take every CPU, E-cores included: give the P-cores' count by hand on a hybrid CPU.
+- **Windows first.** Linux runs on bare metal (Ubuntu on a Snapdragon X mini PC, tested by a user) and under WSL2 (Ubuntu 24.04). On Linux `auto` threads take every CPU, E-cores included: give the P-cores' count by hand on a hybrid CPU.
 - **One request at a time.** The server runs one conversation at once; it's built for a person, not a crowd.
 - **Gemma 4** doesn't save chats on the whole-NPU tier (`TORC_NPU=pure`).
 - **Text the model reads can still steer it.** Control strings like `<|im_end|>` in what you paste or what a tool returns are broken before the model sees them, so they can't fake a turn (except on ERNIE, whose turns are the plain words "User:" and "Assistant:", which no marker-breaking can protect). But a page that says "ignore the user" in plain words still works on most models, mine included. Don't give a model text from the open web and tools that can do damage in the same chat.

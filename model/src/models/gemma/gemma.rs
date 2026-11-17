@@ -198,7 +198,7 @@ pub struct Gemma {
     head: Option<(u32, Vec<u8>)>,
     /// TORC_NPU=pure: the whole model runs on the NPU (npu_gemma.rs); forward does the embedding here and runs the rest
     /// there
-    #[cfg(all(target_arch = "aarch64", windows))]
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
     pure: Option<crate::npu_gemma::GemmaNpu>,
     /// the last forward pass's hidden states after the final norm, one row (d_model) per row of logits: the drafter's h
     /// (gemma_mtp.rs)
@@ -355,7 +355,7 @@ impl Gemma {
             AttnEngine::create(h.n_head as u32, h.full.n_head_kv as u32, h.full.head_dim as u32, Some(1.0), 0)?;
         let eng_swa =
             AttnEngine::create(h.n_head as u32, h.swa.n_head_kv as u32, h.swa.head_dim as u32, Some(1.0), h.window)?;
-        #[cfg(all(target_arch = "aarch64", windows))]
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
         let pure = if pure_npu() { Some(crate::npu_gemma::GemmaNpu::load(&w, &h, n_ctx as usize)?) } else { None };
         // Q4_0 by default: fewer bytes a token than the file's Q6_K
         let head = match crate::switches::get("TORC_HEAD").as_deref() {
@@ -384,7 +384,7 @@ impl Gemma {
             rope_freqs,
             out_norm,
             n_ctx,
-            #[cfg(all(target_arch = "aarch64", windows))]
+            #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
             pure,
             hid: Vec::new(),
             cap_logits: true,
@@ -487,7 +487,7 @@ impl Gemma {
                 &mut sns[t * hs..(t + 1) * hs],
             );
         }
-        #[cfg(all(target_arch = "aarch64", windows))]
+        #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
         if let Some(p) = self.pure.as_mut() {
             p.cap = self.cap_logits;
             p.forward(&x, n, pos0 as usize, logits, all)?;

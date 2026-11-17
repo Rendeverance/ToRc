@@ -88,7 +88,285 @@ fn f32_on() -> bool {
     *ON
 }
 
-/// scores::<NS>, or over the item's f32 copy (kf: rows base..base + nt) when f32c is set.
+/// TORC_ATTN_FAST=1: the scores over each query at sixteen bits (fast::scores). Off by default: the scores are then no
+/// longer the exact path's bits (they differ by the query's rounding, about 3e-5 of the largest score).
+fn fast_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switches::on("TORC_ATTN_FAST"));
+    *ON
+}
+
+/// Whether fast::scores takes this cache and head width: int8 keys, and a head of at most 256 numbers in whole
+/// sixteens (so a score's integer sum stays inside 32 bits: 256 x 127 x 32767 is under 2^31).
+fn fast_fits(kv: &KvCache, hd: usize) -> bool {
+    kv.k16.is_empty() && hd <= fast::HD_MAX && hd.is_multiple_of(16)
+}
+
+/// The fast scores (TORC_ATTN_FAST=1). A query row is rounded to sixteen-bit integers with a step of its own (its
+/// largest magnitude goes to 32767), and its product with a row of int8 keys is then an exact integer sum, which the
+/// processor does sixteen numbers to an instruction where the float path does four (NEON) or eight (AVX2). The score
+/// is that sum times the step, the scale and the key's scale. A slot's scores depend only on its own query and the
+/// keys, so a token gives the same bits alone or in any block; every kernel here gives the portable one's bits.
+mod fast {
+    use super::*;
+
+    /// The widest head the integer sums allow.
+    pub(super) const HD_MAX: usize = 256;
+
+    /// q at sixteen bits: q[i] is about out[i] x the step returned (0 for a row of zeros).
+    pub(super) fn quantize(q: &[f32], out: &mut [i16]) -> f32 {
+        let m = q.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        if m == 0.0 {
+            out.fill(0);
+            return 0.0;
+        }
+        let up = 32767.0 / m;
+        for (o, &x) in out.iter_mut().zip(q) {
+            *o = (x * up).round_ties_even() as i16;
+        }
+        m / 32767.0
+    }
+
+    /// The integer sums of one key row against NS queries: the definition.
+    #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+    pub(super) fn dots_portable<const NS: usize>(k: &[i8], q: &[[i16; HD_MAX]; NS], hd: usize) -> [i32; NS] {
+        std::array::from_fn(|s| k[..hd].iter().zip(&q[s][..hd]).map(|(&a, &b)| a as i32 * b as i32).sum())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    mod x86 {
+        use super::HD_MAX;
+        use std::arch::x86_64::*;
+
+        #[inline(always)]
+        unsafe fn sum8(v: __m256i) -> i32 {
+            unsafe {
+                let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+                let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b0100_1110>(s));
+                _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32::<0b1011_0001>(s)))
+            }
+        }
+
+        /// AVX2: sixteen keys widened to 16 bits, multiplied and added in pairs (vpmaddwd), then added in.
+        #[target_feature(enable = "avx2")]
+        pub(super) unsafe fn dots_avx2<const NS: usize>(k: *const i8, q: &[[i16; HD_MAX]; NS], hd: usize) -> [i32; NS] {
+            unsafe {
+                let mut a = [_mm256_setzero_si256(); NS];
+                let mut i = 0;
+                while i < hd {
+                    let kw = _mm256_cvtepi8_epi16(_mm_loadu_si128(k.add(i).cast()));
+                    for s in 0..NS {
+                        let qv = _mm256_loadu_si256(q[s].as_ptr().add(i).cast());
+                        a[s] = _mm256_add_epi32(a[s], _mm256_madd_epi16(kw, qv));
+                    }
+                    i += 16;
+                }
+                a.map(|v| sum8(v))
+            }
+        }
+
+        /// AVX-VNNI: the multiply, the pair sum and the add in one instruction (vpdpwssd).
+        #[target_feature(enable = "avx2,avxvnni")]
+        pub(super) unsafe fn dots_vnni<const NS: usize>(k: *const i8, q: &[[i16; HD_MAX]; NS], hd: usize) -> [i32; NS] {
+            unsafe {
+                let mut a = [_mm256_setzero_si256(); NS];
+                let mut i = 0;
+                while i < hd {
+                    let kw = _mm256_cvtepi8_epi16(_mm_loadu_si128(k.add(i).cast()));
+                    for s in 0..NS {
+                        let qv = _mm256_loadu_si256(q[s].as_ptr().add(i).cast());
+                        a[s] = _mm256_dpwssd_avx_epi32(a[s], kw, qv);
+                    }
+                    i += 16;
+                }
+                a.map(|v| sum8(v))
+            }
+        }
+
+        /// AVX512-VNNI at 256 bits (the processors that have it without AVX-VNNI).
+        #[target_feature(enable = "avx2,avx512vnni,avx512vl")]
+        pub(super) unsafe fn dots_vnni512<const NS: usize>(
+            k: *const i8,
+            q: &[[i16; HD_MAX]; NS],
+            hd: usize,
+        ) -> [i32; NS] {
+            unsafe {
+                let mut a = [_mm256_setzero_si256(); NS];
+                let mut i = 0;
+                while i < hd {
+                    let kw = _mm256_cvtepi8_epi16(_mm_loadu_si128(k.add(i).cast()));
+                    for s in 0..NS {
+                        let qv = _mm256_loadu_si256(q[s].as_ptr().add(i).cast());
+                        a[s] = _mm256_dpwssd_epi32(a[s], kw, qv);
+                    }
+                    i += 16;
+                }
+                a.map(|v| sum8(v))
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    mod arm {
+        use super::HD_MAX;
+        use std::arch::aarch64::*;
+        use std::arch::asm;
+
+        #[inline]
+        #[target_feature(enable = "dotprod")]
+        unsafe fn sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+            unsafe {
+                asm!("sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b", acc = inout(vreg) acc, a = in(vreg) a, b = in(vreg) b,
+                    options(pure, nomem, nostack));
+            }
+            acc
+        }
+
+        /// USDOT: acc.4s += u.16b (unsigned) . s.16b (signed).
+        #[inline]
+        #[target_feature(enable = "i8mm")]
+        unsafe fn usdot(mut acc: int32x4_t, u: uint8x16_t, s: int8x16_t) -> int32x4_t {
+            unsafe {
+                asm!("usdot {acc:v}.4s, {u:v}.16b, {s:v}.16b", acc = inout(vreg) acc, u = in(vreg) u, s = in(vreg) s,
+                    options(pure, nomem, nostack));
+            }
+            acc
+        }
+
+        /// A query's sixteen-bit numbers as their high bytes (signed) and low bytes (unsigned): q = 256 hi + lo, so
+        /// the sum with the keys is 256 x SDOT(keys, hi) + USDOT(lo, keys), sixteen keys to each instruction.
+        pub(super) fn split(q: &[i16; HD_MAX], hi: &mut [i8; HD_MAX], lo: &mut [u8; HD_MAX]) {
+            for i in 0..HD_MAX {
+                hi[i] = (q[i] >> 8) as i8;
+                lo[i] = q[i] as u8;
+            }
+        }
+
+        #[target_feature(enable = "dotprod,i8mm")]
+        pub(super) unsafe fn dots<const NS: usize>(
+            k: *const i8,
+            hi: &[[i8; HD_MAX]; NS],
+            lo: &[[u8; HD_MAX]; NS],
+            hd: usize,
+        ) -> [i32; NS] {
+            unsafe {
+                let mut ah = [vdupq_n_s32(0); NS];
+                let mut al = [vdupq_n_s32(0); NS];
+                let mut i = 0;
+                while i < hd {
+                    let kv = vld1q_s8(k.add(i));
+                    for s in 0..NS {
+                        ah[s] = sdot(ah[s], kv, vld1q_s8(hi[s].as_ptr().add(i)));
+                        al[s] = usdot(al[s], vld1q_u8(lo[s].as_ptr().add(i)), kv);
+                    }
+                    i += 16;
+                }
+                std::array::from_fn(|s| (256 * vaddvq_s32(ah[s]) as i64 + vaddvq_s32(al[s]) as i64) as i32)
+            }
+        }
+    }
+
+    /// portable::scores' arguments, over the queries at sixteen bits. The caller has checked fast_fits.
+    pub(super) fn scores<const NS: usize>(
+        kv: &KvCache,
+        base: usize,
+        nt: usize,
+        hd: usize,
+        scale: f32,
+        qs: [&[f32]; NS],
+        sc: &mut [f32],
+    ) {
+        assert!(sc.len() >= NS * PAGE && nt <= PAGE && hd <= HD_MAX && hd.is_multiple_of(16));
+        assert!(kv.k16.is_empty() && kv.k.len() >= (base + nt) * hd && qs.iter().all(|q| q.len() >= hd));
+        let mut qi = [[0i16; HD_MAX]; NS];
+        let step: [f32; NS] = std::array::from_fn(|s| quantize(&qs[s][..hd], &mut qi[s][..hd]));
+        let ks = &kv.k_scale[base..base + nt];
+        let k = &kv.k[base * hd..(base + nt) * hd];
+        let put = |t: usize, sums: [i32; NS], sc: &mut [f32]| {
+            for s in 0..NS {
+                sc[s * PAGE + t] = ((sums[s] as f32 * step[s]) * scale) * ks[t];
+            }
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 0: AVX2, 1: AVX-VNNI, 2: AVX512-VNNI at 256 bits
+            static KIND: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+                if std::arch::is_x86_feature_detected!("avxvnni") {
+                    1
+                } else if std::arch::is_x86_feature_detected!("avx512vnni")
+                    && std::arch::is_x86_feature_detected!("avx512vl")
+                {
+                    2
+                } else if std::arch::is_x86_feature_detected!("avx2") {
+                    0
+                } else {
+                    3
+                }
+            });
+            if *KIND < 3 {
+                for t in 0..nt {
+                    let row = k[t * hd..].as_ptr();
+                    // SAFETY: the row holds hd keys and each query hd numbers (checked), and the feature was detected
+                    let sums = unsafe {
+                        match *KIND {
+                            1 => x86::dots_vnni::<NS>(row, &qi, hd),
+                            2 => x86::dots_vnni512::<NS>(row, &qi, hd),
+                            _ => x86::dots_avx2::<NS>(row, &qi, hd),
+                        }
+                    };
+                    put(t, sums, sc);
+                }
+                return;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            static OK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::arch::is_aarch64_feature_detected!("dotprod") && std::arch::is_aarch64_feature_detected!("i8mm")
+            });
+            if *OK {
+                let (mut hi, mut lo) = ([[0i8; HD_MAX]; NS], [[0u8; HD_MAX]; NS]);
+                for s in 0..NS {
+                    arm::split(&qi[s], &mut hi[s], &mut lo[s]);
+                }
+                for t in 0..nt {
+                    // SAFETY: as above
+                    let sums = unsafe { arm::dots::<NS>(k[t * hd..].as_ptr(), &hi, &lo, hd) };
+                    put(t, sums, sc);
+                }
+                return;
+            }
+        }
+        #[allow(unreachable_code)]
+        for t in 0..nt {
+            put(t, dots_portable::<NS>(&k[t * hd..], &qi, hd), sc);
+        }
+    }
+
+    /// For the tests: the portable sums whatever the processor.
+    #[cfg(test)]
+    pub(super) fn scores_portable<const NS: usize>(
+        kv: &KvCache,
+        base: usize,
+        nt: usize,
+        hd: usize,
+        scale: f32,
+        qs: [&[f32]; NS],
+        sc: &mut [f32],
+    ) {
+        let mut qi = [[0i16; HD_MAX]; NS];
+        let step: [f32; NS] = std::array::from_fn(|s| quantize(&qs[s][..hd], &mut qi[s][..hd]));
+        let ks = &kv.k_scale[base..base + nt];
+        for t in 0..nt {
+            let sums = dots_portable::<NS>(&kv.k[(base + t) * hd..], &qi, hd);
+            for s in 0..NS {
+                sc[s * PAGE + t] = ((sums[s] as f32 * step[s]) * scale) * ks[t];
+            }
+        }
+    }
+}
+
+/// scores::<NS>, or over the item's f32 copy (kf: rows base..base + nt) when f32c is set; with TORC_ATTN_FAST=1, the
+/// fast scores (fast::scores) where they apply.
 #[allow(unused_variables, clippy::too_many_arguments)]
 #[inline(always)]
 fn scores_c<const NS: usize>(
@@ -102,6 +380,9 @@ fn scores_c<const NS: usize>(
     qs: [&[f32]; NS],
     sc: &mut [f32],
 ) {
+    if fast_on() && fast_fits(kv, hd) {
+        return fast::scores::<NS>(kv, base, nt, hd, scale, qs, sc);
+    }
     #[cfg(target_arch = "aarch64")]
     if f32c {
         return neon::scores_f32::<NS>(kf, &kv.k_scale[base..base + nt], nt, hd, scale, qs, sc);
@@ -144,11 +425,35 @@ fn gather_on() -> bool {
     *ON
 }
 
-/// TORC_ATTN_TILE=1 (ARM): item's tiled f32 path, for 16 slots or more but below TORC_ATTN_F32_MIN.
+/// The model's default for the tiled path when TORC_ATTN_TILE is unset (set_tile_default).
+static TILE_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets the model's default for the tiled path (tile_on): on for the model it was measured on, the Qwen3.6-35B's
+/// architecture, where a draft-checking pass at a long context is faster through it with the same bits. Call it
+/// before the model's first attention pass. It changes nothing off ARM, where there is no tiled path.
+pub fn set_tile_default(on: bool) {
+    TILE_DEFAULT.store(on, Ordering::Relaxed);
+}
+
+/// The tiled f32 path of item (ARM), for 16 slots or more (TORC_ATTN_TILE_MIN: another count) but below
+/// TORC_ATTN_F32_MIN: TORC_ATTN_TILE=1 / 0, else the model's default. Fixed at the first call.
 #[cfg(target_arch = "aarch64")]
 fn tile_on() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switches::on("TORC_ATTN_TILE"));
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| match crate::switches::get("TORC_ATTN_TILE").as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => TILE_DEFAULT.load(Ordering::Relaxed),
+        });
     *ON
+}
+
+/// The fewest slots the tiled path takes: TORC_ATTN_TILE_MIN, else 16.
+#[cfg(target_arch = "aarch64")]
+fn tile_min() -> usize {
+    static MIN: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| crate::switches::num("TORC_ATTN_TILE_MIN").unwrap_or(16).max(1));
+    *MIN
 }
 
 /// Eight lanes summed as a pairwise tree: ((0 + 1) + (2 + 3)) + ((4 + 5) + (6 + 7)).
@@ -500,12 +805,27 @@ impl Fattn {
         // partials, with each slot's chain carried from tile to tile. The scores are per position and the values are
         // chained in position order, so the bits are the same
         #[cfg(target_arch = "aarch64")]
-        if !f32c && slot_count >= 16 && f32_on() && tile_on() {
+        if !f32c && slot_count >= tile_min() && f32_on() && tile_on() {
             const TP: usize = 32;
             let mut st = crate::scratch::buf::<f32>("fattn.st", slot_count * PAGE);
             let mut tf = crate::scratch::buf::<f32>("fattn.tf", TP * hd);
             let ks = &kv.k_scale[base..base + len];
-            let mut a = 0;
+            // with TORC_ATTN_FAST=1 the scores come from the int8 keys as they are (fast::scores), with no tile of
+            // keys to convert; the values below are tiled either way
+            let fast = fast_on() && fast_fits(kv, hd);
+            let mut s0 = 0;
+            while fast && s0 < slot_count {
+                let step = batch(slot_count - s0);
+                let sc = &mut st[s0 * PAGE..];
+                match step {
+                    8 => fast::scores::<8>(kv, base, len, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), sc),
+                    4 => fast::scores::<4>(kv, base, len, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), sc),
+                    2 => fast::scores::<2>(kv, base, len, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), sc),
+                    _ => fast::scores::<1>(kv, base, len, hd, self.scale, [qrow(s0)], sc),
+                }
+                s0 += step;
+            }
+            let mut a = if fast { len } else { 0 };
             while a < len {
                 let tn = TP.min(len - a);
                 neon::f32_rows(kv, false, base + a, tn, hd, &mut tf);
@@ -1923,6 +2243,78 @@ mod tests {
     ];
 
     use crate::pool::one_caller;
+
+    /// TORC_ATTN_FAST's scores: this processor's kernel gives the portable definition's bits, for every batch size,
+    /// and the scores are the exact path's to within the query's rounding.
+    #[test]
+    fn fast_scores_are_the_integer_definition() {
+        let mut s = 0x5eed_1234_abcd_0001u64;
+        for &(hd, nt) in &[(256usize, 256usize), (256, 37), (128, 200), (64, 1), (32, 255)] {
+            let kv = cache(&mut s, 2, hd, 600, false);
+            let q: Vec<f32> = (0..8 * hd).map(|_| rnd(&mut s)).collect();
+            let rows: [&[f32]; 8] = std::array::from_fn(|i| &q[i * hd..(i + 1) * hd]);
+            let base = 300 + 5;
+            let (mut a, mut b, mut e) = (vec![0f32; 8 * PAGE], vec![0f32; 8 * PAGE], vec![0f32; 8 * PAGE]);
+            fast::scores::<8>(&kv, base, nt, hd, 0.05, rows, &mut a);
+            fast::scores_portable::<8>(&kv, base, nt, hd, 0.05, rows, &mut b);
+            portable::scores::<8>(&kv, base, nt, hd, 0.05, rows, &mut e);
+            let top = e.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for sl in 0..8 {
+                for t in 0..nt {
+                    let i = sl * PAGE + t;
+                    assert_eq!(a[i].to_bits(), b[i].to_bits(), "hd {hd} nt {nt}: slot {sl} position {t}");
+                    assert!((a[i] - e[i]).abs() <= 2e-4 * top, "hd {hd}: {} against {} (top {top})", a[i], e[i]);
+                }
+            }
+            // a slot's scores are the same in a batch of 8, 4, 2 or 1
+            let mut one = vec![0f32; PAGE];
+            fast::scores::<1>(&kv, base, nt, hd, 0.05, [rows[5]], &mut one);
+            assert!((0..nt).all(|t| one[t].to_bits() == a[5 * PAGE + t].to_bits()), "hd {hd}: a slot alone differs");
+            let mut two = vec![0f32; 2 * PAGE];
+            fast::scores::<2>(&kv, base, nt, hd, 0.05, [rows[4], rows[5]], &mut two);
+            assert!((0..nt).all(|t| two[PAGE + t].to_bits() == a[5 * PAGE + t].to_bits()), "hd {hd}: batch of 2");
+        }
+    }
+
+    /// The score kernels alone on one thread: a page of 256 int8 keys of 256 against 8 queries, the exact kernel and
+    /// TORC_ATTN_FAST's, over 40 pages (2.6 MB of keys, as an item meets them); and the values kernel for scale.
+    #[test]
+    #[ignore]
+    fn bench_fast_scores() {
+        let mut s = 0x0f0f_1234_5678_9abcu64;
+        let (hd, pages) = (256usize, 40usize);
+        let kv = cache(&mut s, 1, hd, pages * PAGE, false);
+        let q: Vec<f32> = (0..8 * hd).map(|_| rnd(&mut s)).collect();
+        let rows: [&[f32]; 8] = std::array::from_fn(|i| &q[i * hd..(i + 1) * hd]);
+        let mut sc = vec![0f32; 8 * PAGE];
+        let mut outs = vec![0f32; 8 * hd];
+        let reps = 50;
+        let mac = (reps * pages * PAGE * hd * 8) as f64;
+        let time = |f: &mut dyn FnMut(usize)| {
+            for p in 0..pages {
+                f(p);
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                for p in 0..pages {
+                    f(p);
+                }
+            }
+            mac / t.elapsed().as_secs_f64() / 1e9
+        };
+        let exact = time(&mut |p| scores::<8>(&kv, p * PAGE, PAGE, hd, 0.05, rows, &mut sc));
+        let fast = time(&mut |p| fast::scores::<8>(&kv, p * PAGE, PAGE, hd, 0.05, rows, &mut sc));
+        let vals = time(&mut |p| {
+            let mut it = outs.chunks_exact_mut(hd);
+            let o: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
+            values::<8>(&kv, p * PAGE, PAGE, hd, &sc, o)
+        });
+        let exact2 = time(&mut |p| scores::<8>(&kv, p * PAGE, PAGE, hd, 0.05, rows, &mut sc));
+        println!(
+            "scores, 8 slots, one thread: exact {exact:.1} / {exact2:.1} GMAC/s, fast {fast:.1} GMAC/s ({:.2}x); values {vals:.1} GMAC/s",
+            fast / exact.max(exact2)
+        );
+    }
 
     #[test]
     fn matches_the_definition() {

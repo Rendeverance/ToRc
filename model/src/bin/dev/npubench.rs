@@ -4,7 +4,7 @@
 //! once, each from its own thread. With real overlap, the wall time of the concurrent runs stays close to the single
 //! run's. Sessions past HTP0 need GGML_HEXAGON_NDEV (or _DEVICES) set to that many.
 
-#[cfg(all(target_arch = "aarch64", windows))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 fn main() {
     use kernels::ggml::{self, Ggml, T};
     use std::time::Instant;
@@ -122,7 +122,7 @@ fn main() {
     }
 }
 
-#[cfg(not(all(target_arch = "aarch64", windows)))]
+#[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux"))))]
 fn main() {
     eprintln!("npubench: ARM64 Windows only");
 }

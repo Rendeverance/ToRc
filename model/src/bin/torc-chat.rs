@@ -5,6 +5,7 @@
 use std::io::Write;
 
 fn main() {
+    model::set_npu_env();
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 3 {
         eprintln!("usage: torc-chat <model.torc> \"<message>\" [max new tokens] [threads]");

@@ -5,7 +5,7 @@
 //! relative RMS of each against the f64 reference or the CPU, and the median time of 5 runs on each side (the CPU using
 //! the whole pool). Needs TORC_NPU=1, and TORC_NPU_DIR if the GenieX ggml build is not in its default folder.
 
-#[cfg(all(target_arch = "aarch64", windows))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 fn main() {
     use kernels::npu::{Npu, NpuGroup, NpuMm, configure};
     use kernels::{Q8, QK, ops as kops};
@@ -133,7 +133,7 @@ fn main() {
     eprintln!("npu stats: {g} graphs, {:.1} ms waited", w * 1e3);
 }
 
-#[cfg(not(all(target_arch = "aarch64", windows)))]
+#[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux"))))]
 fn main() {
     eprintln!("npucheck: ARM64 Windows only (the Snapdragon NPU)");
     std::process::exit(2);

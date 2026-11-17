@@ -16,12 +16,49 @@ unsafe extern "system" {
     fn SetThreadAffinityMask(h: *mut c_void, mask: usize) -> usize;
     fn GetCurrentProcess() -> *mut c_void;
     fn SetProcessAffinityMask(h: *mut c_void, mask: usize) -> i32;
+    fn GetProcessAffinityMask(h: *mut c_void, process: *mut usize, system: *mut usize) -> i32;
 }
 
 pub struct Pool {
     pub threads: usize,
     rayon: bool,
     own: Option<OwnPool>,
+    /// each thread's CPU when pinned (thread 0 is the caller)
+    cpus: Vec<i32>,
+    /// whether the threads are pinned now (set_pin changes it)
+    pinned: AtomicBool,
+    /// the CPUs the process was started on, which an unpinned pool on Linux and a pinned one on Windows go back to
+    home: Home,
+}
+
+/// The CPUs a process may run on: Windows' affinity mask (processor group 0), Linux's CPU set.
+#[cfg(windows)]
+type Home = usize;
+#[cfg(not(windows))]
+type Home = [u64; 16];
+
+/// The CPUs this process (on Linux, this thread) may run on now.
+fn home() -> Home {
+    #[cfg(windows)]
+    {
+        let (mut p, mut s) = (0usize, 0usize);
+        unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut p, &mut s) };
+        p
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+        }
+        let mut set = [0u64; 16];
+        // SAFETY: pid 0 is this thread, and the set is a whole cpu_set_t
+        unsafe { sched_getaffinity(0, std::mem::size_of_val(&set), set.as_mut_ptr()) };
+        set
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        [0; 16]
+    }
 }
 
 // SAFETY: the pool is driven from one thread at a time, which is how the forward pass uses it
@@ -185,17 +222,19 @@ pub fn init(n: usize) -> &'static Pool {
             _ => spread_cpus(n).unwrap_or_else(|| (0..n as i32).collect()),
         };
         let n = cpus.len();
+        let home = home();
         let rayon = crate::switches::is("TORC_POOL", "rayon");
         if rayon {
             crate::init_threads(n);
-            return Pool { threads: n, rayon, own: None };
+            return Pool { threads: n, rayon, own: None, cpus, pinned: AtomicBool::new(false), home };
         }
         // TORC_PIN=0: no thread is pinned, and the process is held to the fastest class's CPUs instead,
         // so the OS can move a worker off a core that something else (a scanner, a sensor poller) takes for a moment.
         // Pinned, every sweep waits for that one worker.
         // Pinned by default on Windows only: there the engine reads the core classes and pins to the right CPUs. On
         // Linux and macOS it can't see them yet, so pinning would place workers blind (slow cores on a big.LITTLE
-        // part), and the OS's scheduler does better. TORC_PIN=1 pins there too.
+        // part), and the OS's scheduler does better. TORC_PIN=1 pins on Linux too (CPUs 0..n); macOS has no way to pin
+        // a thread to a core, so there it changes nothing.
         let pin = match crate::switches::get("TORC_PIN") {
             Some(v) => v != "0",
             None => cfg!(windows),
@@ -211,8 +250,79 @@ pub fn init(n: usize) -> &'static Pool {
                 SetProcessAffinityMask(GetCurrentProcess(), f.iter().filter_map(|&c| mask(c)).fold(0, |m, b| m | b));
             }
         }
-        Pool { threads: n, rayon, own }
+        #[cfg(target_os = "linux")]
+        if pin {
+            pin_linux(cpus[0]);
+        }
+        Pool { threads: n, rayon, own, cpus, pinned: AtomicBool::new(pin), home }
     })
+}
+
+/// Pins the pool's threads to their CPUs, or frees them, while it runs: what TORC_PIN chooses at the start, with the
+/// same result. For torc-tune, which measures both, and for apply_tuned_pin. Returns false where there is nothing to
+/// change: rayon's pool, or macOS, which has no way to pin a thread.
+pub fn set_pin(pin: bool) -> bool {
+    let p = get();
+    let Some(o) = &p.own else { return false };
+    if !cfg!(any(windows, target_os = "linux")) {
+        return false;
+    }
+    // every thread sets its own CPUs, so all of them must take part
+    let was = set_width(0);
+    #[cfg(windows)]
+    unsafe {
+        // unpinned, the process is held to the fastest class's CPUs (as init does); pinned, it has the CPUs it started
+        // with, since a thread can only be pinned inside its process's set
+        let fast = fast_cpus().map(|f| f.iter().filter_map(|&c| mask(c)).fold(0, |m, b| m | b)).filter(|&m| m != 0);
+        let all = if pin { p.home } else { fast.unwrap_or(p.home) };
+        if all != 0 {
+            SetProcessAffinityMask(GetCurrentProcess(), all);
+        }
+        o.run(&|t, _| {
+            let m = if pin { mask(p.cpus[t]) } else { Some(all) };
+            if let Some(m) = m.filter(|&m| m != 0) {
+                SetThreadAffinityMask(GetCurrentThread(), m);
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
+    o.run(&|t, _| {
+        if pin {
+            pin_linux(p.cpus[t]);
+        } else {
+            unsafe extern "C" {
+                fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+            }
+            // SAFETY: pid 0 is this thread, and the set is a whole cpu_set_t
+            unsafe { sched_setaffinity(0, std::mem::size_of_val(&p.home), p.home.as_ptr()) };
+        }
+    });
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = (o, &p.cpus, &p.home);
+    set_width(was);
+    p.pinned.store(pin, Ordering::Relaxed);
+    true
+}
+
+/// Whether the pool's threads are pinned now.
+pub fn pinned() -> bool {
+    get().pinned.load(Ordering::Relaxed)
+}
+
+/// Applies the pinning torc-tune measured best for this machine and model ("pin"), unless TORC_PIN chose. Called once
+/// the model is loaded: the tune file is the model's, and the pool is made before the model. Linux keeps its default
+/// (not pinned) whatever the file says: a thread started from a pinned one inherits its CPU there, so the threads the
+/// engine starts later (the expert cache's readers, the GPU's) would all sit on the caller's core.
+pub fn apply_tuned_pin() {
+    if cfg!(target_os = "linux") || crate::switches::given("TORC_PIN") {
+        return;
+    }
+    if let Some(v) = crate::tune::get("pin") {
+        let want = v == 1;
+        if want != pinned() && set_pin(want) {
+            eprintln!("threads: {} (auto-tuned)", if want { "pinned" } else { "not pinned" });
+        }
+    }
 }
 
 /// The pool, made with the automatic thread count (init(0)) if nothing made it first.
@@ -477,12 +587,32 @@ fn mask(c: i32) -> Option<usize> {
     (0..usize::BITS as i32).contains(&c).then(|| 1usize << c)
 }
 
+/// Pins the calling thread to CPU c (Linux; sched_setaffinity, from the C library, on the thread itself). CPUs past
+/// the set's 1024 are left to the OS.
+#[cfg(target_os = "linux")]
+pub(crate) fn pin_linux(c: i32) {
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    }
+    let mut set = [0u64; 16];
+    if !(0..(set.len() * 64) as i32).contains(&c) {
+        return;
+    }
+    set[c as usize / 64] |= 1u64 << (c % 64);
+    // SAFETY: pid 0 is this thread, and the mask is a whole cpu_set_t (1024 bits) that outlives the call
+    unsafe { sched_setaffinity(0, std::mem::size_of_val(&set), set.as_ptr()) };
+}
+
 fn worker(sh: &'static Shared, t: usize, n: usize, cpu: Option<i32>) {
     #[cfg(windows)]
     if let Some(m) = cpu.and_then(mask) {
         unsafe { SetThreadAffinityMask(GetCurrentThread(), m) };
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    if let Some(c) = cpu {
+        pin_linux(c);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = cpu;
     IN_JOB.with(|c| c.set(true));
     let mut last = 0u64;
@@ -594,5 +724,91 @@ pub fn timer_1ms_if_asked() {
         // SAFETY: a plain Win32 call; the period ends with the process
         let r = unsafe { timeBeginPeriod(1) };
         eprintln!("timer: 1 ms ({})", if r == 0 { "set" } else { "refused" });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// The CPUs this thread may run on, as the kernel reports them.
+    fn allowed() -> String {
+        let s = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        s.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:")).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn pinning_holds_a_thread_to_its_cpu() {
+        // on a thread of its own, so the test harness's thread is left as it was
+        let (before, after) = std::thread::spawn(|| {
+            let before = allowed();
+            super::pin_linux(0);
+            (before, allowed())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(after, "0", "was {before}");
+        // a CPU past the set is left to the OS: nothing changes
+        let same = std::thread::spawn(|| {
+            let before = allowed();
+            super::pin_linux(5000);
+            before == allowed()
+        })
+        .join()
+        .unwrap();
+        assert!(same);
+    }
+
+    #[test]
+    fn a_pinned_pool_puts_each_worker_on_its_cpu() {
+        if std::thread::available_parallelism().map_or(1, |p| p.get()) < 3 {
+            return;
+        }
+        let _g = super::one_caller();
+        // CPUs 2 and 1 for threads 0 and 1: the worker (thread 1) must land on CPU 1; the caller is pinned by init,
+        // not by the pool, so it is not checked here
+        let seen = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let p = super::OwnPool::new(Some(&[2, 1]), 2);
+                p.run(&|t, _| seen.lock().unwrap().push((t, allowed())));
+            });
+        });
+        let v = seen.into_inner().unwrap();
+        assert!(v.contains(&(1, "1".to_string())), "{v:?}");
+    }
+
+    #[test]
+    fn set_pin_pins_and_frees_the_running_pool() {
+        if std::thread::available_parallelism().map_or(1, |p| p.get()) < 2 {
+            return;
+        }
+        let _g = super::one_caller();
+        // on a thread of its own: the caller is the pool's thread 0, and set_pin changes its CPUs too
+        let (start, pinned, freed) = std::thread::scope(|s| {
+            s.spawn(|| {
+                let p = super::init(2);
+                let o = p.own.as_ref().unwrap();
+                let each = || {
+                    let seen = std::sync::Mutex::new(vec![String::new(); p.threads]);
+                    o.run(&|t, _| seen.lock().unwrap()[t] = allowed());
+                    seen.into_inner().unwrap()
+                };
+                super::set_pin(false);
+                let start = each();
+                assert!(super::set_pin(true) && super::pinned());
+                let pinned = each();
+                assert!(super::set_pin(false) && !super::pinned());
+                (start, pinned, each())
+            })
+            .join()
+            .unwrap()
+        });
+        // the pool is the process's one (another test may have made it first, with its own count): CPUs 0..n here
+        assert!(pinned.len() >= 2);
+        for (t, c) in pinned.iter().enumerate() {
+            assert_eq!(*c, t.to_string());
+        }
+        // freed, a worker has the CPUs the process started with again
+        assert_eq!(freed[1], start[1]);
+        assert_ne!(freed[1], "1");
     }
 }

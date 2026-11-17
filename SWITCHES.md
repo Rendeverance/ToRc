@@ -19,7 +19,7 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_POOL` | development | worker pool implementation |
-| `TORC_PIN` | development | `0` leaves worker threads unpinned, `1` pins them; pinned by default on Windows only (Linux and macOS leave it to the OS) |
+| `TORC_PIN` | development | `0` leaves worker threads unpinned, `1` pins them; pinned by default on Windows only (Linux and macOS leave it to the OS); `1` pins on Linux too (experimental there: the engine's helper threads end up on one core with it), and changes nothing on macOS, which has no way to pin a thread. Unset, on Windows, Auto-tune's measured choice for the model is used when there is one (AUTOTUNE.md) |
 | `TORC_DECODE_THREADS` | setting | threads a reply step uses (the decode width; default: the tuned `decode_threads`, else all). On a part with two threads a core, one a core can write faster while the prompt still reads on all |
 | `TORC_SPREAD` | development | `0` uses CPUs 0..n instead of spreading over the fastest cores |
 | `TORC_SPIN_US` | development | microseconds a worker spins before it parks (default 200) |
@@ -56,7 +56,8 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_MOE_DRC`, `TORC_MOE_GRC`, `TORC_MOE_JG` | development | row chunking of the expert products |
 | `TORC_HC_TILE`, `TORC_HC_FUSEQ`, `TORC_MIX`, `TORC_MIX_KB`, `TORC_MIX_SPLIT`, `TORC_MIX_MM` | setting: `TORC_MIX_MM`; the rest development | hyper-connection (Flash Next) mixer kernels and tiling; `TORC_MIX_MM=1`: a prompt's mixer products with SMMLA (ARM with i8mm) |
 | `TORC_QSA_GATHER` | development | `0` turns the decode gather of the attention off |
-| `TORC_ATTN_F32`, `TORC_ATTN_F32_MIN`, `TORC_ATTN_TILE`, `TORC_ATTN_ROWS2` | setting: `TORC_ATTN_TILE`; the rest development | attention page conversion to f32 and tiling |
+| `TORC_ATTN_FAST` | setting | `1`: attention scores over each query rounded to sixteen bits, an exact integer sum against the keys: faster at long context, and no longer bit-identical to the default (the scores differ by about 3e-5 of the largest). Off by default. For models with an 8-bit cache and heads of up to 256 |
+| `TORC_ATTN_F32`, `TORC_ATTN_F32_MIN`, `TORC_ATTN_TILE`, `TORC_ATTN_TILE_MIN`, `TORC_ATTN_ROWS2` | setting: `TORC_ATTN_TILE`; the rest development | attention page conversion to f32 and tiling (the tiled path: ARM only, on by default for the Qwen3.6-35B's architecture, `TORC_ATTN_TILE=0` or `1` to choose) |
 
 ## Memory and disk (models bigger than RAM)
 
@@ -86,7 +87,9 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_NPU`, `TORC_NPU_DIR`, `TORC_GEMMA_NPU` | setting | turns the NPU tier on (changes output: not bit-exact, prompts only; `pure` runs Gemma 4 whole on the NPU); where the ggml build is; Gemma's NPU parts |
-| `TORC_NPU_MIN_N`, `TORC_NPU_BLOCK`, `TORC_NPU_GROUP` | development | smallest block for the NPU; longest block per graph; layers per buffer |
+| `TORC_NPU_MIN_N`, `TORC_NPU_BLOCK`, `TORC_NPU_GROUP` | development | smallest block for the NPU; longest block per graph; layers per buffer (Gemma 4 whole on the NPU) |
+| `TORC_NPU_DEV`, `TORC_NPU_BUF_MB` | development | the ggml device to open, by name (default `HTP0`); the largest NPU weight buffer in MiB (default 256 on Linux, `0` one buffer, the Windows default) |
+| `TORC_NPU_MAX_MB` | development | the most weight bytes to put on the NPU, in MiB (default `0`, no limit): what is past it stays on the CPU. For a Linux driver that maps the NPU's buffers inside a small address window |
 | `TORC_NPU_PROFILE`, `TORC_NPU_HOT`, `TORC_NPU_HOT_MIN`, `TORC_NPU_PAD` | setting: `TORC_NPU_PROFILE`, `TORC_NPU_HOT`; the rest development | hot experts on the NPU: a usage file to take them from (default on one machine: the one this machine keeps for the model), how many a layer (16, `0` none) |
 | `TORC_NPU_ASYNC`, `TORC_NPU_GUIDED`, `TORC_NPU_WARM`, `TORC_NPU_Q8`, `TORC_NPU_HEAD`, `TORC_NPU_HELPER_PRIO` | development | scheduling and form of the NPU work |
 | `TORC_NPU_SHARED` | development | `0` keeps the shared expert on the CPU |

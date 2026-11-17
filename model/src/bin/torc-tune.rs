@@ -1,6 +1,6 @@
 //! torc-tune <model.torc> [threads|auto] [ctx]: measures which prompt block size is best on this machine for this model
-//! and layout (AUTOTUNE.md), then whether guided scheduling helps and how many threads a reply should use, and saves
-//! each where torc-server finds it (tune.rs). Run it with the server's environment:
+//! and layout (AUTOTUNE.md), then whether guided scheduling helps, whether to pin the threads and how many threads a
+//! reply should use, and saves each where torc-server finds it (tune.rs). Run it with the server's environment:
 //! TORC_NPU, and TORC_PIPE with the worker up for two machines. TORC_BLOCK still overrides the result.
 //!
 //! There are three fixed texts (prose, code and a story), each read as prompts of 600 and 1800 tokens (LENS) in each
@@ -128,6 +128,7 @@ fn median(v: &[f64]) -> f64 {
 }
 
 fn main() {
+    model::set_npu_env();
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 2 {
         eprintln!("usage: torc-tune <model.torc> [threads|auto] [ctx]");
@@ -446,11 +447,74 @@ fn main() {
     if let Err(e) = model::tune::put("guided", gentry) {
         fail(format!("writing the result: {e}"));
     }
+    model::moe::set_guided(use_guided);
+    // pinning (TORC_PIN): each thread held to one CPU, or left to the OS. Which is faster depends on the machine and on
+    // what else runs on it, so both are measured, three passes in alternating order: the prompts read, then 64 tokens
+    // written. The other setting replaces the platform's default only when reading and writing together are faster by
+    // the margin and neither is slower by it. Pinning changes no arithmetic, so the logits must match. Not measured
+    // when TORC_PIN chose, or where the threads can't be pinned. Not measured on Linux yet either: a thread started
+    // from a pinned one keeps its CPU there, so the helper threads would share one core (pool::apply_tuned_pin)
+    let pin0 = model::pool::pinned();
+    if !cfg!(target_os = "linux") && !model::switches::given("TORC_PIN") && model::pool::set_pin(pin0) {
+        eprintln!("  pinning: measuring pinned and not pinned, three passes ({})", at());
+        // index 0 is the default, 1 the other
+        let pins = [pin0, !pin0];
+        let (mut rs, mut ws) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
+        let mut p_same = true;
+        let mut lg0: Vec<f32> = Vec::new();
+        for pass in 0..3 {
+            let order = if pass % 2 == 0 { [0usize, 1] } else { [1, 0] };
+            for k in order {
+                model::pool::set_pin(pins[k]);
+                let (_, tps, lg) = run(b, &lens, nt);
+                rs[k].push(tps);
+                if pass == 0 && k == 0 {
+                    lg0 = lg;
+                } else if pass == 0 {
+                    p_same = lg.iter().zip(&lg0).all(|(a, c)| a.to_bits() == c.to_bits()) || npu;
+                }
+            }
+        }
+        let (tid, l) = (&ids[0], lens[0]);
+        model::pool::force_decode_width(0);
+        for pass in 0..3 {
+            let order = if pass % 2 == 0 { [0usize, 1] } else { [1, 0] };
+            for k in order {
+                model::pool::set_pin(pins[k]);
+                m.clear_states();
+                m.prefill_blocks(&tid[..l], b, false, &mut |_, _| {}).unwrap_or_else(|e| fail(e));
+                let mut lg = vec![0.0f32; nv];
+                let t = std::time::Instant::now();
+                for i in 0..64 {
+                    m.decode(tid[l + i], (l + i) as u32, &mut lg).unwrap_or_else(|e| fail(e));
+                }
+                ws[k].push(64.0 / t.elapsed().as_secs_f64());
+            }
+        }
+        model::pool::force_decode_width(usize::MAX);
+        let (r0, r1, w0, w1) = (median(&rs[0]), median(&rs[1]), median(&ws[0]), median(&ws[1]));
+        let (gr, gw) = (r1 / r0, w1 / w0);
+        let switch = p_same && (gr * gw).sqrt() > 1.0 + margin && gr >= 1.0 - margin && gw >= 1.0 - margin;
+        let pin = if switch { !pin0 } else { pin0 };
+        model::pool::set_pin(pin);
+        let name = |p: bool| if p { "pinned" } else { "not pinned" };
+        eprintln!(
+            "  pinning: {} reads {r0:.1}, writes {w0:.1}; {} reads {r1:.1}, writes {w1:.1} tokens/s{}  <- {}",
+            name(pin0),
+            name(!pin0),
+            if p_same { "" } else { " (OUTPUT DIFFERS: not used)" },
+            name(pin)
+        );
+        let pentry = json!({"value": pin as u64, "default": pin0 as u64, "read": rs[0], "write": ws[0],
+            "other_read": rs[1], "other_write": ws[1], "block": b, "threads": threads, "when": when});
+        if let Err(e) = model::tune::put("pin", pentry) {
+            fail(format!("writing the result: {e}"));
+        }
+    }
     // the decode threads (pool::Width): on a part with two threads a core the reply can write faster on one thread a
     // core while the prompt reads faster on all of them. Both widths decode the same 64 tokens after the same prompt,
     // three passes in alternating order; the narrower is kept only when faster by the margin. The width changes no
     // arithmetic, so the logits must match
-    model::moe::set_guided(use_guided);
     if let Some(cores) = model::pool::fast_core_count().filter(|&c| c < threads as usize) {
         let widths = [threads as usize, cores];
         eprintln!("  decode threads: measuring {} and {cores}, three passes ({})", widths[0], at());

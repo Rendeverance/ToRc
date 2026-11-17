@@ -5,6 +5,6 @@ pub mod chat;
 #[allow(clippy::module_inception)]
 pub mod gemma;
 pub mod gemma_mtp;
-#[cfg(all(target_arch = "aarch64", windows))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]
 pub mod npu_gemma;
 pub mod serve;

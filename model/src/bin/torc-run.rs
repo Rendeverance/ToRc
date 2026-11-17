@@ -7,6 +7,7 @@ use std::io::Write;
 use std::time::Instant;
 
 fn main() {
+    model::set_npu_env();
     model::pool::timer_1ms_if_asked();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {

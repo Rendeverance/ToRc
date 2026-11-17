@@ -8,8 +8,8 @@ people; [SPEC.md](SPEC.md) describes how each part works inside.
 
 A CPU-first inference engine for mixture-of-experts language models, with its own model file format. It serves an
 OpenAI-style API on the user's machine. On the CPU the output is deterministic: the same logits at any thread count
-and any prompt block size. Windows first (ARM64, and x86-64 with AVX2); on Linux it has run under WSL2, not yet
-on bare metal.
+and any prompt block size. Windows first (ARM64, and x86-64 with AVX2); Linux runs on bare metal (Ubuntu on a Snapdragon X
+mini PC, tested by a user) and under WSL2.
 
 ## 1. Check the machine
 
@@ -31,6 +31,8 @@ away:
     ./build-x86.sh
 
     # either, with the GPU tier: add --features torc-model/gpu (build-x86.sh: after the target dir)
+
+    # Linux: the ARM line, plus a C++ compiler (g++, Ubuntu's build-essential) for the NPU tier's exception guard
 
 The executables land in `target/release`. Built with llvm-mingw, copy its `libunwind.dll` next to them. Run
 `cargo test --release` once; the parity tests check every kernel against its definition on this CPU.
@@ -80,12 +82,14 @@ sources they do not control. The system message is read as written.
 
 Change one thing at a time and measure each change (section 7). In this order:
 
-1. `torc-tune model.torc` picks the prompt block size for this machine and saves it where the server finds it. Run it
-   with the same settings the server will use (NPU and GPU on, second machine up).
+1. `torc-tune model.torc` picks the prompt block size for this machine, and whether to pin the threads, and saves both
+   where the server finds them. Run it with the same settings the server will use (NPU and GPU on, second machine up).
 2. Threads: `auto` is usually right. On a hybrid Intel CPU also try the P-cores only, one thread per core. Worker
    threads are pinned to cores on Windows and left to the OS on Linux and macOS, where the engine can't yet see
-   which cores are fast; `TORC_PIN=1` (pin) or `TORC_PIN=0` (don't) is worth one measured try either way.
-3. ARM: `TORC_Q4X4=1` and `TORC_ATTN_TILE=1` are off by default on the Qwen models and often help; try both.
+   which cores are fast. On Windows `torc-tune` measures both ways and keeps the faster; `TORC_PIN=1` (pin) or
+   `TORC_PIN=0` (don't) overrides it. `TORC_PIN=1` on Linux is experimental.
+3. ARM: `TORC_Q4X4=1` is off by default on the Qwen models and often helps. `TORC_ATTN_TILE` is on by default for the
+   Qwen3.6-35B and off for the other models; try `1` on them.
 4. Snapdragon X NPU: `TORC_NPU=1` reads prompts faster. On one machine torc-server counts the experts in use and the NPU
    takes the most used ones from the next load on (the first session is slower than later ones; `TORC_NPU_HOT=0` turns
    that off). It is not bit-exact, so it only touches prompts, never replies. Run `npucheck` first.

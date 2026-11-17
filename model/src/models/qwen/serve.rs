@@ -148,10 +148,11 @@ fn argmax(l: &[f32]) -> u32 {
 }
 
 impl Engine {
-    /// Runs the MTP block's rows over what this reply's prompt read (positions start..=last, as logged by prefill),
-    /// then makes the first draft from the last row with token t, the first token of the reply. Returns None if the log
-    /// does not cover those positions.
-    fn mtp_start(&mut self, ids: &[u32], start: usize, t: u32) -> format::Result<Option<Drafting>> {
+    /// The MTP block's keys and values over what this reply's prompt read (positions start..last, as logged by
+    /// prefill): the rows before the last, each with the token after it (token q + 1 with hidden row q). Returns the
+    /// last row, which mtp_start runs in full with the reply's first token, or None if the log does not cover those
+    /// positions.
+    fn mtp_fill(&mut self, ids: &[u32], start: usize) -> format::Result<Option<Vec<f32>>> {
         let last = ids.len() - 1;
         let dm = self.m.hidden_width();
         let Some((s0, log)) = self.m.take_hidden_log() else { return Ok(None) };
@@ -160,14 +161,20 @@ impl Engine {
             return Ok(None);
         }
         self.m.mtp_note(ids)?;
-        self.m.mtp_note(&[t])?;
-        // rows before the last only need their keys and values (token q + 1 with hidden row q); the last row runs in
-        // full
         if rows > 1 {
             self.m.mtp_fill(&ids[start + 1..=last], &log[..(rows - 1) * dm], start as u32)?;
         }
+        Ok(Some(log[(rows - 1) * dm..].to_vec()))
+    }
+
+    /// Makes the first draft from the prompt's last row (tail, from mtp_fill) with token t, the first token of the
+    /// reply. Returns None without a tail.
+    fn mtp_start(&mut self, ids: &[u32], tail: Option<Vec<f32>>, t: u32) -> format::Result<Option<Drafting>> {
+        let Some(tail) = tail else { return Ok(None) };
+        let last = ids.len() - 1;
+        self.m.mtp_note(&[t])?;
         let mut dl = vec![0.0f32; self.m.draft_width()];
-        let mh = self.m.mtp(&[t], &log[(rows - 1) * dm..], last as u32, &mut dl)?;
+        let mh = self.m.mtp(&[t], &tail, last as u32, &mut dl)?;
         Ok(Some(Drafting {
             d0: self.m.draft_id(argmax(&dl) as usize),
             c0: conf(&dl),
@@ -732,6 +739,9 @@ impl Engine {
             self.m.decode(ids[last], last as u32, &mut one)?;
         }
         self.seen.extend_from_slice(&ids[self.seen.len()..]);
+        // the MTP block's keys and values over the prompt are part of reading it (pipelined speculation takes the
+        // prompt's rows itself)
+        let mut mtp_tail = if drafting && !(pipespec && max > 0) { self.mtp_fill(&ids, start)? } else { None };
         let prompt_s = t0.elapsed().as_secs_f64();
         self.metric(json!({"event": "first_token", "reply": rn, "prompt_seconds": prompt_s}));
         // TORC_PROF=1: this machine's share of the prompt, then of the reply, per row or token (the main machine's side
@@ -739,8 +749,8 @@ impl Engine {
         prof_say(&format!("reply {rn} prompt, {total} rows"), prof_a, self.m.prof, &attn_a, total);
         let (prof_b, attn_b) = (self.m.prof, attn_ns());
         let mut t = sp.pick(&one);
-        // the MTP block's start (its keys and values over the prompt) waits until the first token has gone out, so the
-        // client does not wait for it
+        // the MTP block's first draft (the prompt's last row with the first token) waits until the first token has
+        // gone out, so the client does not wait for it
         let (mut dr, mut dr_due, t1) = (None, drafting, t);
         // the worker sends back only what the sampler can pick: the top 1 (greedy) or the top_k (top-k sampling)
         // with a penalty, the whole row: a penalised token can drop out of the top_k and let the next one in
@@ -814,7 +824,7 @@ impl Engine {
                 pending.drain(..ok);
             }
             if dr_due {
-                dr = self.mtp_start(&ids, start, t1)?;
+                dr = self.mtp_start(&ids, mtp_tail.take(), t1)?;
                 dr_due = false;
             }
             let seen0 = self.seen.len();
@@ -860,7 +870,7 @@ impl Engine {
         self.timed = (total, prompt_s, ttft_s, n, tg.elapsed().as_secs_f64());
         // a reply that ended on its first token still starts the block, as the state after it expects
         if dr_due {
-            dr = self.mtp_start(&ids, start, t1)?;
+            dr = self.mtp_start(&ids, mtp_tail.take(), t1)?;
         }
         if let Some(q) = ps.as_mut() {
             self.ps_close(t, q)?;
