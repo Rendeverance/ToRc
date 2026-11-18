@@ -3,6 +3,7 @@
 //! activation, less 8 times the activations' sum; then acc[k] = fma(d_w[k] * g.d[k], sum, acc[k]), and the eight lanes
 //! are folded as ((0+4)+(2+6))+((1+5)+(3+7)). That is the reference's order, so the bits are the reference's.
 
+use super::x86mm::{ask_ahead, lookahead_blocks};
 use crate::{Groups32, Q4_0_BLOCK};
 use core::arch::x86_64::*;
 
@@ -30,10 +31,17 @@ pub(crate) unsafe fn fold(a: __m256) -> f32 {
     }
 }
 
-/// R rows from w (row_bytes apart) into y[0..R]. With VNNI, each sub-block's four-product sums come from vpdpbusd
-/// (AVX-VNNI) instead of pmaddubsw + pmaddwd (the integers are the same).
+/// R rows from w (row_bytes apart) into y[0..R], asking for each row's block `ahead` blocks on as it goes (x86mm's
+/// lookahead_blocks: one vector gives the memory too little time otherwise). With VNNI, each sub-block's four-product
+/// sums come from vpdpbusd (AVX-VNNI) instead of pmaddubsw + pmaddwd (the integers are the same).
 #[inline(always)]
-unsafe fn rows_pass<const R: usize, const VNNI: bool>(w: *const u8, row_bytes: usize, x: &[Groups32], y: *mut f32) {
+unsafe fn rows_pass<const R: usize, const VNNI: bool>(
+    w: *const u8,
+    row_bytes: usize,
+    x: &[Groups32],
+    y: *mut f32,
+    ahead: usize,
+) {
     unsafe {
         let (m15, ones) = (_mm_set1_epi8(15), _mm256_set1_epi16(1));
         let mut acc = [_mm256_setzero_ps(); R];
@@ -44,6 +52,7 @@ unsafe fn rows_pass<const R: usize, const VNNI: bool>(w: *const u8, row_bytes: u
             let a: [__m256i; 8] = std::array::from_fn(|k| _mm256_loadu_si256(xb.qs.as_ptr().add(32 * k).cast()));
             for r in 0..R {
                 let wb = w.add(r * row_bytes + b * 8 * Q4_0_BLOCK);
+                ask_ahead(wb, ahead, 8 * Q4_0_BLOCK);
                 let s: [__m256i; 8] = std::array::from_fn(|k| {
                     let q = _mm_loadu_si128(wb.add(k * Q4_0_BLOCK + 2).cast());
                     let nib = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16::<4>(q), m15), _mm_and_si128(q, m15));
@@ -68,13 +77,13 @@ unsafe fn rows_pass<const R: usize, const VNNI: bool>(w: *const u8, row_bytes: u
 
 #[inline(always)]
 unsafe fn each_row<const VNNI: bool>(w: &[u8], row_bytes: usize, rows: usize, x: &[Groups32], y: &mut [f32]) {
-    let r2 = rows / 2 * 2;
+    let (r2, ahead) = (rows / 2 * 2, lookahead_blocks(1));
     unsafe {
         for r in (0..r2).step_by(2) {
-            rows_pass::<2, VNNI>(w.as_ptr().add(r * row_bytes), row_bytes, x, y.as_mut_ptr().add(r));
+            rows_pass::<2, VNNI>(w.as_ptr().add(r * row_bytes), row_bytes, x, y.as_mut_ptr().add(r), ahead);
         }
         if r2 < rows {
-            rows_pass::<1, VNNI>(w.as_ptr().add(r2 * row_bytes), row_bytes, x, y.as_mut_ptr().add(r2));
+            rows_pass::<1, VNNI>(w.as_ptr().add(r2 * row_bytes), row_bytes, x, y.as_mut_ptr().add(r2), ahead);
         }
     }
 }

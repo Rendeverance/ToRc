@@ -924,16 +924,29 @@ impl Fattn {
             // a page more than the slots need, so that the row offset a run starts at (below PAGE) still leaves the
             // kernels their NS x PAGE
             let mut sc = crate::scratch::buf::<f32>("fattn.scg", 9 * PAGE);
+            // TORC_ATTN_FAST=1 scores here as it does over whole pages, so a token gets the same bits alone or in a
+            // block
+            let fast = fast_on() && fast_fits(kv, hd);
             let mut s0 = 0;
             while s0 < slot_count {
                 let step = batch(slot_count - s0);
                 for &(a, b) in &runs {
-                    let w = &mut sc[a..];
-                    match step {
-                        8 => scores::<8>(kv, base + a, b - a, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w),
-                        4 => scores::<4>(kv, base + a, b - a, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w),
-                        2 => scores::<2>(kv, base + a, b - a, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w),
-                        _ => scores::<1>(kv, base + a, b - a, hd, self.scale, [qrow(s0)], w),
+                    let (w, at, n) = (&mut sc[a..], base + a, b - a);
+                    match (step, fast) {
+                        (8, true) => {
+                            fast::scores::<8>(kv, at, n, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w)
+                        }
+                        (4, true) => {
+                            fast::scores::<4>(kv, at, n, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w)
+                        }
+                        (2, true) => {
+                            fast::scores::<2>(kv, at, n, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w)
+                        }
+                        (_, true) => fast::scores::<1>(kv, at, n, hd, self.scale, [qrow(s0)], w),
+                        (8, false) => scores::<8>(kv, at, n, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w),
+                        (4, false) => scores::<4>(kv, at, n, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w),
+                        (2, false) => scores::<2>(kv, at, n, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), w),
+                        _ => scores::<1>(kv, at, n, hd, self.scale, [qrow(s0)], w),
                     }
                 }
                 for k in 0..step {

@@ -333,6 +333,50 @@ fn answers(port: u16) -> bool {
     s.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.1 200")
 }
 
+/// The loaded engine's settings: its profile (GET /torc/settings), or with `profile` that profile read in (POST), for
+/// the engine's next start. The engine answers in JSON either way.
+fn engine_settings(shell: &Shell, profile: Option<&Value>) -> Value {
+    let port = match shell.server.lock().unwrap().as_ref() {
+        Some(sv) if sv.ready && !sv.worker => sv.port,
+        _ => return json!({"ok": false, "error": "load a model first: these are the running engine's settings"}),
+    };
+    let Ok(mut s) = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(2)) else {
+        return json!({"ok": false, "error": "the engine did not answer"});
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+    let body = profile.map(Value::to_string).unwrap_or_default();
+    let head = match profile {
+        Some(_) => format!(
+            "POST /torc/settings HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ),
+        None => "GET /torc/settings HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".to_string(),
+    };
+    let mut got = Vec::new();
+    if s.write_all(head.as_bytes())
+        .and_then(|_| s.write_all(body.as_bytes()))
+        .and_then(|_| s.read_to_end(&mut got))
+        .is_err()
+    {
+        return json!({"ok": false, "error": "the engine did not answer"});
+    }
+    let text = String::from_utf8_lossy(&got);
+    let (status, reply) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let reply: Value = serde_json::from_str(reply).unwrap_or(Value::Null);
+    match (status.starts_with("HTTP/1.1 200"), profile) {
+        (true, None) => json!({"ok": true, "profile": reply}),
+        (true, Some(_)) => {
+            json!({"ok": true, "written": reply["written"], "layout": reply["layout"], "running": reply["running"]})
+        }
+        // an engine from before 0.1.4 has no settings to give
+        (false, _) if status.starts_with("HTTP/1.1 404") => {
+            json!({"ok": false, "error": "this engine is older than the settings files (ToRc 0.1.4)"})
+        }
+        (false, _) => json!({"ok": false, "error": reply["error"].as_str().unwrap_or("the engine refused them")}),
+    }
+}
+
 /// The app's own switch (TORC_DEVTOOLS_PORT) is not an engine switch: kept from the engine and the benchmark, which
 /// record every TORC_ variable they see
 pub(crate) fn without_app_vars(cmd: &mut Command) -> &mut Command {
@@ -804,6 +848,8 @@ async fn call(app: AppHandle, shell: State<'_, Arc<Shell>>, name: String, args: 
             json!(true)
         }
         "job" => shell.run_job(&app, a(0).as_str().unwrap_or(""), &a(1)),
+        "engineSettings" => engine_settings(&shell, None),
+        "engineSettingsSet" => engine_settings(&shell, Some(&a(0))),
         "ggufCheck" => shell.gguf_check(a(0).as_str().unwrap_or("")),
         "modelArch" => shell.model_arch(a(0).as_str().unwrap_or("")),
         "chats" => shell.chats(),

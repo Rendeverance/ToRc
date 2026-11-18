@@ -17,11 +17,11 @@ I'm building a table of the best result for each machine and model, with the set
 
 It sends the standard prompts (a short one, then 1k, 4k, 8k and 16k tokens), prints the speeds as it goes and adds one row per size to `torc-bench.csv`. Add `--sizes alice,1k,4k,8k,16k,32k` if you have the context for 32k.
 
-The file holds the CPU, cores, RAM size and speed, GPU, NPU, OS and power plan, your settings, and the speeds. No host name, no paths, nothing else. Open it and look before you send it.
+The file holds the CPU, cores, RAM size and speed, GPU, NPU, OS and power plan, your settings, and the speeds. With ToRc it also keeps the settings the server ran with, so anyone with the same model can read them into the desktop app (Settings > Share settings). No host name, no paths, nothing else. Open it and look before you send it.
 
 ## Send it in
 
-Open an issue called `Results: <your CPU>, <model>` and attach the CSV.
+Open an issue called `Results: <your CPU>, <model>` and attach the CSV. If you ran Auto-tune, attach your tune file too (the JSON files under `%LOCALAPPDATA%\torc\tune` on Windows, `~/.cache/torc/tune` on Linux), and the settings file from Settings > Share settings > Save if you used the app: then I can see how your result was got.
 
 Say in `--settings` anything that limits the machine: a power limit, a small case, a laptop on battery. A number without that is no use to anyone.
 
@@ -44,10 +44,10 @@ The same script works against llama.cpp's server, so you can measure both on you
 
 | Machine | Model | Settings | alice | 1k | 4k | 8k | 16k | 32k | By |
 |---|---|---|---|---|---|---|---|---|---|
-| 2 x Snapdragon X mini PC (32 GB each), USB4 link | Qwen3.6-35B-A3B Q4_0 | CPU + NPU + GPU on both | 352 / 51 | 378 / 59 | 406 / 49 | 370 / 50 | 310 / 32 | 229 / 30 | Rendeverance |
-| 2 x Snapdragon X mini PC (32 GB each), USB4 link | Qwen3.6-35B-A3B Q4_0 | CPU only on both | 263 / 55 | 282 / 59 | 308 / 52 | 275 / 52 | 235 / 32 | 177 / 29 | Rendeverance |
-| Snapdragon X mini PC (32 GB) | Qwen3.6-35B-A3B Q4_0 | CPU + NPU + GPU | 267 / 52 | 283 / 59 | 262 / 49 | 223 / 41 | 189 / 34 | 136 / 29 | Rendeverance |
-| Snapdragon X mini PC (32 GB) | Qwen3.6-35B-A3B Q4_0 | CPU only | 169 / 54 | 173 / 62 | 156 / 48 | 134 / 44 | 117 / 30 | 96 / 29 | Rendeverance |
+| 2 x Snapdragon X mini PC (32 GB each), USB4 link | Qwen3.6-35B-A3B Q4_0 | CPU + NPU + GPU on both | 352 / 52 | 378 / 59 | 406 / 54 | 370 / 55 | 310 / 40 | 229 / 30 | Rendeverance |
+| 2 x Snapdragon X mini PC (32 GB each), USB4 link | Qwen3.6-35B-A3B Q4_0 | CPU only on both | 263 / 55 | 282 / 59 | 308 / 52 | 275 / 52 | 235 / 38 | 177 / 29 | Rendeverance |
+| Snapdragon X mini PC (32 GB) | Qwen3.6-35B-A3B Q4_0 | CPU + NPU + GPU | 302 / 53 | 307 / 62 | 283 / 56 | 239 / 55 | 203 / 44 | 141 / 30 | Rendeverance |
+| Snapdragon X mini PC (32 GB) | Qwen3.6-35B-A3B Q4_0 | CPU only | 169 / 54 | 173 / 63 | 156 / 53 | 134 / 56 | 117 / 38 | 96 / 29 | Rendeverance |
 | Desktop, i5-12600K, 64 GB, RTX 3060 | Qwen3.6-35B-A3B Q4_0 | CPU + GPU attention on the 3060 | 192 / 39 | 197 / 41 | 183 / 43 | 170 / 51 | 161 / 27 | 147 / 22 | Rendeverance |
 | Desktop, i5-12600K, 64 GB | Qwen3.6-35B-A3B Q4_0 | CPU only | 190 / 40 | 195 / 40 | 182 / 41 | 164 / 51 | 140 / 28 | 107 / 22 | Rendeverance |
 

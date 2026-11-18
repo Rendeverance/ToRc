@@ -31,7 +31,7 @@ done
 cp "$repo"/{LICENSE-MIT,LICENSE-APACHE,NOTICE,THIRD-PARTY-NOTICES.md,THIRD-PARTY-LICENSES.md} "$root/"
 cp "$repo"/desktop/package/{README.md,THIRD-PARTY-LICENSES-APP.md} "$root/"
 [[ -n $dlls ]] && cp "$repo/desktop/package/THIRD-PARTY-DLLS.md" "$root/"
-cp "$repo"/{GUIDE.md,AGENTS.md,SWITCHES.md,AUTOTUNE.md,TWO-BOX.md,EXPERT-CACHE.md,FORMAT.md,RESULTS.md} "$root/docs/"
+cp "$repo"/{GUIDE.md,AGENTS.md,SWITCHES.md,AUTOTUNE.md,TWO-BOX.md,EXPERT-CACHE.md,FORMAT.md,RESULTS.md,CHANGELOG.md} "$root/docs/"
 if [[ -n $ext ]]; then eol=$'\r\n' torc='engine\torc.exe'; else eol=$'\n' torc=engine/torc; fi
 printf "%s$eol" 'ToRc runs .torc models. Open a GGUF in the app and it converts it, or run:' \
   "  $torc convert-gguf <in.gguf> <out.torc>" > "$root/models/PUT YOUR MODELS HERE.txt"

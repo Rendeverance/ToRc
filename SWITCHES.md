@@ -19,7 +19,7 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_POOL` | development | worker pool implementation |
-| `TORC_PIN` | development | `0` leaves worker threads unpinned, `1` pins them; pinned by default on Windows only (Linux and macOS leave it to the OS); `1` pins on Linux too (experimental there: the engine's helper threads end up on one core with it), and changes nothing on macOS, which has no way to pin a thread. Unset, on Windows, Auto-tune's measured choice for the model is used when there is one (AUTOTUNE.md) |
+| `TORC_PIN` | setting | `0` leaves worker threads unpinned, `1` pins them; pinned by default on Windows only (Linux and macOS leave it to the OS); `1` pins on Linux too (experimental there, though a user has measured it faster on a Snapdragon X under Ubuntu), and changes nothing on macOS, which has no way to pin a thread. Unset, on Windows, Auto-tune's measured choice for the model is used when there is one (AUTOTUNE.md) |
 | `TORC_DECODE_THREADS` | setting | threads a reply step uses (the decode width; default: the tuned `decode_threads`, else all). On a part with two threads a core, one a core can write faster while the prompt still reads on all |
 | `TORC_SPREAD` | development | `0` uses CPUs 0..n instead of spreading over the fastest cores |
 | `TORC_SPIN_US` | development | microseconds a worker spins before it parks (default 200) |
@@ -33,7 +33,7 @@ The switches are read once, when the program starts, so changing one means start
 
 | Switch | Kind | What it does |
 |---|---|---|
-| `TORC_BLOCK` | setting | the prompt block size the server reads with (else the tuned value, else the rule) |
+| `TORC_BLOCK` | setting | the prompt block size the server reads with (else the tuned value, else the rule: 512 on the CPU, 256 with the NPU, or 1024 with the NPU on the Qwen3.6-35B and the other Qwen3.5 / 3.6 MoE models when the whole model is in memory, and 128 on two machines) |
 | `TORC_BLOCK_LONG` | setting | block size for long prompts |
 | `TORC_CHECKPOINT`, `TORC_CHECKPOINT_MIN` | development: `TORC_CHECKPOINT`; the rest setting | state checkpoints while reading a prompt (retry granularity; the fewest tokens worth one) |
 | `TORC_GEMM_MIN`, `TORC_PACKED_MIN` | development | from how many vectors the packed matrix kernels take over |
@@ -63,7 +63,7 @@ The switches are read once, when the program starts, so changing one means start
 
 | Switch | Kind | What it does |
 |---|---|---|
-| `TORC_CACHE_MB` | setting | expert cache budget (`0` off; by default on when the file does not fit in memory) |
+| `TORC_CACHE_MB` | setting | expert cache budget (`0` off; a size streams the experts through a cache of that size, even for a file that fits; by default on when the file does not fit in memory) |
 | `TORC_CACHE_LAYERS` | setting | `a-b`: the layers this machine loads ahead (expert cache warm set, NPU hot experts); on two machines each one's own half by default ([TWO-BOX.md](TWO-BOX.md)) |
 | `TORC_IO`, `TORC_IO_THREADS`, `TORC_IO_DEPTH`, `TORC_IO_PIECE_KB`, `TORC_IO_SORT`, `TORC_IO_BUFFERED` | development: `TORC_IO`, `TORC_IO_BUFFERED`; the rest setting | how expert reads are issued ([EXPERT-CACHE.md](EXPERT-CACHE.md)) |
 | `TORC_OWN`, `TORC_OWN_LARGE`, `TORC_OWN_PREFETCH` | development: `TORC_OWN`; the rest setting | an owned copy of the weights that are always in memory; that copy on large pages (it turns the copy on too); `0` turns the expert cache's read-ahead off |
@@ -90,7 +90,7 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_NPU_MIN_N`, `TORC_NPU_BLOCK`, `TORC_NPU_GROUP` | development | smallest block for the NPU; longest block per graph; layers per buffer (Gemma 4 whole on the NPU) |
 | `TORC_NPU_DEV`, `TORC_NPU_BUF_MB` | development | the ggml device to open, by name (default `HTP0`); the largest NPU weight buffer in MiB (default 256 on Linux, `0` one buffer, the Windows default) |
 | `TORC_NPU_MAX_MB` | development | the most weight bytes to put on the NPU, in MiB (default `0`, no limit): what is past it stays on the CPU. For a Linux driver that maps the NPU's buffers inside a small address window |
-| `TORC_NPU_PROFILE`, `TORC_NPU_HOT`, `TORC_NPU_HOT_MIN`, `TORC_NPU_PAD` | setting: `TORC_NPU_PROFILE`, `TORC_NPU_HOT`; the rest development | hot experts on the NPU: a usage file to take them from (default on one machine: the one this machine keeps for the model), how many a layer (16, `0` none) |
+| `TORC_NPU_PROFILE`, `TORC_NPU_HOT`, `TORC_NPU_HOT_MIN`, `TORC_NPU_PAD` | setting: `TORC_NPU_PROFILE`, `TORC_NPU_HOT`; the rest development | hot experts on the NPU: a usage file to take them from (default on one machine: the one this machine keeps for the model), how many a layer (16, or 32 on one machine with the Qwen3.6-35B and the other Qwen3.5 / 3.6 MoE models when the whole model fits with 8 GB to spare; `0` none) |
 | `TORC_NPU_ASYNC`, `TORC_NPU_GUIDED`, `TORC_NPU_WARM`, `TORC_NPU_Q8`, `TORC_NPU_HEAD`, `TORC_NPU_HELPER_PRIO` | development | scheduling and form of the NPU work |
 | `TORC_NPU_SHARED` | development | `0` keeps the shared expert on the CPU |
 

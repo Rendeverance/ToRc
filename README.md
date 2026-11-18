@@ -53,8 +53,10 @@ system's WebKitGTK, which most desktops already have (if yours hasn't, on Ubuntu
 4. Press Auto-tune once: it measures your machine and keeps the fastest settings.
 5. Load it and talk.
 
-The folder holds everything the app keeps (settings, chats, primers, the MCP servers you add), so moving or removing
-ToRc is moving or deleting one folder. [GUIDE.md](GUIDE.md) covers building it yourself, serving the engine to other clients and
+The folder holds everything the app keeps (settings, chats, primers, the MCP servers you add), so moving ToRc is
+moving one folder. What the engine learns about your machine (Auto-tune's results, the NPU's busy experts, the
+two-machine split) is kept apart, in `%LOCALAPPDATA%\torc` on Windows and `~/.cache/torc` on Linux and macOS, so a new
+version picks it up. To remove every trace of ToRc, delete that folder too. [GUIDE.md](GUIDE.md) covers building it yourself, serving the engine to other clients and
 tuning it by hand; [AGENTS.md](AGENTS.md) is the same for an AI agent helping you set it up. Every engine setting is a plain
 switch listed in [SWITCHES.md](SWITCHES.md), so an agent driving `torc-server` and `torc-bench` can also search for better settings
 on your hardware.
@@ -89,13 +91,13 @@ Qwen3.6-35B-A3B Q4_0, a 4k-token prompt and a 128-token reply, in tokens a secon
 
 | Machine | Read | Write |
 |---|---|---|
-| Two Snapdragon X mini PCs (32 GB each) over USB4, CPU + NPU + GPU | 406 | 49 |
-| One of them, CPU + NPU + GPU | 262 | 49 |
+| Two Snapdragon X mini PCs (32 GB each) over USB4, CPU + NPU + GPU | 406 | 54 |
+| One of them, CPU + NPU + GPU | 283 | 55.7 |
 | Desktop, i5-12600K, CPU only | 182 | 41 |
 | The same desktop, llama.cpp b12360 at its best thread count | 107 | 21 |
 
 **Bigger than memory: Qwen3.8 Flash Next, a 107 GB file, on the same two boxes with 64 GB of RAM between them, the
-experts that don't fit read from the SSDs as they are needed. About 66 tokens a second reading a 16k-token prompt and
+experts that don't fit read from the SSDs as they are needed. About 67 tokens a second reading a 16k-token prompt and
 17 writing.**
 
 **Every model and machine measured so far, with llama.cpp beside it where it was run: [PERFORMANCE.md](PERFORMANCE.md).**
@@ -105,9 +107,9 @@ experts that don't fit read from the SSDs as they are needed. About 66 tokens a 
 ToRc's write figures are with its drafts on, which is how it runs by default. llama.cpp is shown without drafts:
 with `--spec-type draft-mtp` it measured between slower and level on this machine.
 
-The ToRc rows are the 4k column of [RESULTS.md](RESULTS.md), which has the other prompt sizes, says how they are measured and how to
-measure your own machine. Longer prompts read slower. Write moves by a few tokens a second from one reply to the next
-with drafts on, more on long prompts.
+[PERFORMANCE.md](PERFORMANCE.md) has every prompt size for each model and machine, and [RESULTS.md](RESULTS.md) says how
+they are measured and how to measure your own machine. Longer prompts read slower. With drafts on, the write speed
+moves by a few tokens a second from one reply to the next, and more on long prompts.
 
 ## What's in it
 

@@ -69,28 +69,77 @@ pub fn get(name: &str) -> Option<u64> {
 
 /// Stores `entry` (the value and its evidence) as `name`'s value for this layout, keeping the rest of the file.
 pub fn put(name: &str, entry: Value) -> std::io::Result<PathBuf> {
+    put_in(&layout(), name, entry)
+}
+
+/// put, for a given layout ("one-npu" and so on) rather than the one this process runs.
+pub fn put_in(lay: &str, name: &str, entry: Value) -> std::io::Result<PathBuf> {
     let p = file().ok_or_else(|| std::io::Error::other("no model loaded or no cache directory"))?;
     let mut v = read();
     if !v.is_object() {
         v = json!({});
     }
-    let l = v.as_object_mut().unwrap().entry(layout()).or_insert_with(|| json!({}));
+    let l = v.as_object_mut().unwrap().entry(lay).or_insert_with(|| json!({}));
     if !l.is_object() {
         *l = json!({});
     }
     l.as_object_mut().unwrap().insert(name.to_string(), entry);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap())?;
+    // written beside the file and renamed over it, so a crash half way never leaves it unreadable
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap())?;
+    std::fs::rename(&tmp, &p)?;
     Ok(p)
 }
 
-/// The prompt block by rule: 128 on the two-machine pipeline, with the NPU or not; 256 with the NPU tier on one
-/// machine; and 512 on one machine's CPU.
+/// The loaded model's architecture (general.architecture), for the defaults that differ by model.
+static ARCH: OnceLock<String> = OnceLock::new();
+
+/// Records the loaded model's architecture (Model::load).
+pub fn set_arch(arch: &str) {
+    let _ = ARCH.set(arch.to_string());
+}
+
+/// The loaded model's architecture, or "" before a load.
+pub fn arch() -> &'static str {
+    ARCH.get().map_or("", String::as_str)
+}
+
+/// Whether the loaded model sits whole in memory (no expert cache), set by Model::load.
+static RESIDENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the loaded model sits whole in memory (Model::load).
+pub fn set_resident(on: bool) {
+    RESIDENT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The NPU's prompt block and hot experts a layer on one machine, by architecture, with the whole model in memory.
+/// The Qwen3.6-35B was measured reading faster with these than with the general 256 and 16, writing as fast and giving
+/// the same replies, and the other Qwen3.5 / 3.6 MoE models share its build. Every other model keeps the general
+/// values, since neither is better on every model, and so does a model read from disk through the expert cache.
+fn npu_defaults() -> Option<(usize, usize)> {
+    if !RESIDENT.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match arch() {
+        "qwen35moe" => Some((1024, 32)),
+        _ => None,
+    }
+}
+
+/// The hot experts a layer the NPU tier takes when TORC_NPU_HOT and the tune file say nothing: the model's own
+/// default (npu_defaults), or 16.
+pub fn npu_hot_default() -> usize {
+    npu_defaults().map_or(16, |d| d.1)
+}
+
+/// The prompt block by rule: 128 on the two-machine pipeline, with the NPU or not; with the NPU tier on one machine
+/// the model's own default (npu_defaults), else 256; and 512 on one machine's CPU.
 pub fn block_rule() -> usize {
     if crate::switches::given("TORC_PIPE") {
         128
     } else if crate::switches::on("TORC_NPU") {
-        256
+        npu_defaults().map_or(256, |d| d.0)
     } else {
         512
     }

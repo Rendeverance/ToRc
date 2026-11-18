@@ -4,6 +4,8 @@
 const FIRST = [
   'TORC_MTP',
   'TORC_DRAFT',
+  'TORC_ATTN_FAST',
+  'TORC_PIN',
   'TORC_DECODE_THREADS',
   'TORC_BLOCK',
   'TORC_BLOCK_LONG',

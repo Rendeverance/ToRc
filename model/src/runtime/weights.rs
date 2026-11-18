@@ -309,7 +309,10 @@ impl Weights {
         // state: a server stays loaded, so its warm-up is long done) "fits" means within 80% of the installed memory,
         // not of the free memory: the standby list counts as used but is given back as the mapping is touched, so free
         // memory would turn a model that fits into a streamed one
-        let fits = total_phys().is_some_and(|a| map.len() as u64 <= a / 10 * 8);
+        // A TORC_CACHE_MB above 0 asks for the expert cache, so the experts are streamed through it even when the file
+        // would fit: mapping the whole file as well would hold the model twice.
+        let streamed = cache && crate::switches::num::<u64>("TORC_CACHE_MB").is_some_and(|mb| mb > 0);
+        let fits = !streamed && total_phys().is_some_and(|a| map.len() as u64 <= a / 10 * 8);
         // TORC_KLAY_LARGE=1: the laid-out copies' large pages are reserved now, before the warm-up breaks up free
         // memory (repack::klay_reserve)
         #[cfg(target_arch = "aarch64")]
@@ -424,7 +427,8 @@ impl Weights {
         };
         if budget > 0 && w.file.expert_region.bytes > 0 {
             let n_layer = w.file.blocks.iter().map(|b| b.layer + 1).max().unwrap_or(0);
-            let n_expert = w.file.experts.first().map_or(0, |x| x.n_expert);
+            // the widest layer's: a model whose first layers are dense (one expert) keeps its usage rows that wide
+            let n_expert = w.file.experts.iter().map(|x| x.n_expert).max().unwrap_or(0);
             let tc = std::time::Instant::now();
             // I/O threads: TORC_IO_THREADS, else up to 8, one per CPU, for more reads in flight at once
             let nio = crate::switches::num::<i32>("TORC_IO_THREADS")

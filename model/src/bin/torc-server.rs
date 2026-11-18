@@ -21,9 +21,10 @@
 //! torc-server <model> [port] [threads] [ctx] [name]: a chat server for every model ToRc runs.
 //!
 //! One conversation at a time, over HTTP: GET /v1/models, and POST /v1/chat/completions (OpenAI), /v1/messages
-//! (Anthropic) and /v1/responses (OpenAI Responses), each as one JSON reply or as that API's stream of events. This
-//! file is the HTTP side. The model answers through chat/serve.rs, each family from its own folder under models/,
-//! picked by the file's architecture.
+//! (Anthropic) and /v1/responses (OpenAI Responses), each as one JSON reply or as that API's stream of events. GET
+//! /torc/settings gives the settings it runs with as a profile, and POST /torc/settings reads one in for its next start
+//! (runtime/profile.rs, AUTOTUNE.md). This file is the HTTP side. The model answers through chat/serve.rs, each
+//! family from its own folder under models/, picked by the file's architecture.
 
 use model::api;
 use model::chat::serve::{Reply, Serve, tool_calls};
@@ -170,6 +171,24 @@ fn handle(e: &mut dyn Serve, mut s: TcpStream) {
         ("GET", "/v1/models") => {
             let j = json!({"object": "list", "data": [{"id": e.name(), "object": "model", "owned_by": "torc"}]});
             respond(&mut s, "200 OK", "application/json", &j.to_string());
+        }
+        ("GET", "/torc/settings") => {
+            respond(&mut s, "200 OK", "application/json", &model::profile::export(e.name()).to_string());
+        }
+        ("POST", "/torc/settings") => {
+            let Ok(p) = serde_json::from_slice::<Value>(&body) else {
+                return respond(&mut s, "400 Bad Request", "application/json", r#"{"error":"bad json"}"#);
+            };
+            match model::profile::import(&p) {
+                Ok((layout, done)) => {
+                    let j = json!({"ok": true, "written": done, "layout": layout, "running": model::tune::layout(),
+                        "note": "used from the server's next start in that layout"});
+                    respond(&mut s, "200 OK", "application/json", &j.to_string());
+                }
+                Err(err) => {
+                    respond(&mut s, "400 Bad Request", "application/json", &json!({"error": err}).to_string());
+                }
+            }
         }
         ("POST", "/v1/chat/completions" | "/v1/messages" | "/v1/responses" | "/v1/messages/count_tokens") => {
             let Ok(req) = serde_json::from_slice::<Value>(&body) else {

@@ -176,6 +176,8 @@ impl Model {
         let w = Weights::load(path)?;
         say("weights");
         let h = Hparams::from_file(&w.file)?;
+        crate::tune::set_arch(&h.arch);
+        crate::tune::set_resident(w.cache.is_none());
         // the tiled attention path is this architecture's default on ARM (fattn::set_tile_default)
         crate::fattn::set_tile_default(h.arch == "qwen35moe");
         crate::pipe::set_shape(h.n_layer, h.d_model, h.hc);

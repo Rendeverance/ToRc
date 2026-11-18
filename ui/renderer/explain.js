@@ -43,7 +43,9 @@ window.EXPLAIN = {
   TORC_NPU_PROFILE:
     'A usage file to take the NPU’s hot experts from. On one machine you don’t need it: the engine ' +
     'learns which experts your work uses most and gives those to the NPU from the next time the model loads.',
-  TORC_NPU_HOT: 'How many hot experts a layer the NPU gets. 16 by default, 0 for none.',
+  TORC_NPU_HOT:
+    'How many hot experts a layer the NPU gets. 16 by default (32 for the Qwen3.6-35B on one machine with ' +
+    'memory to spare), 0 for none.',
   TORC_GPU_ATTN:
     'Set 1 and part of a long prompt’s attention runs on the GPU while the CPU does the rest. It needs an ' +
     'engine built with the GPU feature, and only joins in once a prompt is a few thousand tokens long. Like the NPU ' +
@@ -58,7 +60,17 @@ window.EXPLAIN = {
   TORC_Q4X4:
     'A repacked layout for Q4_0 weights on ARM machines with i8mm (Snapdragon X). Off by default on the ' +
     'Qwen models, though my two Snapdragon boxes run the 35B faster with it. Worth a try on yours.',
-  TORC_ATTN_TILE: 'Tiled attention. Off by default. Like TORC_Q4X4, it helps the 35B on my Snapdragon boxes.',
+  TORC_ATTN_TILE:
+    'Tiled attention. On by default on ARM for the Qwen3.6-35B and the other Qwen3.5 / 3.6 MoE models built ' +
+    'like it, off for the rest: try 1 on them, or 0 on the 35B, and keep what is faster on yours.',
+  TORC_PIN:
+    'Pinning: 1 holds each worker thread to one core, 0 leaves them to the OS. On Windows Auto-tune measures ' +
+    'both and keeps the faster. On Linux they are left to the OS, but 1 has measured faster on a Snapdragon X ' +
+    'under Ubuntu, so it’s worth a try there.',
+  TORC_ATTN_FAST:
+    'Fast attention: set 1 and long prompts read faster. It should stay accurate (its scores differ from the ' +
+    'default by about 3e-5 of the largest), but I’m still testing it, so it’s off by default and replies ' +
+    'can differ a little from the default’s.',
   TORC_MIX_MM: 'For Flash Next models on ARM with i8mm. Set 1 and a prompt’s mixer products use SMMLA. Prompts only.',
   TORC_X86_PF_BLOCKS: 'On x86, how far ahead the kernels prefetch, in blocks. 16 by default, 0 turns it off.',
   TORC_LARGE_PAGES:

@@ -22,7 +22,9 @@
 //   read  = prompt tokens / the time to read the prompt        write = reply tokens / the time to write them
 // Each figure in the CSV is the median of the measured runs.
 //
-// The CSV holds what you see in it and nothing else: the hardware's names and sizes, no host name, no paths.
+// The CSV holds what you see in it and nothing else: the hardware's names and sizes, no host name, no paths. With a
+// ToRc server, each row also keeps the settings the server ran with (its /torc/settings: the values in use, the layout
+// and the model file's key), so the desktop app can read a result's settings back in (AUTOTUNE.md, Sharing settings).
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -113,6 +115,14 @@ function hardware() {
   const isPath = (v) => /[\\/:]/.test(v);
   const shown = (k) => (ADDRESSES.includes(k) ? `${k}=<address>` : isPath(process.env[k]) ? `${k}=<path>` : `${k}=${process.env[k]}`);
   const env = Object.keys(process.env).filter((k) => k.startsWith('TORC_')).sort().map(shown).join(' ');
+  // the settings the server runs with, ToRc's own (another server has none)
+  let tuned = '';
+  if (engine === 'ToRc') {
+    try {
+      const p = await ask('/torc/settings');
+      if (p && p.torc_settings) tuned = JSON.stringify({ torc_settings: p.torc_settings, model_key: p.model_key, layout: p.layout, in_use: p.in_use, chosen: p.chosen });
+    } catch (_e) { /* an older server: no settings to keep */ }
+  }
   const hw = hardware();
   const rows = [];
   for (const size of sizes) {
@@ -127,12 +137,19 @@ function hardware() {
   }
   if (!rows.length) process.exit(1);
   const head = ['date', 'name', 'engine', 'model', 'settings', 'torc_switches', 'size', 'prompt_tokens', 'read_tps', 'write_tps', 'reply_tokens', 'runs',
-    'cpu', 'cores', 'threads', 'ram_gb', 'ram', 'gpu', 'npu', 'os', 'power'];
+    'cpu', 'cores', 'threads', 'ram_gb', 'ram', 'gpu', 'npu', 'os', 'power', 'torc_settings'];
   const esc = (v) => (/[",\n]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v));
   const date = new Date().toISOString().slice(0, 10);
   const lines = rows.map((r) => [date, opt('name', ''), engine, opt('model', served), opt('settings', ''), env, r.size, r.tokens, r.read.toFixed(1), r.write.toFixed(1),
-    r.reply, runs, hw.cpu, hw.cores, hw.threads, hw.ram_gb, hw.ram_speed, hw.gpu, hw.npu, hw.os, hw.power].map(esc).join(','));
+    r.reply, runs, hw.cpu, hw.cores, hw.threads, hw.ram_gb, hw.ram_speed, hw.gpu, hw.npu, hw.os, hw.power, tuned].map(esc).join(','));
   const fresh = !fs.existsSync(out);
+  // a file started before the settings column: its header gets the column, its old rows stay as they are
+  if (!fresh) {
+    const old = fs.readFileSync(out, 'utf8');
+    const nl = old.indexOf('\n');
+    const first = nl < 0 ? old : old.slice(0, nl);
+    if (!first.split(',').includes('torc_settings')) fs.writeFileSync(out, first.replace(/\r$/, '') + ',torc_settings' + (nl < 0 ? '\n' : old.slice(nl)));
+  }
   fs.appendFileSync(out, (fresh ? head.join(',') + '\n' : '') + lines.join('\n') + '\n');
   console.log(`${rows.length} rows added to ${out}`);
 })();

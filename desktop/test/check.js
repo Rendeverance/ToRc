@@ -226,6 +226,26 @@ fs.writeFileSync(path.join(root, 'data', 'settings.json'), JSON.stringify(settin
   check('the benchmark writes a row for each prompt size', all, sizes.join(' ') || (await page(log)).slice(-150));
   await page('closeSheet()');
 
+  // ---- settings to share: the benchmark keeps them, the engine gives them, and a file for another model is refused
+  // (refused before the tune file is touched, so the check writes nothing of yours)
+  const head = fs.existsSync(csv) ? fs.readFileSync(csv, 'utf8').split('\n')[0] : '';
+  const lastRow = rows[rows.length - 1] || '';
+  const keeps = head.split(',').includes('torc_settings') && lastRow.includes('in_use');
+  check('each benchmark row keeps the settings the engine ran with', keeps, head.slice(-60));
+  const prof = await page('window.torc.engineSettings()');
+  const p = prof && prof.profile;
+  const plain = !!p && Object.values(p.switches || {}).every((v) => !/[\\/:]/.test(v) || v.startsWith('<'));
+  const gives = !!p && p.in_use.block > 0 && plain;
+  check('the engine gives its settings, with no path or address in them', gives, JSON.stringify(p && p.in_use));
+  const foreign = JSON.stringify({ ...(p || {}), model_key: 'ffffffffffffffff' });
+  const other = await page(`window.torc.engineSettingsSet(${foreign})`);
+  const refusedOther = !!other && !other.ok && /another model/.test(other.error);
+  check('settings measured on another model file are refused', refusedOther, other && other.error);
+  await page('openSettings()');
+  const sheetText = await page("document.querySelector('.sheet').textContent");
+  check('Settings has the Share settings group', /Share settings/.test(sheetText));
+  await page('closeSheet()');
+
   // ---- what a new user does first: with a model loaded, a new context typed in and Load pressed again, by the buttons
   const reload = async (n) => {
     await page('openLoader()');

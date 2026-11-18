@@ -62,12 +62,32 @@ is kept per layout, one machine or two, NPU or CPU, since the best block changes
 `torc-tune <model>`, by hand: a few minutes for a model in RAM. Start the server again afterwards; it reads the file
 once.
 
+## Sharing settings
+
+The settings a model runs with on one machine can go to another. The server gives them as a profile at
+`GET /torc/settings`: the values in use (the prompt block, the work split, pinning, the reply threads and the NPU's hot
+experts a layer) and what chose each (a switch, the tune file or the engine's default), with the switches it was
+started with, the model file it was measured on
+and the hardware. `tools/bench/torc-bench.js` keeps the same settings in every row of its CSV, so a result always says
+how it was run.
+
+In the desktop app, Settings > Share settings saves the loaded model's settings as a file, and reads one back in from
+a settings file or a benchmark CSV. Reading in (`POST /torc/settings`) writes the values a switch or the tune file
+chose (not the engine's defaults, which differ from machine to machine) into this machine's tune file for the same
+model, under the layout they were measured in (one machine or two, NPU or CPU), and the model loads again with them.
+They count as tuned values: a switch still wins over them, and running `torc-tune` measures the block, the
+split, pinning and the reply threads again on this machine. The hot experts a layer stay as read in (`TORC_NPU_HOT`
+overrides them), and more than 16 are only taken where the whole model fits in memory with 8 GB to spare. Settings
+that name a model file of another size or shape are refused. A switch holding a path or an address is never written
+into a profile, and the app only takes switches back in that are plain numbers or single words and point at nothing
+on the disk or the network.
+
 ## Planned
 
 None of this is built yet:
 
 - More settings: the thread count for the prompt, the packed-product threshold and the prefetch distance on x86,
-  the two-machine layer split, the NPU's smallest block, and the expert cache's budget.
+  the two-machine layer split, and the expert cache's budget.
 - The drive, for models bigger than RAM: read size, reads in flight, I/O threads and read order, tuned on the
   drive the model sits on, with that drive in the key.
 - A second pass over the block and the threads, which interact.

@@ -481,9 +481,11 @@ struct OwnPool {
 struct Padded<T>(T);
 
 struct Shared {
-    /// bumped once per run; a worker that sees it change picks up the new job
+    /// changed once per run: the run's number in the high bits and, in the low 16, how many threads take part
+    /// (run_word). A worker that sees it change picks up the new job if its number is inside that width, and
+    /// otherwise takes no part: it neither reads the job nor publishes the run
     epoch: Padded<AtomicU64>,
-    /// per worker, the newest epoch whose job it has completed. Each sits on its own 128-byte line, so workers
+    /// per worker, the newest run word whose job it has completed. Each sits on its own 128-byte line, so workers
     /// publishing completion never contend for the same cache line
     finished: Vec<Padded<AtomicU64>>,
     job: AtomicPtr<JobRef<'static>>,
@@ -503,8 +505,15 @@ thread_local! {
     static IN_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A run's word: its number and its width (the threads taking part, 1 to WIDTH_MAX).
+const WIDTH_MAX: usize = 0xffff;
+fn run_word(number: u64, width: usize) -> u64 {
+    number << 16 | width as u64
+}
+
 impl OwnPool {
     fn new(cpus: Option<&[i32]>, n: usize) -> OwnPool {
+        assert!((1..=WIDTH_MAX).contains(&n), "torc pool: {n} threads");
         // a worker spins for TORC_SPIN_US (default 200) before it parks
         let spin = crate::switches::num("TORC_SPIN_US").unwrap_or(200u64);
         let sh: &'static Shared = Box::leak(Box::new(Shared {
@@ -555,14 +564,18 @@ impl OwnPool {
         let f: &(dyn Fn(usize, usize) + Sync) = if w < self.n { &narrow } else { f };
         let job = JobRef { f };
         // SAFETY: `job` lives on this stack frame until the function returns. A worker dereferences it only after it
-        // observes the new epoch and before it publishes that epoch in `finished`, and the loop at the end waits for
-        // every worker to publish it
+        // observes this run's word with its own number inside the width, and before it publishes that word in
+        // `finished`; the loop at the end waits for every worker inside the width to publish it. A worker past the
+        // width never reads the job
         let p = &job as *const JobRef as *mut JobRef<'static>;
         sh.job.store(p, Ordering::Relaxed);
-        let g = sh.epoch.0.fetch_add(1, Ordering::SeqCst) + 1;
-        for (t, w) in self.workers.iter().enumerate() {
+        // one caller at a time (busy), so nothing else writes the word between this load and the store
+        let g = run_word((sh.epoch.0.load(Ordering::Relaxed) >> 16) + 1, w);
+        sh.epoch.0.store(g, Ordering::SeqCst);
+        // workers 1..w take part: the ones past the width stay parked
+        for (t, th) in self.workers.iter().enumerate().take(w - 1) {
             if sh.parked[t + 1].0.load(Ordering::SeqCst) {
-                w.unpark();
+                th.unpark();
             }
         }
         IN_JOB.with(|c| c.set(true));
@@ -571,7 +584,7 @@ impl OwnPool {
             std::process::abort();
         }
         IN_JOB.with(|c| c.set(false));
-        for d in &sh.finished[1..] {
+        for d in &sh.finished[1..w] {
             while d.0.load(Ordering::Acquire) != g {
                 std::hint::spin_loop();
             }
@@ -616,17 +629,27 @@ fn worker(sh: &'static Shared, t: usize, n: usize, cpu: Option<i32>) {
     let _ = cpu;
     IN_JOB.with(|c| c.set(true));
     let mut last = 0u64;
+    // whether the newest run left this thread out (a width below its number). It then parks at once instead of
+    // spinning for the next run: a thread spinning on a core's second CPU takes from the one working on its first
+    let mut out = false;
     loop {
         let mut since = Instant::now();
         let mut i = 0u32;
         let g = loop {
             let g = sh.epoch.0.load(Ordering::Acquire);
             if g != last {
-                break g;
+                if t < (g & WIDTH_MAX as u64) as usize {
+                    out = false;
+                    break g;
+                }
+                // not this thread's run: it must not read the job, which the caller keeps only for the threads inside
+                // the width
+                last = g;
+                out = true;
             }
             std::hint::spin_loop();
             i = i.wrapping_add(1);
-            if i.is_multiple_of(1024) && since.elapsed() >= sh.spin {
+            if out || (i.is_multiple_of(1024) && since.elapsed() >= sh.spin) {
                 sh.parked[t].0.store(true, Ordering::SeqCst);
                 if sh.epoch.0.load(Ordering::SeqCst) == last {
                     std::thread::park();
@@ -636,7 +659,8 @@ fn worker(sh: &'static Shared, t: usize, n: usize, cpu: Option<i32>) {
             }
         };
         last = g;
-        // SAFETY: OwnPool::run keeps epoch g's job alive until this worker stores g in `finished`
+        // SAFETY: OwnPool::run keeps run g's job alive until this worker, which is inside g's width, stores g in
+        // `finished`
         let job = unsafe { &*sh.job.load(Ordering::Acquire) };
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.f)(t, n))).is_err() {
             eprintln!("torc pool: a job panicked on thread {t}");
@@ -810,5 +834,41 @@ mod tests {
         // freed, a worker has the CPUs the process started with again
         assert_eq!(freed[1], start[1]);
         assert_ne!(freed[1], "1");
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A run at every width in turn, many times over: exactly the threads inside the width take part, each sees that
+    /// width, and a thread left out of narrow runs comes back for a wide one.
+    #[test]
+    fn a_narrow_run_takes_the_threads_inside_its_width_only() {
+        if std::thread::available_parallelism().map_or(1, |p| p.get()) < 4 {
+            return;
+        }
+        let _g = super::one_caller();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let p = super::init(4);
+                let o = p.own.as_ref().unwrap();
+                let n = p.threads;
+                for round in 0..2000 {
+                    // widths n, 1, n - 1, 2, ..: wide and narrow runs follow each other both ways
+                    let k = if round % 2 == 0 { n - (round / 2) % n } else { 1 + (round / 2) % n };
+                    let ran: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+                    let was = super::set_width(k);
+                    o.run(&|t, w| {
+                        assert_eq!(w, k);
+                        ran[t].fetch_add(1, Ordering::Relaxed);
+                    });
+                    super::set_width(was);
+                    for (t, r) in ran.iter().enumerate() {
+                        assert_eq!(r.load(Ordering::Relaxed), (t < k) as usize, "round {round}, width {k}, thread {t}");
+                    }
+                }
+            });
+        });
     }
 }

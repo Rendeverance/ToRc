@@ -170,9 +170,12 @@ mod imp {
         let mut hot: Vec<Vec<(usize, [i32; 3])>> = vec![Vec::new(); groups.len()];
         // an expert's input width and output rows (the same for every routed expert)
         let mut dims = (0, 0);
+        // a profile row is as wide as the widest layer: a model whose first layers are dense (one expert) has the
+        // same row width in those layers as in the rest
+        let width = profile.len() / groups.len().max(1);
         for (l, &g) in groups.iter().enumerate().filter(|&(l, _)| k > 0 && own.contains(&(l as u32))) {
             let ne = w.layer_experts(g).n_expert as usize;
-            let c = &profile[l * ne..(l + 1) * ne];
+            let c = &profile[l * width..l * width + ne];
             let mut ord: Vec<usize> = (0..ne).collect();
             ord.sort_by_key(|&e| std::cmp::Reverse(c[e]));
             for &e in ord.iter().take(k).filter(|&&e| c[e] > 0) {
@@ -291,9 +294,21 @@ mod imp {
         // hot experts come from that file when no profile is named
         let own = super::OWN.load(std::sync::atomic::Ordering::Relaxed);
         super::OWN_COUNT.store(own && w.cache.is_none(), std::sync::atomic::Ordering::Relaxed);
-        // hot experts: TORC_NPU_PROFILE=<counts file>, and TORC_NPU_HOT=k per layer (16, at most 64)
+        // hot experts: TORC_NPU_PROFILE=<counts file>, and TORC_NPU_HOT=k per layer, else the tuned or imported
+        // "npu_hot", else the model's default (tune::npu_hot_default: 16 for most), at most 64. Anything above 16
+        // that TORC_NPU_HOT did not ask for is only taken on one machine with the whole model in memory and 8 GB to
+        // spare: each hot expert is a second copy, and a tuned or read-in count may come from a bigger machine
         let hot_set = crate::switches::given("TORC_NPU_HOT");
-        let mut k = crate::switches::num::<usize>("TORC_NPU_HOT").unwrap_or(16).min(64);
+        let roomy = w.cache.is_none()
+            && !crate::switches::given("TORC_PIPE")
+            && crate::weights::total_phys().is_some_and(|m| m.saturating_sub(w.file.header.file_bytes) >= 8 << 30);
+        let mut k = match crate::switches::num::<usize>("TORC_NPU_HOT") {
+            Some(k) => k,
+            None => crate::tune::get("npu_hot")
+                .map_or_else(crate::tune::npu_hot_default, |v| v as usize)
+                .min(if roomy { 64 } else { 16 }),
+        }
+        .min(64);
         let mut profile = Vec::new();
         // a dense model (each FFN a one-expert pack, convert.rs dense_of): every token uses its layer's one expert,
         // so the FFNs go up as each layer's hot expert without a profile (TORC_NPU_HOT=0 keeps them on the CPU)
@@ -307,13 +322,14 @@ mod imp {
         };
         let chosen =
             crate::switches::get("TORC_NPU_PROFILE").or_else(|| if hot_set || own { own_usage() } else { None });
+        let asked = k;
         match chosen.ok_or(()) {
             _ if dense && k > 0 => {
                 k = 1;
                 profile = vec![1; groups.len()];
             }
             Ok(p) if k > 0 => {
-                let ne = groups.first().map_or(0, |&g| w.layer_experts(g).n_expert as usize);
+                let ne = groups.iter().map(|&g| w.layer_experts(g).n_expert as usize).max().unwrap_or(0);
                 match read_profile(&p, groups.len(), ne) {
                     Ok(c) => profile = c,
                     Err(e) => {
@@ -324,6 +340,9 @@ mod imp {
             }
             _ => k = 0,
         }
+        // the count asked for, which a profile passes on: not the 0 a first session (no usage file yet) or a refused
+        // file leaves. A dense model asks for its one expert a layer
+        HOT_ASKED.store(if dense { k } else { asked }, std::sync::atomic::Ordering::Relaxed);
         let t = match build(w, n_layer, groups, k, &profile) {
             Err(e) if k > 0 && !e.is_empty() => {
                 eprintln!("npu: with {k} hot experts a layer: {e}; trying the dense products alone");
@@ -376,6 +395,13 @@ mod imp {
         TIER.get().is_some()
     }
 
+    /// The hot experts a layer the tier was asked for (load), whatever it ended up with.
+    pub static HOT_ASKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub fn hot_asked() -> usize {
+        HOT_ASKED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn ffn_ids(m: &[Mat; 3], n: usize) -> Option<[i32; 3]> {
         let t = TIER.get()?.lock().unwrap();
         if n < t.min_tokens {
@@ -426,6 +452,9 @@ mod imp {
     pub fn up() -> bool {
         false
     }
+    pub fn hot_asked() -> usize {
+        0
+    }
     pub fn ffn_ids(_: &[Mat; 3], _: usize) -> Option<[i32; 3]> {
         None
     }
@@ -460,6 +489,12 @@ pub fn apply(jobs: &mut [(Mat, &mut [f32])], x: &[f32], n: usize) -> bool {
 /// is up, n >= min_tokens and all three were uploaded.
 pub fn ffn_ids(m: &[Mat; 3], n: usize) -> Option<[i32; 3]> {
     imp::ffn_ids(m, n)
+}
+
+/// The hot experts a layer the NPU tier was asked for at load (TORC_NPU_HOT, the tune file or the model's default;
+/// 0 when there was no usage file to take them from, 1 on a dense model), whatever the upload then managed.
+pub fn hot_asked() -> usize {
+    imp::hot_asked()
 }
 
 /// Layer `layer`'s hot experts (in increasing id, with their NPU ids) for a block of n tokens: empty unless the tier is

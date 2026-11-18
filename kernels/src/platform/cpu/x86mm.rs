@@ -117,7 +117,7 @@ unsafe fn halves8(p: *const u8, stride: usize, off: usize) -> __m256 {
 /// arithmetic to cover the wait for memory, so while a block is multiplied, the block this many blocks further along
 /// the row is asked for. With several vectors the arithmetic covers it. TORC_X86_PF_BLOCKS=<n> sets the distance
 /// (default 16; 0 turns it off).
-fn lookahead_blocks(nv: usize) -> usize {
+pub(crate) fn lookahead_blocks(nv: usize) -> usize {
     static N: std::sync::LazyLock<usize> =
         std::sync::LazyLock::new(|| crate::switches::num("TORC_X86_PF_BLOCKS").unwrap_or(16));
     if nv == 1 { *N } else { 0 }
@@ -126,7 +126,7 @@ fn lookahead_blocks(nv: usize) -> usize {
 /// Asks for the block of `len` bytes that starts `blocks` blocks after `blk`, every 64-byte line of it (nothing for 0
 /// blocks). Past the row's end this is harmless: a prefetch never faults, so the address is formed with wrapping_add.
 #[inline(always)]
-unsafe fn ask_ahead(blk: *const u8, blocks: usize, len: usize) {
+pub(crate) unsafe fn ask_ahead(blk: *const u8, blocks: usize, len: usize) {
     if blocks == 0 {
         return;
     }

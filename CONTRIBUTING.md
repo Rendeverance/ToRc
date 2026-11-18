@@ -58,6 +58,17 @@ You can change it, but then every model is affected and has to be shown not to m
 
 Say what the code does and why it has to. Keep dates, benchmark numbers and the story of how you found the bug out of the comments - the numbers belong in the PR, and the story in its description.
 
+## Reporting a bug or a speed finding
+
+The reports that have helped most came with everything I needed to repeat them here. Please include:
+
+- **The version and the machine.** The ToRc version (or the commit you built), the OS, and the CPU, RAM, GPU or NPU.
+- **The settings it ran with.** In the app, Settings > Share settings > Save writes them to a small file: attach it. A benchmark CSV from `tools/bench/torc-bench.js` carries them too, in its `torc_settings` column.
+- **Your tune file**, if you ran Auto-tune: the JSON files under `%LOCALAPPDATA%\torc\tune` on Windows, or `~/.cache/torc/tune` on Linux. With it I can see what Auto-tune picked on your machine, and whether something there is worth trying differently.
+- **The numbers.** The benchmark CSV, before and after, on the same boot, run before, after, after, before, with one change at a time. A ladder of single changes tells me which one did it; three changes at once don't.
+- **For a bug:** the server's log (what it prints on the console), the exact message, and the file and line if you found it in the code.
+- **For a speed idea:** what you measured and how, before changing any code. Where the time goes, call by call, is worth more than a rewrite: several of the best gains so far turned out to be settings, not code.
+
 ## Results from your machine
 
 Not a code change, but just as useful: [RESULTS.md](RESULTS.md) says how to measure your machine and send the numbers in.

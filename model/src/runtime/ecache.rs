@@ -49,7 +49,9 @@ pub struct ExpertCache {
 pub(crate) const USAGE_MAGIC: &[u8; 8] = b"TORCUSE1";
 const USAGE_HEAD: usize = 48;
 
-/// Reads a usage file of n_layer x n_expert counts; `model`, when given, must match the file's model id.
+/// Reads a usage file of n_layer x n_expert counts; `model`, when given, must match the file's model id. A file one
+/// layer longer or shorter is read too, its last layer dropped or a layer of zeros added: the expert cache counts a
+/// model's draft block as a layer and the NPU tier does not, and the two keep the same file.
 pub(crate) fn usage_read(
     path: &std::path::Path,
     model: Option<&[u8; 32]>,
@@ -64,8 +66,11 @@ pub(crate) fn usage_read(
     if model.is_some_and(|m| b[8..40] != m[..]) {
         return Err(format!("{}: written for another model file", path.display()));
     }
-    let n = n_layer as usize * n_expert as usize;
-    if (le32(40), le32(44)) != (n_layer, n_expert) || b.len() != USAGE_HEAD + 8 * n {
+    let (file_layers, n) = (le32(40), n_layer as usize * n_expert as usize);
+    if le32(44) != n_expert
+        || file_layers.abs_diff(n_layer) > 1
+        || b.len() != USAGE_HEAD + 8 * file_layers as usize * n_expert as usize
+    {
         return Err(format!(
             "{}: {} layers x {} experts, this model has {n_layer} x {n_expert}",
             path.display(),
@@ -73,7 +78,9 @@ pub(crate) fn usage_read(
             le32(44)
         ));
     }
-    Ok(b[USAGE_HEAD..].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
+    let mut c: Vec<u64> = b[USAGE_HEAD..].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    c.resize(n, 0);
+    Ok(c)
 }
 
 /// Writes a usage file (`counts` holds n_layer x n_expert), through a temporary name in the same folder so a reader
@@ -228,5 +235,28 @@ impl ExpertCache {
 impl Drop for ExpertCache {
     fn drop(&mut self) {
         self.usage_save();
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::{usage_read, usage_write};
+
+    #[test]
+    fn a_usage_file_one_layer_off_is_read_and_two_off_is_refused() {
+        let dir = std::env::temp_dir().join(format!("torc-usage-test-{}", std::process::id()));
+        let (p, m) = (dir.join("u"), [7u8; 32]);
+        let counts: Vec<u64> = (0..41 * 4).collect();
+        usage_write(&p, &m, 41, 4, &counts).unwrap();
+        assert_eq!(usage_read(&p, Some(&m), 41, 4).unwrap(), counts);
+        assert_eq!(usage_read(&p, Some(&m), 40, 4).unwrap(), counts[..40 * 4]);
+        assert!(usage_read(&p, Some(&m), 39, 4).is_err());
+        assert!(usage_read(&p, Some(&m), 41, 8).is_err());
+        usage_write(&p, &m, 40, 4, &counts[..40 * 4]).unwrap();
+        let grown = usage_read(&p, None, 41, 4).unwrap();
+        assert_eq!(grown[..40 * 4], counts[..40 * 4]);
+        assert!(grown[40 * 4..].iter().all(|&c| c == 0));
+        assert!(usage_read(&p, Some(&[8u8; 32]), 40, 4).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

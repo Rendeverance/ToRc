@@ -57,7 +57,7 @@ jobs:
       - name: The desktop app
         run: cargo build --release --manifest-path desktop/Cargo.toml
 
-  # Linux has run under WSL2 (README, Roadmap), not yet on bare metal
+  # Linux: tested under WSL2 here, and on bare metal by a user (GUIDE)
   linux:
     runs-on: ubuntu-latest
     steps:

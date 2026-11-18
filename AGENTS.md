@@ -87,12 +87,17 @@ Change one thing at a time and measure each change (section 7). In this order:
 2. Threads: `auto` is usually right. On a hybrid Intel CPU also try the P-cores only, one thread per core. Worker
    threads are pinned to cores on Windows and left to the OS on Linux and macOS, where the engine can't yet see
    which cores are fast. On Windows `torc-tune` measures both ways and keeps the faster; `TORC_PIN=1` (pin) or
-   `TORC_PIN=0` (don't) overrides it. `TORC_PIN=1` on Linux is experimental.
+   `TORC_PIN=0` (don't) overrides it. torc-tune doesn't measure it on Linux yet; `TORC_PIN=1` there has measured
+   faster on a Snapdragon X under Ubuntu (a user's test).
 3. ARM: `TORC_Q4X4=1` is off by default on the Qwen models and often helps. `TORC_ATTN_TILE` is on by default for the
-   Qwen3.6-35B and off for the other models; try `1` on them.
+   Qwen3.6-35B and the other Qwen3.5 / 3.6 MoE models (arch `qwen35moe`) and off for the rest; try `1` on them.
+   Any machine: `TORC_ATTN_FAST=1` (fast attention) reads long prompts faster. It should stay accurate (scores within
+   about 3e-5 of the largest) but is still in testing: off by default, replies can differ a little.
 4. Snapdragon X NPU: `TORC_NPU=1` reads prompts faster. On one machine torc-server counts the experts in use and the NPU
    takes the most used ones from the next load on (the first session is slower than later ones; `TORC_NPU_HOT=0` turns
-   that off). It is not bit-exact, so it only touches prompts, never replies. Run `npucheck` first.
+   that off). It is not bit-exact, so it only touches prompts, never replies. Run `npucheck` first. On one machine
+   with a `qwen35moe` model held whole in memory, the NPU's defaults are blocks of 1024 and 32 hot experts a layer
+   (16 without 8 GB to spare); other models keep 256 and 16.
 5. GPU (in the release zips, or built with the gpu feature): `TORC_GPU_ATTN=1` shares long prompts' attention between the GPU and the CPU,
    learning the split per machine. Not bit-exact, prompts only, a gain from a few thousand tokens of prompt. If the card
    runs out of memory, the tier switches off for the rest of the run and the CPU carries on.
@@ -130,6 +135,10 @@ write = reply tokens / the time to write them. One row a size goes into torc-ben
 - Nothing else running on the machine during a measurement, and the profiler (`TORC_PROF=1`) off.
 
 `torc-run` and the profiler show where the time goes, but the server's numbers are the ones to quote.
+
+Each row also keeps the settings the server ran with (`GET /torc/settings` on torc-server: the values in use, the
+layout and the model file's key). `POST /torc/settings` with that profile writes its values into this machine's tune
+file for the same model, used from the server's next start ([AUTOTUNE.md](AUTOTUNE.md), Sharing settings).
 
 ## 8. Troubleshooting
 

@@ -123,15 +123,25 @@ impl GemmaNpu {
         // a part: tensors made by `make` in a fresh context, one buffer for them, then `fill` sets their data
         let mut part = |n: usize, weights: bool, make: &mut dyn FnMut(Ctx) -> Result<()>| -> Result<ggml::Buffer> {
             let ctx = g.meta_ctx(n, false);
-            make(ctx)?;
+            // on a failure here the context is freed: it is not in parts yet
+            // SAFETY: ctx was made above and nothing else holds it
+            let drop_ctx = || unsafe { (f.ggml_free)(ctx) };
+            if let Err(e) = make(ctx) {
+                drop_ctx();
+                return Err(e);
+            }
             // SAFETY: ctx holds only metadata tensors, and the buffer backs them all
             // an exception in ggml here (a buffer the driver will not map) comes back as an error (Linux)
             let buft = g.buft;
             let buf = match ggml::guarded(|| unsafe { (f.ggml_backend_alloc_ctx_tensors_from_buft)(ctx, buft) }) {
                 Ok(b) => b,
-                Err(e) => return err(format!("NPU: buffer allocation failed: {e}")),
+                Err(e) => {
+                    drop_ctx();
+                    return err(format!("NPU: buffer allocation failed: {e}"));
+                }
             };
             if buf.is_null() {
+                drop_ctx();
                 return err("NPU: buffer allocation failed");
             }
             unsafe {
@@ -468,6 +478,11 @@ impl GemmaNpu {
             (f.ggml_build_forward_expand)(gf, lo);
             let alloc = (f.ggml_gallocr_new)(self.g.buft);
             if alloc.is_null() || !(f.ggml_gallocr_alloc_graph)(alloc, gf) {
+                // the graph is not kept, so its allocator and context go now
+                if !alloc.is_null() {
+                    (f.ggml_gallocr_free)(alloc);
+                }
+                (f.ggml_free)(ctx);
                 return err("NPU: graph allocation failed");
             }
             if crate::switches::get("TORC_NPU_VERBOSE").is_some_and(|v| v != "0") {
