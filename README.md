@@ -87,7 +87,7 @@ model's page on Hugging Face lists them).
 
 ## How fast
 
-Qwen3.6-35B-A3B Q4_0, a 4k-token prompt and a 128-token reply, in tokens a second as the server times them.
+Qwen3.6-35B-A3B Q4_0, **<ins>a 4k-token prompt</ins>** and a 128-token reply, in tokens a second as the server times them.
 
 | Machine | Read | Write |
 |---|---|---|
