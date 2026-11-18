@@ -1293,3 +1293,182 @@ fn bench_portable_quants() {
         println!("{line}  (GMAC/s)");
     }
 }
+
+/// The formats asked of ggml itself, not of this crate's reading of them. With TORC_GGML_REF set to the program
+/// scripts/ggml_ref.sh builds from a ggml checkout, the blocks above go through both: every weight must decode to the
+/// same float bits, and every product must match ggml's scalar definition within float rounding. The test says out loud
+/// that it did nothing when the variable is unset, so a machine without a ggml checkout still passes.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")
+))]
+#[test]
+fn ggml_decodes_the_same_blocks() {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    let harness = match std::env::var("TORC_GGML_REF") {
+        Ok(h) if !h.is_empty() => h,
+        _ => {
+            eprintln!("TORC_GGML_REF is not set: not asking ggml (scripts/ggml_ref.sh builds that harness)");
+            return;
+        }
+    };
+    let dir = std::env::temp_dir().join(format!("torc-ggml-ref-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ip, op) = (dir.join("in.bin"), dir.join("out.bin"));
+
+    // Every index table, walked in full: a row of `grid_len(ty)` blocks whose block j asks entry
+    // j in every slot of that block. Random blocks of the size above cover a handful of entries
+    // out of iq1s_grid's 2048 and iq2s_grid's 1024, and an entry copied wrong out of
+    // ggml-common.h then goes unmeasured. Q2_K has no table: its values come from the scale
+    // fields, which the random rows already vary.
+    // Where an index lives, exactly as the kernels read it (all verified bit-exact against ggml):
+    // iq2_xxs and iq3_xxs: one byte at 2 + slot. iq2_xs: a u16 at 2 + 2*slot, low 9 bits.
+    // iq2_s: 8 low bits at 2 + slot, 2 high bits in qh[slot/4] at bit 2*(slot%4).
+    // iq1_m: 8 low bits at slot, 3 high bits in qh[2*(slot/4) + (slot%4)/2] at bit 4*(slot%2).
+    fn grid_len(ty: u32) -> usize {
+        match ty {
+            16 | 18 => 256, // iq2xxs_grid, iq3xxs_grid
+            17 => 512,      // iq2xs_grid
+            22 => 1024,     // iq2s_grid
+            29 => 2048,     // iq1s_grid
+            _ => 0,
+        }
+    }
+    fn slots_of(ty: u32) -> usize {
+        match ty {
+            16 | 18 => 64,
+            17 | 22 | 29 => 32,
+            _ => 0,
+        }
+    }
+    fn force_index(ty: u32, blk: &mut [u8], slot: usize, v: usize) {
+        match ty {
+            16 | 18 => blk[2 + slot] = v as u8,
+            17 => {
+                let at = 2 + 2 * slot;
+                blk[at] = (v & 0xff) as u8;
+                blk[at + 1] = (v >> 8) as u8;
+            }
+            22 => {
+                let (ib, l) = (slot / 4, slot % 4);
+                blk[2 + slot] = (v & 0xff) as u8;
+                let b = &mut blk[66 + ib];
+                let sh = 2 * l;
+                *b = (*b & !(3 << sh)) | ((((v >> 8) & 3) as u8) << sh);
+            }
+            29 => {
+                let (ib, l) = (slot / 4, slot % 4);
+                blk[slot] = (v & 0xff) as u8;
+                let b = &mut blk[32 + 2 * ib + l / 2];
+                let sh = 4 * (l % 2);
+                *b = (*b & !(7 << sh)) | ((((v >> 8) & 7) as u8) << sh);
+            }
+            _ => {}
+        }
+    }
+
+    // every type the portable kernels carry: one, three and eight blocks, four rows each
+    let mut plan: Vec<(u32, usize, bool)> = Vec::new();
+    for ty in [10u32, 16, 17, 18, 22, 29] {
+        for nb in [1usize, 3, 8] {
+            for _ in 0..4 {
+                plan.push((ty, nb, false));
+            }
+        }
+        if grid_len(ty) > 0 {
+            plan.push((ty, grid_len(ty), true));
+        }
+    }
+    let mut rng = Rng(0x2d496b1e5f3c0a77);
+    let (mut inputs, mut req) = (Vec::new(), std::fs::File::create(&ip).unwrap());
+    req.write_all(b"TORCREF1").unwrap();
+    req.write_all(&(plan.len() as u32).to_le_bytes()).unwrap();
+    let mut written: BTreeMap<u32, std::collections::BTreeSet<usize>> = BTreeMap::new();
+    for &(ty, nb, cover) in &plan {
+        let (bs, ..) = geometry(ty);
+        let (mut w, rb) = weights(&mut rng, ty, 1, nb);
+        if cover {
+            // block b of the row asks table entry b, in every slot the type has
+            for b in 0..nb {
+                let blk = &mut w[b * bs..(b + 1) * bs]; // rb is the whole row; bs is one block
+                for s in 0..slots_of(ty) {
+                    force_index(ty, blk, s, b);
+                }
+                written.entry(ty).or_default().insert(b);
+            }
+        }
+        let xq = quantized(&mut rng, 1, nb);
+        for n in [ty, bs as u32, nb as u32] {
+            req.write_all(&n.to_le_bytes()).unwrap();
+        }
+        req.write_all(&w).unwrap();
+        for b in &xq.k {
+            req.write_all(&b.d.to_le_bytes()).unwrap();
+            for &v in &b.qs {
+                req.write_all(&[v as u8]).unwrap();
+            }
+            for &s in &b.bsums {
+                req.write_all(&s.to_le_bytes()).unwrap();
+            }
+        }
+        inputs.push((w, rb, xq));
+    }
+    req.flush().unwrap();
+    drop(req);
+    let ran = std::process::Command::new(&harness).arg(&ip).arg(&op).status();
+    assert!(ran.map(|s| s.success()).unwrap_or(false), "the ggml reference harness {harness} did not run");
+
+    let data = std::fs::read(&op).unwrap();
+    assert_eq!(&data[..8], b"TORCOUT1", "the reference answer is not in the form expected");
+    let mut c = 12; // past the magic and the record count
+    assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize, plan.len(), "wrong number of answers");
+    let mut report: BTreeMap<u32, (usize, f64, usize)> = BTreeMap::new();
+    for (i, &(ty, nb, _)) in plan.iter().enumerate() {
+        let n = nb * QK;
+        let deq: Vec<f32> =
+            data[c..c + 4 * n].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        c += 4 * n;
+        let dot = f32::from_le_bytes(data[c..c + 4].try_into().unwrap());
+        c += 4;
+        let (w, rb, xq) = &inputs[i];
+
+        // the same bytes through this crate's decoder: ggml's values bit for bit, or the tables and the reading of them
+        // differ somewhere a model would feel.
+        let mut mine = vec![0f32; n];
+        assert!(kernels::dequant::dequantize(ty, w, &mut mine), "type {ty}");
+        for (j, (&g, &x)) in mine.iter().zip(&deq).enumerate() {
+            assert_eq!(g.to_bits(), x.to_bits(), "type {ty} row {i} value {j}: this crate reads {g}, ggml reads {x}");
+        }
+
+        // and the product, which the two accumulate in different orders
+        let mut y = [0f32; 1];
+        portable(ty, w, *rb, 1, xq.view(), 1, &mut y);
+        let mut mag = 0f64;
+        for (j, &wi) in deq.iter().enumerate() {
+            let b = &xq.k[j / QK];
+            mag += (wi as f64 * (b.d as f64 * b.qs[j % QK] as f64)).abs();
+        }
+        let rel = (y[0] as f64 - dot as f64).abs() / (mag + 1e-30);
+        let e = report.entry(ty).or_insert((0, 0.0, 0));
+        e.0 += 1;
+        e.1 = e.1.max(rel);
+        e.2 += (y[0].to_bits() == dot.to_bits()) as usize;
+        assert!(
+            rel <= 1e-4,
+            "type {ty} row {i} of {nb} blocks: {} where ggml has {dot} ({rel:.2} of the term sum)",
+            y[0]
+        );
+    }
+    for (ty, (rows, worst, bits)) in &report {
+        println!(
+            "type {ty:3}: {rows} rows: every weight identical to ggml's, {bits}/{rows} products identical to ggml's bits, worst difference {worst:.2e} of the term sum"
+        );
+    }
+    // the tables themselves: every entry of every index table asked of ggml at least once
+    for ty in [16u32, 17, 18, 22, 29] {
+        let got = written.get(&ty).map(|s| s.len()).unwrap_or(0);
+        assert_eq!(got, grid_len(ty), "type {ty}: only {got} of the {} table entries were asked", grid_len(ty));
+        println!("type {ty:3}: all {got} index-table entries asked of ggml, each in every slot of its block");
+    }
+}
