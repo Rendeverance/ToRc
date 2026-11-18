@@ -96,7 +96,8 @@ function showPending() {
   if (!note) return;
   const changed = changedSinceLoad();
   note.hidden = !changed.length;
-  note.firstChild.textContent = `Changed since ${S.loaded} was loaded: ${changed.join(', ')}. Load it again to use them.`;
+  const what = changed.join(', ');
+  note.firstChild.textContent = `Changed since ${S.loaded} was loaded: ${what}. Load it again to use them.`;
 }
 
 function toast(text) {

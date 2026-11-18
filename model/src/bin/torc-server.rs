@@ -20,11 +20,12 @@
  */
 //! torc-server <model> [port] [threads] [ctx] [name]: a chat server for every model ToRc runs.
 //!
-//! One conversation at a time, over HTTP: GET /health and /v1/models (also /v1/models/<name>), and POST /v1/chat/completions (OpenAI), /v1/messages
-//! (Anthropic) and /v1/responses (OpenAI Responses), each as one JSON reply or as that API's stream of events. GET
-//! /torc/settings gives the settings it runs with as a profile, and POST /torc/settings reads one in for its next start
-//! (runtime/profile.rs, AUTOTUNE.md). This file is the HTTP side. The model answers through chat/serve.rs, each
-//! family from its own folder under models/, picked by the file's architecture.
+//! One conversation at a time, over HTTP: GET /health and /v1/models (also /v1/models/<name>), and POST
+//! /v1/chat/completions (OpenAI), /v1/messages (Anthropic) and /v1/responses (OpenAI Responses), each as one JSON reply
+//! or as that API's stream of events. GET /torc/settings gives the settings it runs with as a profile, and POST
+//! /torc/settings reads one in for its next start (runtime/profile.rs, AUTOTUNE.md). This file is the HTTP side. The
+//! model answers through chat/serve.rs, each family from its own folder under models/, picked by the file's
+//! architecture.
 
 use model::api;
 use model::chat::serve::{Reply, Serve, tool_calls};
