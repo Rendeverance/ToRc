@@ -248,7 +248,7 @@ fn multi_vector_consistent_and_correct() {
     for &(ty, ..) in &TYPES {
         for (nb, rows) in [(1usize, 7usize), (3, 64), (8, 33)] {
             let (w, rb) = weights(&mut rng, ty, rows, nb);
-            for nv in [1usize, 2, 3, 4, 5, 8, 9] {
+            for nv in [1usize, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33] {
                 let xq = quantized(&mut rng, nv, nb);
                 let all = matmul(ty, &w, rb, rows, xq.view(), nv);
                 let (want, mag) = reference(ty, &w, rb, rows, xq.view(), nv);
@@ -1251,6 +1251,44 @@ fn bench_q45k_x86() {
                 macs / d / 1e9,
                 macs / g / 1e9
             );
+        }
+        println!("{line}  (GMAC/s)");
+    }
+}
+
+/// An ignored benchmark: the portable tier over the types that have no vector kernel (512 x 2048 rows, one thread),
+/// GMAC/s per type. The row is the shape of a real projection and the nv values are a decoded token, a small batch
+/// and a prefill block. cargo test --release -p torc-kernels --test parity bench_portable -- --ignored --nocapture
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")
+))]
+#[test]
+#[ignore]
+fn bench_portable_quants() {
+    let mut rng = Rng(11);
+    let (rows, nb) = (512usize, 8usize);
+    let time = |f: &mut dyn FnMut()| {
+        f();
+        let t = std::time::Instant::now();
+        let mut n = 0u32;
+        while t.elapsed().as_secs_f64() < 0.4 {
+            f();
+            n += 1;
+        }
+        t.elapsed().as_secs_f64() / n as f64
+    };
+    let names: [(u32, &str); 6] =
+        [(10, "Q2_K  "), (16, "IQ2XXS"), (17, "IQ2_XS"), (18, "IQ3XXS"), (22, "IQ2_S "), (29, "IQ1_M ")];
+    for (ty, name) in names {
+        let (w, rb) = weights(&mut rng, ty, rows, nb);
+        let mut line = format!("{name}:");
+        for nv in [1usize, 2, 4, 8, 16, 32, 64] {
+            let xq = quantized(&mut rng, nv, nb);
+            let mut y = vec![0f32; nv * rows];
+            let macs = (rows * nb * QK * nv) as f64;
+            let d = time(&mut || portable(ty, &w, rb, rows, xq.view(), nv, &mut y));
+            line += &format!(" nv {nv:3} {:6.2}", macs / d / 1e9);
         }
         println!("{line}  (GMAC/s)");
     }

@@ -13,9 +13,26 @@ pub const IQ1_M_BLOCK: usize = 56;
 /// The offset every IQ1_S vector carries, which the dot has to account for separately (ggml's IQ1M_DELTA).
 const IQ1M_DELTA: f32 = 0.125;
 
+/// How many of the nv vectors are carried at a time: the grid lookups and the shift bits of a block are read once
+/// and applied to all of them.
+const VECTORS: usize = 16;
+
+/// Sixteen values against the same sixteen activations - the width one of the group's two scales covers.
+#[inline(always)]
+fn dot_half(w: &[i8], a: &[i8]) -> i32 {
+    let mut s = 0i32;
+    for j in 0..16 {
+        s += w[j] as i32 * a[j] as i32;
+    }
+    s
+}
+
 /// Rows of IQ1_M against nv vectors, portably (ggml's ggml_vec_dot_iq1_m_q8_K): the grid values dot the activations
 /// directly, and because each of them sits 1/8 off zero, the same group's activations summed - signed by the shift
 /// bit - give the second term.
+///
+/// The offset term is kept as a second dot rather than a sum of activations: a sub-block's shift bit is a ±1 over
+/// its eight weights, so the two terms read the same activations and differ only in the byte paired with them.
 pub fn iq1m_matmul_scalar(
     w: &[u8],
     row_bytes: usize,
@@ -27,13 +44,14 @@ pub fn iq1m_matmul_scalar(
 ) {
     let nb = x.len() / nv.max(1);
     assert!(nv >= 1 && x.len() == nv * nb && row_bytes >= nb * IQ1_M_BLOCK && w.len() >= rows * row_bytes);
-    for r in 0..rows {
-        let wr = &w[r * row_bytes..];
-        for v in 0..nv {
+    // One vector, which is what a decoded token is: the grid vectors and the shift signs are read out and dotted in
+    // the same pass, so nothing is materialised for a block that only one vector uses.
+    if nv == 1 {
+        for r in 0..rows {
+            let wr = &w[r * row_bytes..];
             let mut acc = 0f32;
             for b in 0..nb {
-                let blk = &wr[b * IQ1_M_BLOCK..(b + 1) * IQ1_M_BLOCK];
-                let xa = &x[v * nb + b];
+                let (blk, xa) = (&wr[b * IQ1_M_BLOCK..(b + 1) * IQ1_M_BLOCK], &x[b]);
                 let sc: [u16; 4] = std::array::from_fn(|i| u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]));
                 let scale =
                     f16_to_f32((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
@@ -70,7 +88,61 @@ pub fn iq1m_matmul_scalar(
                 }
                 acc = (scale * xa.d).mul_add(sumi1 as f32 + IQ1M_DELTA * (sumi2 as f32), acc);
             }
-            y[v * y_stride + r] = acc;
+            y[r] = acc;
+        }
+        return;
+    }
+    for r in 0..rows {
+        let wr = &w[r * row_bytes..];
+        for v0 in (0..nv).step_by(VECTORS) {
+            let k = VECTORS.min(nv - v0);
+            let mut acc = [0f32; VECTORS];
+            for b in 0..nb {
+                let blk = &wr[b * IQ1_M_BLOCK..(b + 1) * IQ1_M_BLOCK];
+                let sc: [u16; 4] = std::array::from_fn(|i| u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]));
+                let scale =
+                    f16_to_f32((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+                let (qs, qh) = (&blk[0..32], &blk[32..48]);
+                // The grid values, the shift signs that go with them, and the two scales of each group of 32,
+                // all decoded once for the whole chunk of vectors.
+                let (mut qv, mut qd, mut ls) = ([0i8; 256], [0i8; 256], [0i32; 16]);
+                for ib in 0..8 {
+                    let (ls1, ls2) = (
+                        (2 * ((sc[ib / 2] >> (6 * (ib % 2))) & 0x7) + 1) as i32,
+                        (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1) as i32,
+                    );
+                    ls[2 * ib] = ls1;
+                    ls[2 * ib + 1] = ls2;
+                    let delta = [
+                        1 - 2 * ((qh[2 * ib] >> 3) & 1) as i8,
+                        1 - 2 * ((qh[2 * ib] >> 7) & 1) as i8,
+                        1 - 2 * ((qh[2 * ib + 1] >> 3) & 1) as i8,
+                        1 - 2 * ((qh[2 * ib + 1] >> 7) & 1) as i8,
+                    ];
+                    for l in 0..4 {
+                        let idx = qs[4 * ib + l] as usize
+                            | (((qh[2 * ib + l / 2] as u32) << (8 - 4 * (l % 2))) & 0x700) as usize;
+                        let grid = IQ1S_GRID[idx];
+                        for j in 0..8 {
+                            let at = 32 * ib + 8 * l + j;
+                            qv[at] = ((grid >> (8 * j)) & 0xff) as u8 as i8;
+                            qd[at] = delta[l];
+                        }
+                    }
+                }
+                for j in 0..k {
+                    let xa = &x[(v0 + j) * nb + b];
+                    let (mut sumi1, mut sumi2) = (0i32, 0i32);
+                    for h in 0..16 {
+                        sumi1 += ls[h] * dot_half(&qv[16 * h..], &xa.qs[16 * h..]);
+                        sumi2 += ls[h] * dot_half(&qd[16 * h..], &xa.qs[16 * h..]);
+                    }
+                    acc[j] = (scale * xa.d).mul_add(sumi1 as f32 + IQ1M_DELTA * (sumi2 as f32), acc[j]);
+                }
+            }
+            for j in 0..k {
+                y[(v0 + j) * y_stride + r] = acc[j];
+            }
         }
     }
 }
