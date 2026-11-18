@@ -1,0 +1,60 @@
+//! iq2_s.rs - IQ2_S (ggml): 2.56 bpw. No grid of signs: the signs of an eight-weight sub-block are their own bits,
+//! and the index into a 1024-entry grid of magnitudes is split between a byte of the block and two high bits in a
+//! separate byte, so a whole group of four sub-blocks stays byte aligned.
+
+use crate::quant::iq2s_grid::IQ2S_GRID;
+use crate::quant::ksigns::KMASK_IQ2XS;
+use crate::{BlockQ8K, f16_to_f32};
+
+/// IQ2_S's block: fp16 d, 32 grid indices followed by their 32 sign bytes, 8 bytes holding the two top index bits
+/// of each group, and 8 scale bytes.
+pub const IQ2_S_BLOCK: usize = 82;
+
+/// Rows of IQ2_S against nv vectors, portably (ggml's ggml_vec_dot_iq2_s_q8_K): two exponents a 32-weight group as
+/// IQ2_XS has, but the signs come from the block itself, one bit per weight, so no sign table is read.
+pub fn iq2s_matmul_scalar(
+    w: &[u8],
+    row_bytes: usize,
+    rows: usize,
+    x: &[BlockQ8K],
+    nv: usize,
+    y: &mut [f32],
+    y_stride: usize,
+) {
+    let nb = x.len() / nv.max(1);
+    assert!(nv >= 1 && x.len() == nv * nb && row_bytes >= nb * IQ2_S_BLOCK && w.len() >= rows * row_bytes);
+    for r in 0..rows {
+        let wr = &w[r * row_bytes..];
+        for v in 0..nv {
+            let mut acc = 0f32;
+            for b in 0..nb {
+                let blk = &wr[b * IQ2_S_BLOCK..(b + 1) * IQ2_S_BLOCK];
+                let xa = &x[v * nb + b];
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) * xa.d;
+                let (qs, qh, sc, signs) = (&blk[2..66], &blk[66..74], &blk[74..82], &blk[34..66]);
+                let (mut bsum, mut q8) = (0i32, 0usize);
+                for ib in 0..8 {
+                    let (ls1, ls2) = ((1 + 2 * (sc[ib] & 0xf)) as i32, (1 + 2 * (sc[ib] >> 4)) as i32);
+                    let (mut sumi1, mut sumi2) = (0i32, 0i32);
+                    for l in 0..4 {
+                        let idx = (qs[4 * ib + l] as u32 | ((qh[ib] as u32) << (8 - 2 * l)) & 0x300) as usize;
+                        let grid = IQ2S_GRID[idx];
+                        for j in 0..8 {
+                            let g = ((grid >> (8 * j)) & 0xff) as i32;
+                            let s = if signs[4 * ib + l] & KMASK_IQ2XS[j] != 0 { -1 } else { 1 };
+                            if l < 2 {
+                                sumi1 += g * xa.qs[q8 + j] as i32 * s;
+                            } else {
+                                sumi2 += g * xa.qs[q8 + j] as i32 * s;
+                            }
+                        }
+                        q8 += 8;
+                    }
+                    bsum += ls1 * sumi1 + ls2 * sumi2;
+                }
+                acc = d.mul_add(bsum as f32, acc);
+            }
+            y[v * y_stride + r] = acc * 0.125;
+        }
+    }
+}

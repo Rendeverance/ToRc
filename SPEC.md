@@ -120,6 +120,12 @@ against Q8 activations (formats: ggml, MIT); ARM SDOT / SMMLA and x86 AVX2 / VNN
 bits are pinned by `kernels/tests/parity.rs`: every path for a type gives the same bits as the others for the same row
 and vector, and every product is within rounding of an f64 product of the weights dequantised by ggml's definitions.
 
+**Portable:** Q2_K / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ1_M, ported from ggml's generic `ggml_vec_dot_*_q8_K`
+kernels and their tables (`kernels::quant::{q2k, iq2xxs, iq2xs, iq2s, iq3xxs, iq1m}_matmul_scalar`). No vector kernel
+covers them yet on either CPU, so `model/src/layers/moe.rs::native_multi` runs these for every target - which is what
+lets a model whose tensors are mixed quants of this family (GSQ-RCO and the like) run without requantising it. Their
+grids and sign tables are copied unchanged by `scripts/gen_ggml_tables.py`.
+
 **Activations (`kernels::Q8`: each 256 numbers quantised twice, into two arrays side by side. `k` is ggml's block_q8_K,
 d, qs[256], bsums[16]; `g` is the same numbers as eight 32-groups with block_q8_0's scales, d[8], qs[256] and one sum
 per group, sums[8]):** per 256 numbers, amax = the largest |x| (a NaN wins), d = amax / 127, id = 1 / d (0 when d = 0),

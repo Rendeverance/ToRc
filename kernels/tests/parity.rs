@@ -54,20 +54,26 @@ fn quantized(rng: &mut Rng, nv: usize, nb: usize) -> Q8 {
 }
 
 /// (ggml type, block bytes, numbers a block, offsets of its fp16 fields): the types the row kernels take.
-const TYPES: [(u32, usize, usize, &[usize]); 13] = [
-    (2, 18, 32, &[0]),       // Q4_0
-    (3, 20, 32, &[0, 2]),    // Q4_1
-    (6, 22, 32, &[0]),       // Q5_0
-    (7, 24, 32, &[0, 2]),    // Q5_1
-    (8, 34, 32, &[0]),       // Q8_0
-    (11, 110, 256, &[108]),  // Q3_K
-    (12, 144, 256, &[0, 2]), // Q4_K
-    (13, 176, 256, &[0, 2]), // Q5_K
-    (14, 210, 256, &[208]),  // Q6_K
-    (20, 18, 32, &[0]),      // IQ4_NL
-    (21, 110, 256, &[0]),    // IQ3_S
-    (23, 136, 256, &[0]),    // IQ4_XS
-    (39, 17, 32, &[]),       // MXFP4 (its scale is one E8M0 byte, set in weights)
+const TYPES: [(u32, usize, usize, &[usize]); 19] = [
+    (2, 18, 32, &[0]),        // Q4_0
+    (3, 20, 32, &[0, 2]),     // Q4_1
+    (6, 22, 32, &[0]),        // Q5_0
+    (7, 24, 32, &[0, 2]),     // Q5_1
+    (8, 34, 32, &[0]),        // Q8_0
+    (10, 84, 256, &[80, 82]), // Q2_K
+    (11, 110, 256, &[108]),   // Q3_K
+    (12, 144, 256, &[0, 2]),  // Q4_K
+    (13, 176, 256, &[0, 2]),  // Q5_K
+    (14, 210, 256, &[208]),   // Q6_K
+    (16, 66, 256, &[0]),      // IQ2_XXS
+    (17, 74, 256, &[0]),      // IQ2_XS
+    (18, 98, 256, &[0]),      // IQ3_XXS
+    (20, 18, 32, &[0]),       // IQ4_NL
+    (21, 110, 256, &[0]),     // IQ3_S
+    (22, 82, 256, &[0]),      // IQ2_S
+    (23, 136, 256, &[0]),     // IQ4_XS
+    (29, 56, 256, &[]),       // IQ1_M (its scale is four nibbles, set in weights)
+    (39, 17, 32, &[]),        // MXFP4 (its scale is one E8M0 byte, set in weights)
 ];
 
 fn geometry(ty: u32) -> (usize, usize, &'static [usize]) {
@@ -92,6 +98,13 @@ fn weights(rng: &mut Rng, ty: u32, rows: usize, nb: usize) -> (Vec<u8>, usize) {
         if ty == 39 {
             // an E8M0 scale over the same range, 2^-11 .. 2^8
             blk[0] = (117 + rng.next() % 20) as u8;
+        }
+        if ty == 29 {
+            // IQ1_M has no fp16 field: its scale's exponent is four nibbles of the block's last bytes, two of them
+            // here. Same range as the f16 fields above.
+            let e = ((rng.next() % 20) + 4) as u8;
+            blk[53] = (blk[53] & 0x3f) | ((e & 3) << 6);
+            blk[55] = (blk[55] & 0x0f) | ((e >> 2) << 4);
         }
     }
     (w, rb)
@@ -141,6 +154,10 @@ fn bits(v: &[f32]) -> Vec<u32> {
 fn matmul(ty: u32, w: &[u8], rb: usize, rows: usize, xq: Q8s, nv: usize) -> Vec<f32> {
     use kernels::neon;
     let mut y = vec![0f32; nv * rows];
+    if is_portable(ty) {
+        portable(ty, w, rb, rows, xq, nv, &mut y);
+        return y;
+    }
     let p = y.as_mut_ptr();
     // SAFETY: FEAT_DotProd checked by the caller; y holds nv x rows; the kernels assert the slice sizes
     unsafe {
@@ -167,6 +184,10 @@ fn matmul(ty: u32, w: &[u8], rb: usize, rows: usize, xq: Q8s, nv: usize) -> Vec<
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
 fn matmul(ty: u32, w: &[u8], rb: usize, rows: usize, xq: Q8s, nv: usize) -> Vec<f32> {
     let mut y = vec![0f32; nv * rows];
+    if is_portable(ty) {
+        portable(ty, w, rb, rows, xq, nv, &mut y);
+        return y;
+    }
     // SAFETY: AVX2, FMA and F16C are the build's target; y holds nv x rows; the kernels assert the slice sizes
     unsafe {
         if ty == 2 {
@@ -176,6 +197,31 @@ fn matmul(ty: u32, w: &[u8], rb: usize, rows: usize, xq: Q8s, nv: usize) -> Vec<
         }
     }
     y
+}
+
+/// The types with no vector kernel on any CPU go through this crate's portable ones here, as the engine routes them
+/// in model/src/layers/moe.rs::native_multi.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")
+))]
+fn is_portable(ty: u32) -> bool {
+    matches!(ty, 10 | 16 | 17 | 18 | 22 | 29)
+}
+
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")
+))]
+fn portable(ty: u32, w: &[u8], rb: usize, rows: usize, xq: Q8s, nv: usize, y: &mut [f32]) {
+    match ty {
+        10 => kernels::q2k_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+        16 => kernels::iq2xxs_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+        17 => kernels::iq2xs_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+        18 => kernels::iq3xxs_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+        22 => kernels::iq2s_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+        _ => kernels::iq1m_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+    }
 }
 
 fn native() -> bool {

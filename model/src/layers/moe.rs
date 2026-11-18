@@ -810,6 +810,24 @@ unsafe fn native_multi(
     y_stride: usize,
 ) -> bool {
     let wr = &w[..rows * row_bytes];
+    // Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ2_S and IQ1_M have no vector kernel on either CPU yet, so they run through
+    // this crate's portable ones - the same definitions the parity tests check the vector kernels against.
+    if matches!(ty, 10 | 16 | 17 | 18 | 22 | 29) {
+        // SAFETY: y[v * y_stride + r] is writable for v < nv and r < rows (this function's contract), so the slice
+        // up to the last of them is
+        let ys = unsafe { std::slice::from_raw_parts_mut(y, (nv - 1) * y_stride + rows) };
+        match ty {
+            // SAFETY: x.k holds the activations of a 256-column block for every weight block (this function's
+            // contract); the kernels assert the sizes
+            10 => kernels::q2k_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+            16 => kernels::iq2xxs_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+            17 => kernels::iq2xs_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+            18 => kernels::iq3xxs_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+            22 => kernels::iq2s_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+            _ => kernels::iq1m_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+        }
+        return true;
+    }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("dotprod") {
         // SAFETY: FEAT_DotProd was checked; the kernels assert the sizes; y is as this function's contract says

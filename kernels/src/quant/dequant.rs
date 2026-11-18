@@ -4,6 +4,12 @@
 //! there. The embeddings' rows and the requantised heads go through here.
 
 use crate::f16_to_f32;
+use crate::quant::iq1s_grid::IQ1S_GRID;
+use crate::quant::iq2s_grid::IQ2S_GRID;
+use crate::quant::iq2xs_grid::IQ2XS_GRID;
+use crate::quant::iq2xxs_grid::IQ2XXS_GRID;
+use crate::quant::iq3xxs_grid::IQ3XXS_GRID;
+use crate::quant::ksigns::{KMASK_IQ2XS, KSIGNS_IQ2XS};
 
 /// IQ4_NL's sixteen levels (ggml-common.h).
 const IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
@@ -35,6 +41,12 @@ pub fn block_geometry(ty: u32) -> Option<(usize, usize)> {
         12 => (144, 256),
         13 => (176, 256),
         14 => (210, 256),
+        10 => (84, 256),
+        16 => (66, 256),
+        17 => (74, 256),
+        18 => (98, 256),
+        22 => (82, 256),
+        29 => (56, 256),
         11 => (110, 256),
         23 => (136, 256),
         21 => (110, 256),
@@ -182,6 +194,138 @@ pub fn dequantize(ty: u32, w: &[u8], y: &mut [f32]) -> bool {
                 for j in 0..16 {
                     y[j] = d * crate::MXFP4_LEVELS[(b[1 + j] & 15) as usize] as f32;
                     y[j + 16] = d * crate::MXFP4_LEVELS[(b[1 + j] >> 4) as usize] as f32;
+                }
+            }
+            10 => {
+                // the value, its 4-bit group scale, and the block minimum off the group's own offset
+                let (sc, q) = (&b[0..16], &b[16..80]);
+                let (d, mn) = (h(b, 80), h(b, 82));
+                for g in 0..16 {
+                    let (chunk, half, shift) = (32 * (g / 8), 16 * (g % 2), 2 * ((g % 8) / 2));
+                    let (dl, ml) = (d * (sc[g] & 0xF) as f32, mn * (sc[g] >> 4) as f32);
+                    for l in 0..16 {
+                        y[16 * g + l] = dl * ((q[chunk + half + l] >> shift) & 3) as f32 - ml;
+                    }
+                }
+            }
+            16 => {
+                // eight magnitudes from the grid under one exponent the four sub-blocks of a group share
+                let d = h(b, 0);
+                let mut o = 0usize;
+                for ib in 0..8 {
+                    let a0 = u32::from_le_bytes(b[2 + 8 * ib..6 + 8 * ib].try_into().unwrap());
+                    let a1 = u32::from_le_bytes(b[6 + 8 * ib..10 + 8 * ib].try_into().unwrap());
+                    let db = d * (0.5 + (a1 >> 28) as f32) * 0.25;
+                    for l in 0..4 {
+                        let grid = IQ2XXS_GRID[a0.to_le_bytes()[l] as usize];
+                        let signs = KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize];
+                        for j in 0..8 {
+                            let v = ((grid >> (8 * j)) & 0xff) as f32;
+                            y[o + j] = db * v * if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                        }
+                        o += 8;
+                    }
+                }
+            }
+            17 => {
+                // a 9-bit index into 512 vectors, the bits above it being where the signs live
+                let d = h(b, 0);
+                let mut o = 0usize;
+                for ib in 0..8 {
+                    let (db1, db2) =
+                        (d * (0.5 + (b[66 + ib] & 0xf) as f32) * 0.25, d * (0.5 + (b[66 + ib] >> 4) as f32) * 0.25);
+                    for l in 0..4 {
+                        let q2 = u16::from_le_bytes([b[2 + 2 * (4 * ib + l)], b[3 + 2 * (4 * ib + l)]]) as usize;
+                        let grid = IQ2XS_GRID[q2 & 511];
+                        let signs = KSIGNS_IQ2XS[q2 >> 9];
+                        let db = if l < 2 { db1 } else { db2 };
+                        for j in 0..8 {
+                            let v = ((grid >> (8 * j)) & 0xff) as f32;
+                            y[o + j] = db * v * if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                        }
+                        o += 8;
+                    }
+                }
+            }
+            22 => {
+                // the signs are their own bytes here, so the index only needs two bits from elsewhere
+                let d = h(b, 0);
+                let (qs, qh, sc, signs) = (&b[2..66], &b[66..74], &b[74..82], &b[34..66]);
+                let mut o = 0usize;
+                for ib in 0..8 {
+                    let (db1, db2) =
+                        (d * (0.5 + (sc[ib] & 0xf) as f32) * 0.25, d * (0.5 + (sc[ib] >> 4) as f32) * 0.25);
+                    for l in 0..4 {
+                        let db = if l < 2 { db1 } else { db2 };
+                        let idx = (qs[4 * ib + l] as u32 | ((qh[ib] as u32) << (8 - 2 * l)) & 0x300) as usize;
+                        let grid = IQ2S_GRID[idx];
+                        for j in 0..8 {
+                            let v = ((grid >> (8 * j)) & 0xff) as f32;
+                            y[o + j] = db * v * if signs[4 * ib + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                        }
+                        o += 8;
+                    }
+                }
+            }
+            18 => {
+                // two grid entries make a sub-block of eight, four sign bits each, under a shared exponent
+                let d = h(b, 0);
+                let (q3, gas) = (&b[2..66], &b[66..98]);
+                let mut o = 0usize;
+                for ib in 0..8 {
+                    let aux = u32::from_le_bytes(gas[4 * ib..4 * ib + 4].try_into().unwrap());
+                    let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+                    for l in 0..4 {
+                        let g1 = IQ3XXS_GRID[q3[8 * ib + 2 * l] as usize];
+                        let g2 = IQ3XXS_GRID[q3[8 * ib + 2 * l + 1] as usize];
+                        let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                        for j in 0..4 {
+                            let v1 = ((g1 >> (8 * j)) & 0xff) as f32;
+                            let v2 = ((g2 >> (8 * j)) & 0xff) as f32;
+                            y[o + j] = db * v1 * if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                            y[o + j + 4] = db * v2 * if signs & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                        }
+                        o += 8;
+                    }
+                }
+            }
+            29 => {
+                // a scale of four 4-bit fields, and every value 1/8 off the grid number the shift bit signs
+                let sc: [u16; 4] = std::array::from_fn(|i| u16::from_le_bytes([b[48 + 2 * i], b[49 + 2 * i]]));
+                let d =
+                    f16_to_f32((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+                let (qs, qh) = (&b[0..32], &b[32..48]);
+                for ib in 0..8 {
+                    let (db1, db2) = (
+                        d * (2.0 * ((sc[ib / 2] >> (6 * (ib % 2))) & 0x7) as f32 + 1.0),
+                        d * (2.0 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) as f32 + 1.0),
+                    );
+                    for l in 0..4 {
+                        let db = if l < 2 { db1 } else { db2 };
+                        let delta = match l {
+                            0 | 1 => {
+                                if qh[2 * ib] & (0x08 << (4 * l)) != 0 {
+                                    -0.125
+                                } else {
+                                    0.125
+                                }
+                            }
+                            _ => {
+                                if qh[2 * ib + 1] & (0x08 << (4 * (l - 2))) != 0 {
+                                    -0.125
+                                } else {
+                                    0.125
+                                }
+                            }
+                        };
+                        let idx = qs[4 * ib + l] as usize
+                            | (((qh[2 * ib + l / 2] as u32) << (8 - 4 * (l % 2))) & 0x700) as usize;
+                        let grid = IQ1S_GRID[idx];
+                        for j in 0..8 {
+                            let v = (((grid >> (8 * j)) & 0xff) as u8) as i8 as f32;
+                            y[32 * ib + 8 * l + j] = db * (v + delta);
+                        }
+                    }
                 }
             }
             _ => unreachable!(),
