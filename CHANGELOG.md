@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.5 (18 November 2026)
+
+The desktop app made clearer for users, plus a couple of server additions. Thanks to RainerSC for his continued
+feedback and contributions.
+
+- Share on my network (Settings > Engine): other machines can use the engine's OpenAI and Anthropic APIs. Before,
+  the app always kept its server to this machine, whatever `TORC_HOST` said. Sharing comes with an API key, made for
+  you, with Copy and New key buttons: paste it where your app or agent asks for an API key. The side pane shows the
+  address to use.
+- API key for the server (`TORC_API_KEY`): when it is set, another machine's requests must carry it, as
+  `Authorization: Bearer <key>` or `x-api-key: <key>`, the ways OpenAI and Anthropic clients send one. Requests from
+  the same machine never need it. A wrong or missing key gets a clear error in that API's own shape, and another
+  machine has 5 seconds to send its request's head, so one that connects and sends nothing holds the server for
+  seconds, not two minutes.
+- Model lists that more clients understand: `/v1/models` now gives the model a `created` time, `/v1/models/<name>`
+  answers for the loaded model, `/models` (for a client that leaves out the `/v1`) and a trailing slash no longer
+  get a "not found", and a model name with spaces is found when it comes %-escaped. Agent frameworks that check the
+  model list before they start should now get past that check.
+- `GET /health` answers {"status":"ok"}, with no key needed, for monitors and frameworks that check the server is up.
+  Like every request, it is answered between replies, not during one.
+- Settings are saved as you change them, and the app now informs the user which ones wait for the next Load. The
+  Load screen informs the user at the top, and after a change the side pane declares what is waiting, with a Load
+  again button (the terminal view's top bar notes it too). The side pane shows what the loaded model is running
+  with, not a change that hasn't been loaded yet.
+- When ToRc opens, the model you chose last is one press away in the side pane.
+- "Listen on" on the Load screen is now "Wait for the first machine on", and only shows on the second of two
+  machines, which is the only place it does anything. It was easy to take for the API's address.
+- Settings > Model now says plainly that the context, threads, NPU and GPU are on the Load a model screen, and its
+  button points there.
+
 ## 0.1.4 (18 November 2026)
 
 - Snapdragon X NPU, Qwen3.6-35B (and the other Qwen3.5 / 3.6 MoE models built like it) on one machine: prompts now

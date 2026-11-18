@@ -17,7 +17,7 @@ function openSettings() {
   };
   const saveChats = toggle(s.saveChats, (v) => setSettings({ saveChats: v }).then(renderPane));
   const autoCompact = toggle(s.autoCompact, (v) => setSettings({ autoCompact: v }).then(renderPane));
-  const modelSettings = el('button', 'btn', 'Open');
+  const modelSettings = el('button', 'btn', 'Go to Load a model');
   modelSettings.onclick = openLoader;
   const advancedSettings = el('button', 'btn', 'Open');
   advancedSettings.onclick = () => openAdvanced();
@@ -25,14 +25,15 @@ function openSettings() {
     group('Model', [
       row(
         'Context, threads, NPU and GPU',
-        'These are set with the model, in Load a model',
+        'On the Load a model screen, with the model you load',
         modelSettings,
         'The context, the CPU threads, the NPU and GPU switches and Auto-tune belong to the model you load, so ' +
-          'they live on the Load a model sheet. A change there takes effect when you press Load.',
+          'they live on the Load a model screen. This button only takes you there. A change there is saved at ' +
+          'once and takes effect when you press Load.',
       ),
       row(
         'Advanced settings',
-        'The engine’s switches, for the model you load next',
+        'The engine’s switches, used from the next Load',
         advancedSettings,
         'The same sheet as Advanced… under Load a model. A change takes effect when you press Load.',
       ),
@@ -100,6 +101,43 @@ function openSettings() {
   const engineDir = el('span', 'ctl');
   engineDir.append(binDir, browse);
   const port = field('number', s.port, (v) => setSettings({ port: Math.round(v) }), { min: 1, max: 65535 });
+  // sharing always comes with a key: the first time it is turned on, one is made
+  const share = toggle(s.share, async (v) => {
+    await setSettings(v && !S.settings.apiKey ? { share: true, apiKey: newApiKey() } : { share: v });
+    keyBox.value = S.settings.apiKey || '';
+    showKey(v);
+  });
+  const keyBox = field('text', s.apiKey || '', () => {}, { readOnly: true, className: 'wide-box key-box' });
+  const copy = el('button', 'btn', 'Copy');
+  copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(S.settings.apiKey);
+      toast('The key is copied');
+    } catch (_) {
+      keyBox.select();
+      toast('The key is selected: press Ctrl+C to copy it');
+    }
+  };
+  const fresh = confirmButton('btn', 'New key', 'Replace the key?', async () => {
+    await setSettings({ apiKey: newApiKey() });
+    keyBox.value = S.settings.apiKey;
+    toast('New key made. Machines using the old one need this one after the next Load');
+  });
+  const keyCtl = el('span', 'ctl');
+  keyCtl.append(keyBox, copy, fresh);
+  const keyRow = row(
+    'API key',
+    'Other machines need it, this one doesn’t',
+    keyCtl,
+    'Another machine’s requests must carry this key, the way any OpenAI or Anthropic client sends one: paste it ' +
+      'where your app or agent asks for an API key (it goes as "Authorization: Bearer <key>" or "x-api-key: ' +
+      '<key>"). Requests from this machine, ToRc itself included, need no key. New key replaces it from the next ' +
+      'Load, and anything using the old one is refused after that. Keep it like a password.',
+  );
+  const showKey = (on) => {
+    keyRow[0].hidden = !on;
+    if (!on) keyRow[1].hidden = true;
+  };
   const log = el('button', 'btn', 'Show the log');
   log.onclick = () => showLog();
   body.append(
@@ -108,17 +146,31 @@ function openSettings() {
         'Engine folder',
         'Where torc-server is',
         engineDir,
-        'The folder holding torc-server. After "cargo build --release" that is target/release in the ToRc folder.',
+        'The folder holding torc-server. After "cargo build --release" that is target/release in the ToRc folder. ' +
+          'Used from the next Load.',
       ),
       row(
         'Port',
-        'The local port the engine listens on',
+        'The port the engine’s API listens on',
         port,
-        'ToRc talks to the engine on this machine only. Change the port if something else is using 8080.',
+        'ToRc, and any app or agent you point at the engine, reaches it on this port: http://127.0.0.1:8080/v1 ' +
+          'by default. Change it if something else is using 8080. Used from the next Load.',
       ),
+      row(
+        'Share on my network',
+        'Off: this machine only. On: other machines can use the API too',
+        share,
+        'Off, the engine answers this machine only (127.0.0.1). On, it listens on every network this machine is ' +
+          'on (0.0.0.0), so other machines can use its OpenAI and Anthropic APIs at this machine’s address and ' +
+          'the port above, with the API key below; the side pane shows the address once the model is loaded. ' +
+          'The key is all that guards it and the traffic is not encrypted, so only turn it on for a network you ' +
+          'trust. Windows may ask once whether to let torc-server through its firewall. Used from the next Load.',
+      ),
+      keyRow,
       row('Log', 'What the engine and the tool servers have printed', log),
     ]),
   );
+  showKey(!!s.share);
 
   const bench = el('button', 'btn', 'Run the benchmark');
   bench.onclick = () => openJob('bench');
@@ -160,6 +212,13 @@ function openSettings() {
       ),
     ]),
   );
+}
+
+// A new API key: 24 random bytes, as letters and digits another app can take in a paste.
+function newApiKey() {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  const text = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return `torc-${text}`;
 }
 
 // The loaded model's settings, saved as a file to keep or pass on.

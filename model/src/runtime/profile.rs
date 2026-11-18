@@ -59,11 +59,13 @@ pub fn chosen() -> Value {
 }
 
 /// The TORC_* switches this process was started with. A switch holding a path or a network address is given by name
-/// only, so a profile never carries a folder name or an address.
+/// only, so a profile never carries a folder name or an address, and the API key is never given at all.
 pub fn switches() -> Value {
     let mut m = Map::new();
     for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("TORC_")) {
-        let hidden = if ["TORC_HOST", "TORC_PIPE", "TORC_PIPE_BIND"].contains(&k.as_str()) {
+        let hidden = if k == "TORC_API_KEY" {
+            "<key>"
+        } else if ["TORC_HOST", "TORC_PIPE", "TORC_PIPE_BIND"].contains(&k.as_str()) {
             "<address>"
         } else if v.contains(['/', '\\', ':']) {
             "<path>"

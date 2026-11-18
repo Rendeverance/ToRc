@@ -175,6 +175,12 @@ body:not(.terminal) .top .model, body:not(.terminal) #btnLoad { display: none; }
 .pane-card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); padding: 11px 12px; font-size: 12.5px; }
 .pane-model { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .pane-model b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-load { width: 100%; margin: 2px 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-pending { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; padding: 7px 9px; border-radius: 8px; background: var(--warn-soft); color: var(--warn); font-size: 12px; }
+.pane-pending .btn { flex: none; }
+.pending-note { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; border-radius: 8px; }
+.pending-note[hidden] { display: none; }
+.pending-note .btn { flex: none; }
 .kv { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; color: var(--ink2); }
 .kv b { color: var(--ink); font-weight: 500; }
 .meter { height: 5px; margin: 4px 0 7px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); overflow: hidden; }
@@ -250,6 +256,7 @@ body:not(.terminal) .top .model, body:not(.terminal) #btnLoad { display: none; }
 
 .joblog.tall { height: 460px; }
 .wide-box { width: 300px; }
+.key-box { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .btn.sure { color: var(--bad); border-color: var(--bad); }
 
 /* the context filling up: a bar over the message box in the chat view, the share in the strip, a line in the terminal */

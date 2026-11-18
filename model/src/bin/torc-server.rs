@@ -20,7 +20,7 @@
  */
 //! torc-server <model> [port] [threads] [ctx] [name]: a chat server for every model ToRc runs.
 //!
-//! One conversation at a time, over HTTP: GET /v1/models, and POST /v1/chat/completions (OpenAI), /v1/messages
+//! One conversation at a time, over HTTP: GET /health and /v1/models (also /v1/models/<name>), and POST /v1/chat/completions (OpenAI), /v1/messages
 //! (Anthropic) and /v1/responses (OpenAI Responses), each as one JSON reply or as that API's stream of events. GET
 //! /torc/settings gives the settings it runs with as a profile, and POST /torc/settings reads one in for its next start
 //! (runtime/profile.rs, AUTOTUNE.md). This file is the HTTP side. The model answers through chat/serve.rs, each
@@ -110,13 +110,136 @@ fn local_origin(v: &str) -> bool {
     matches!(name, "localhost" | "127.0.0.1" | "[::1")
 }
 
+/// The key another machine's requests must carry (TORC_API_KEY), read once at start. None: no key is asked for.
+static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The "created" time /v1/models gives the model, in seconds since 1970: when its file was last written.
+static CREATED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// With a key set, how long another machine has to send its request's head: every client sends it at once, and the
+/// server takes one connection at a time, so a machine without the key must not hold it for REQUEST_DEADLINE.
+const KEYED_HEAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A key one header line carries: "Authorization: Bearer <key>" (OpenAI's clients) or "x-api-key: <key>"
+/// (Anthropic's). The header names and "Bearer" in any case; the key as written.
+fn carried_key(line: &str) -> Option<&str> {
+    let (name, value) = line.split_once(':')?;
+    let value = value.trim();
+    match name.trim().to_ascii_lowercase().as_str() {
+        "x-api-key" => Some(value),
+        "authorization" => {
+            let (scheme, key) = value.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| key.trim())
+        }
+        _ => None,
+    }
+    .filter(|k| !k.is_empty())
+}
+
+/// Whether two keys are the same, in a time that doesn't depend on where they first differ.
+fn same_key(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// Whether a request may be served: always without a key set, and always from this machine; from another machine only
+/// when one of the keys it carries is the key.
+fn allowed(key: Option<&str>, local: bool, given: &[String]) -> bool {
+    match key {
+        None => true,
+        Some(_) if local => true,
+        Some(k) => given.iter().any(|g| same_key(g.as_bytes(), k.as_bytes())),
+    }
+}
+
+/// A connection from this machine: 127.0.0.1 and the rest of 127/8, ::1, and 127.0.0.1 written as IPv6.
+fn local_peer(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
+/// The refusal of a request without the key, in the error shape of the API it came by, so a client shows it.
+fn key_refused(path: &str) -> String {
+    let text = "this server needs its API key from other machines: send it as \"Authorization: Bearer <key>\" or \
+                \"x-api-key: <key>\"";
+    if route(path).starts_with("/v1/messages") {
+        json!({"type": "error", "error": {"type": "authentication_error", "message": text}}).to_string()
+    } else {
+        json!({"error": {"message": text, "type": "invalid_request_error", "code": "invalid_api_key"}}).to_string()
+    }
+}
+
+/// A request's path as the routes name it: without its query (some clients ask for /v1/messages?beta=true) or a
+/// trailing slash, and with the /v1 that clients given a base address without it leave out.
+fn route(path: &str) -> String {
+    let p = path.split('?').next().unwrap_or("").trim_end_matches('/');
+    if p.is_empty() || p == "/v1" || p.starts_with("/v1/") || p.starts_with("/torc/") {
+        p.to_string()
+    } else {
+        format!("/v1{p}")
+    }
+}
+
+/// The loaded model as /v1/models lists it.
+fn model_entry(name: &str) -> Value {
+    json!({"id": name, "object": "model", "created": CREATED.get().copied().unwrap_or(0), "owned_by": "torc"})
+}
+
+/// A path segment with its %XX escapes undone ("Llama%203" is "Llama 3"); a bad escape is kept as written.
+fn unescape(segment: &str) -> String {
+    let b = segment.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| segment.to_string())
+}
+
+/// Reads and drops a served request's body that the route doesn't use (GET /health with one).
+fn drain(r: &mut BufReader<Deadline>, len: usize) {
+    let _ = std::io::copy(&mut r.by_ref().take(len.min(MAX_BODY) as u64), &mut std::io::sink());
+}
+
+/// How long a refused request's client is read after the refusal is sent.
+const LINGER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Refuses a request so that the client gets the reason: the reply goes first, then the sending side is closed, and
+/// what the client still sends (a body of any length, by Content-Length or chunked) is read and dropped until it
+/// closes, for LINGER at most. Closing a socket with data still unread resets the connection on Windows, and a reset
+/// can reach the client before the reply does, which then reports "connection reset" instead of the reason.
+fn refuse(s: &mut TcpStream, r: &mut BufReader<Deadline>, status: &str, body: &str) {
+    respond(s, status, "application/json", body);
+    let _ = s.flush();
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    r.get_mut().end = std::time::Instant::now() + LINGER;
+    let _ = std::io::copy(&mut r.by_ref().take(MAX_BODY as u64), &mut std::io::sink());
+}
+
 fn handle(e: &mut dyn Serve, mut s: TcpStream) {
     // one connection at a time, so a client that stalls before finishing its request must not hold the server (the
     // whole request has REQUEST_DEADLINE, see Deadline), and nor must one that stops reading the reply without closing
     // (a write that can't go out in a minute ends it)
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(60)));
     let Ok(rs) = s.try_clone() else { return };
-    let mut r = BufReader::new(Deadline { s: rs, end: std::time::Instant::now() + REQUEST_DEADLINE });
+    // with TORC_API_KEY set, another machine's request needs the key, and gets only a few seconds to send its head;
+    // this machine's never needs it (a failed address lookup counts as another machine)
+    let key = KEY.get().and_then(|k| k.as_deref());
+    let local = s.peer_addr().map(|a| local_peer(a.ip())).unwrap_or(false);
+    let start = std::time::Instant::now();
+    let head_end = if key.is_some() && !local { KEYED_HEAD_DEADLINE } else { REQUEST_DEADLINE };
+    let mut r = BufReader::new(Deadline { s: rs, end: start + head_end });
     let mut left = MAX_HEAD;
     let Some(line) = head_line(&mut r, &mut left) else { return };
     let (method, path) = {
@@ -124,6 +247,7 @@ fn handle(e: &mut dyn Serve, mut s: TcpStream) {
         (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
     };
     let (mut len, mut foreign) = (0usize, false);
+    let mut given = Vec::new();
     loop {
         let Some(h) = head_line(&mut r, &mut left) else { return };
         if h == "\r\n" || h.is_empty() {
@@ -136,26 +260,31 @@ fn handle(e: &mut dyn Serve, mut s: TcpStream) {
         if let Some(v) = low.strip_prefix("origin:") {
             foreign = !local_origin(v);
         }
+        if let Some(k) = carried_key(&h) {
+            given.push(k.to_string());
+        }
     }
     // a browser names the page a request comes from, and another site's page is refused, whatever address the server
     // listens on: it could otherwise run the model from any open tab. Clients that aren't web pages send no Origin
     if foreign {
-        respond(
-            &mut s,
-            "403 Forbidden",
-            "application/json",
-            &json!({"error": "requests from another site's web page are refused"}).to_string(),
-        );
+        let why = json!({"error": "requests from another site's web page are refused"}).to_string();
+        return refuse(&mut s, &mut r, "403 Forbidden", &why);
+    }
+    // whether the server is up, for monitors and frameworks that probe before they start: no key needed (it says
+    // nothing but that), as llama-server's /health. It is answered between requests, like everything else
+    if method == "GET" && route(&path) == "/v1/health" {
+        drain(&mut r, len);
+        respond(&mut s, "200 OK", "application/json", r#"{"status":"ok"}"#);
         return;
     }
+    if !allowed(key, local, &given) {
+        return refuse(&mut s, &mut r, "401 Unauthorized", &key_refused(&path));
+    }
+    // let in: the rest of the request has what is left of the whole request's time
+    r.get_mut().end = start + REQUEST_DEADLINE;
     if len > MAX_BODY {
-        respond(
-            &mut s,
-            "413 Payload Too Large",
-            "application/json",
-            &json!({"error": format!("request body over {} MB", MAX_BODY >> 20)}).to_string(),
-        );
-        return;
+        let why = json!({"error": format!("request body over {} MB", MAX_BODY >> 20)}).to_string();
+        return refuse(&mut s, &mut r, "413 Payload Too Large", &why);
     }
     let mut body = vec![0u8; len];
     let mut got = 0;
@@ -165,12 +294,23 @@ fn handle(e: &mut dyn Serve, mut s: TcpStream) {
             _ => return,
         }
     }
-    // the path without its query (some clients ask for /v1/messages?beta=true)
-    let path = path.split('?').next().unwrap_or("");
+    let path = route(&path);
+    let path = path.as_str();
     match (method.as_str(), path) {
         ("GET", "/v1/models") => {
-            let j = json!({"object": "list", "data": [{"id": e.name(), "object": "model", "owned_by": "torc"}]});
+            let j = json!({"object": "list", "data": [model_entry(e.name())]});
             respond(&mut s, "200 OK", "application/json", &j.to_string());
+        }
+        // one model by its name, as OpenAI's clients ask before they use it
+        ("GET", p) if p.starts_with("/v1/models/") => {
+            let asked = unescape(&p["/v1/models/".len()..]);
+            if asked == e.name() {
+                respond(&mut s, "200 OK", "application/json", &model_entry(e.name()).to_string());
+            } else {
+                let text = format!("no model {asked} here: this server runs {}", e.name());
+                let j = json!({"error": {"message": text, "type": "invalid_request_error", "code": "model_not_found"}});
+                respond(&mut s, "404 Not Found", "application/json", &j.to_string());
+            }
         }
         ("GET", "/torc/settings") => {
             respond(&mut s, "200 OK", "application/json", &model::profile::export(e.name()).to_string());
@@ -454,6 +594,10 @@ fn main() {
         );
     }
     let (path, name) = (a[1].as_str(), a.get(5).cloned());
+    // the model file's own date, so the same model keeps the same "created" from one start to the next
+    let written = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let since = written.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    let _ = CREATED.set(since);
     let mut e = match arch.as_deref() {
         Some("gemma4") => model::models::gemma::serve::open(path, ctx, name),
         Some("gpt-oss") => model::models::gptoss::serve::open(path, ctx, name),
@@ -467,14 +611,18 @@ fn main() {
 
 /// Serves requests on the port, one at a time, until the process ends.
 fn listen(e: &mut dyn Serve, port: u16) {
-    // this machine only, unless TORC_HOST says otherwise (the server has no authentication of its own; a front end in
-    // front of it does)
+    // this machine only, unless TORC_HOST says otherwise; then TORC_API_KEY, when set, is what another machine's
+    // requests must carry (this machine's never need it)
     let host = model::switches::get("TORC_HOST").unwrap_or_else(|| "127.0.0.1".into());
+    let key = model::switches::get("TORC_API_KEY").map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    let keyed = key.is_some();
+    let _ = KEY.set(key);
     let l = TcpListener::bind((host.as_str(), port)).unwrap_or_else(|err| {
         eprintln!("torc-server: cannot listen on {host}:{port}: {err}");
         std::process::exit(1)
     });
-    eprintln!("torc-server: {} on {host}:{port}", e.name());
+    let needs = if keyed { ", other machines need the API key" } else { "" };
+    eprintln!("torc-server: {} on {host}:{port}{needs}", e.name());
     // between requests: after TORC_IDLE_SAVE seconds without one (default 60, 0 = never) the current chat goes to disk
     // as well (save_leaving), so a reload or a restart comes back to it warm
     let idle = model::switches::num::<u64>("TORC_IDLE_SAVE").unwrap_or(60);
@@ -542,5 +690,72 @@ mod guards {
         assert_eq!(status(&format::Error("the NPU went away".into())), "500 Internal Server Error");
         // an engine fault that happens to mention the context is still the server's
         assert_eq!(status(&format::Error("position past the context".into())), "500 Internal Server Error");
+    }
+
+    #[test]
+    fn keys_are_read_the_two_standard_ways() {
+        assert_eq!(carried_key("Authorization: Bearer abc-123\r\n"), Some("abc-123"));
+        assert_eq!(carried_key("authorization: bearer abc-123"), Some("abc-123"));
+        assert_eq!(carried_key("x-api-key: Abc-123\r\n"), Some("Abc-123"));
+        assert_eq!(carried_key("X-Api-Key:abc"), Some("abc"));
+        for h in ["Authorization: Basic abc", "Authorization: Bearer ", "x-api-key: ", "Content-Length: 5", "Bearer x"]
+        {
+            assert_eq!(carried_key(h), None, "{h}");
+        }
+    }
+
+    #[test]
+    fn only_another_machine_needs_the_key() {
+        let k = |s: &str| vec![s.to_string()];
+        // no key set: everyone
+        assert!(allowed(None, false, &[]));
+        // this machine: never asked
+        assert!(allowed(Some("s3cret"), true, &[]));
+        // another machine: only with the key, exactly
+        assert!(!allowed(Some("s3cret"), false, &[]));
+        assert!(!allowed(Some("s3cret"), false, &k("s3cre")));
+        assert!(!allowed(Some("s3cret"), false, &k("S3CRET")));
+        assert!(!allowed(Some("s3cret"), false, &k("s3cret ")));
+        assert!(allowed(Some("s3cret"), false, &k("s3cret")));
+        assert!(allowed(Some("s3cret"), false, &["wrong".into(), "s3cret".into()]));
+    }
+
+    #[test]
+    fn this_machine_is_loopback_only() {
+        for ip in ["127.0.0.1", "127.8.0.2", "::1", "::ffff:127.0.0.1"] {
+            assert!(local_peer(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["192.168.1.20", "10.0.0.1", "100.80.236.60", "::ffff:192.168.1.20", "fe80::1", "0.0.0.0"] {
+            assert!(!local_peer(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn paths_fold_the_usual_variations() {
+        assert_eq!(route("/v1/models"), "/v1/models");
+        assert_eq!(route("/v1/models/"), "/v1/models");
+        assert_eq!(route("/models"), "/v1/models");
+        assert_eq!(route("/models/qwen?x=1"), "/v1/models/qwen");
+        assert_eq!(route("/v1/messages?beta=true"), "/v1/messages");
+        assert_eq!(route("/chat/completions"), "/v1/chat/completions");
+        assert_eq!(route("/torc/settings"), "/torc/settings");
+        assert_eq!(route("/"), "");
+        assert_eq!(route("/health"), "/v1/health");
+        assert_eq!(route("/v1/health/"), "/v1/health");
+        // the refusal comes in the shape of the API asked
+        assert!(key_refused("/v1/messages").contains("authentication_error"));
+        assert!(key_refused("/v1/chat/completions").contains("invalid_api_key"));
+        assert!(key_refused("/messages?beta=true").contains("authentication_error"));
+    }
+
+    #[test]
+    fn model_names_lose_their_escapes() {
+        assert_eq!(unescape("Llama%203%208B"), "Llama 3 8B");
+        assert_eq!(unescape("qwen3.6-35b-a3b-q4_0"), "qwen3.6-35b-a3b-q4_0");
+        assert_eq!(unescape("a%2Fb%2fc"), "a/b/c");
+        // a bad or cut-off escape stays as written
+        for s in ["100%", "%zz", "a%2", "%"] {
+            assert_eq!(unescape(s), s, "{s}");
+        }
     }
 }

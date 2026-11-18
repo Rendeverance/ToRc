@@ -6,7 +6,20 @@ const WAIT_FOR_JOB = 'Wait for the tuner or the benchmark to finish, or stop it'
 function openLoader() {
   if (S.busy) return toast(WAIT_FOR_REPLY);
   const s = S.settings;
-  const body = sheet('Load a model', 'The main settings. Auto-tune measures this machine and sets the rest.');
+  const body = sheet(
+    'Load a model',
+    'The main settings. Each is saved as you change it and takes effect when you press Load. Auto-tune ' +
+      'measures this machine and sets the rest.',
+  );
+  // changes made since the model now running was loaded, said again as they are made
+  const pending = el('div', 'note warn pending-note');
+  pending.id = 'pendingNote';
+  pending.hidden = true;
+  const again = el('button', 'btn', 'Load now');
+  again.onclick = loadNow;
+  pending.append(el('span', ''), again);
+  body.append(pending);
+  showPending();
 
   const file = el('button', 'btn', s.lastModel ? baseName(s.lastModel) : 'Choose a file');
   file.onclick = async () => {
@@ -102,6 +115,15 @@ function openLoader() {
   );
 
   const worker = field('text', s.worker, (v) => setSettings({ worker: v.trim() }), { placeholder: 'none' });
+  const waitOn = row(
+    'Wait for the first machine on',
+    'The network the first machine reaches this one on',
+    listenChoice(),
+    'Only for two machines: this is where the second machine waits for the first, not where your chat app or ' +
+      'agent reaches the engine (that is Share on my network, in Settings). The second machine has no password, ' +
+      'so it waits on one network only: pick the one the first machine is on (a USB4 or Ethernet link, or your ' +
+      'home network). Every network is there if you need it, but then anyone on any of them can use it.',
+  );
   body.append(
     group('This machine', [
       row(
@@ -132,21 +154,20 @@ function openLoader() {
       row(
         'This is the second machine',
         'Load waits here for the first machine to connect',
-        toggle(s.asWorker, (v) => setSettings({ asWorker: v })),
+        toggle(s.asWorker, (v) => setSettings({ asWorker: v }).then(() => showWaitOn(v))),
         'Tick this on the machine that helps, not the one you chat on. Load then holds the later layers of the ' +
           'model and waits; the status line shows the address to type into the first machine’s Second machine ' +
           'box. Both machines need the same model file, and the same context or more here. Chat on the first one.',
       ),
-      row(
-        'Listen on',
-        'The network the first machine reaches this one on',
-        listenChoice(),
-        'The second machine has no password, so it waits on one network only: pick the one the first machine is ' +
-          'on (a USB4 or Ethernet link, or your home network). Every network is there if you need it, but then ' +
-          'anyone on any of them can use it.',
-      ),
+      waitOn,
     ]),
   );
+  // only a second machine waits for the first, so the choice shows when this is one
+  const showWaitOn = (on) => {
+    waitOn[0].hidden = !on;
+    if (!on) waitOn[1].hidden = true;
+  };
+  showWaitOn(!!s.asWorker);
 
   const acts = el('div', 'row-actions');
   const tune = el('button', 'btn', 'Auto-tune');
@@ -165,7 +186,10 @@ function openLoader() {
 function listenChoice() {
   const s = el('select');
   s.onchange = () => setSettings({ workerBind: s.value });
+  // asking the system for its networks takes a moment
+  s.append(el('option', '', 'Finding this machine’s networks…'));
   window.torc.addresses().then((list) => {
+    s.replaceChildren();
     const hosts = list.map((i) => i.address);
     const options = list.map((i) => [i.address, `${i.address} (${i.name})`]);
     for (const [v, label] of [...options, ['any', 'Every network']]) {
@@ -207,8 +231,19 @@ async function loadNow() {
   S.loaded = null;
   setStatus('Loading the model', true);
   renderPane();
+  const asked = JSON.parse(JSON.stringify(S.settings));
   const r = await window.torc.load();
   S.asWorker = !!(r.ok && r.worker);
+  if (r.ok) {
+    S.loadedWith = asked;
+    // where other machines reach it, said in the side pane: this machine's own addresses with the port
+    S.shareAt = [];
+    if (asked.share && !r.worker) {
+      // the likeliest first (the shell ranks them), every one in the line's tooltip
+      const mine = await window.torc.addresses();
+      S.shareAt = mine.map((i) => `${i.address}:${asked.port} (${i.name})`);
+    }
+  }
   if (r.ok && r.worker) {
     S.loaded = r.name;
     const where = r.addresses && r.addresses.length ? r.addresses.join(' or ') : 'this machine, port 50052';

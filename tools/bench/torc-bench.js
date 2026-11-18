@@ -10,6 +10,8 @@
 //     --out torc-bench.csv           the file to write (default torc-bench.csv, rows are added to it)
 //     --hwscan path/to/hwscan        where hwscan is, if it is not next to the server (it fills in the hardware)
 //     --host 192.168.1.20            the server's address, if it listens somewhere else than this machine (TORC_HOST)
+//     --key <key>                    the server's API key, for one on another machine that asks for it (better: set
+//                                    TORC_API_KEY instead, which other users of this machine can't see in its process list)
 //
 // Start the server first with the settings you want measured, and with enough context for the largest size you ask
 // for (4096 more than the size is plenty). Nothing else should be running: another program taking even one core
@@ -44,12 +46,16 @@ for (const s of sizes) if (!FILES[s]) { console.error(`unknown size ${s} (sizes:
 const runs = Math.max(1, Number(opt('runs', 2)));
 const out = opt('out', 'torc-bench.csv');
 
+// the key a server on another machine may ask for (only another machine's requests need it)
+const key = opt('key', process.env.TORC_API_KEY || '');
+const auth = key ? { Authorization: `Bearer ${key}` } : {};
+
 // one request; resolves to the reply's JSON
 function ask(pathname, body) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({ host: opt('host', '127.0.0.1'), port, path: pathname, method: body ? 'POST' : 'GET',
-      headers: data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {} }, (res) => {
+      headers: { ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {}), ...auth } }, (res) => {
       let buf = '';
       res.setEncoding('utf8');
       res.on('data', (d) => { buf += d; });
@@ -110,10 +116,12 @@ function hardware() {
   try { const m = await ask('/v1/models'); served = m.data && m.data[0] ? m.data[0].id : ''; engine = m.data && m.data[0] && m.data[0].owned_by === 'torc' ? 'ToRc' : (m.data && m.data[0] && m.data[0].owned_by) || ''; }
   catch (e) { console.error(`no server answers on port ${port}: ${e.message}`); process.exit(1); }
   // the TORC_* settings in this shell: the server's own, if it was started from the same shell. A setting that holds a
-  // path or a network address is written by name only, so the CSV never carries a folder name or an address
+  // path or a network address is written by name only, so the CSV never carries a folder name or an address, and
+  // the API key never at all
   const ADDRESSES = ['TORC_HOST', 'TORC_PIPE', 'TORC_PIPE_BIND'];
   const isPath = (v) => /[\\/:]/.test(v);
-  const shown = (k) => (ADDRESSES.includes(k) ? `${k}=<address>` : isPath(process.env[k]) ? `${k}=<path>` : `${k}=${process.env[k]}`);
+  const shown = (k) =>
+    k === 'TORC_API_KEY' ? `${k}=<key>` : ADDRESSES.includes(k) ? `${k}=<address>` : isPath(process.env[k]) ? `${k}=<path>` : `${k}=${process.env[k]}`;
   const env = Object.keys(process.env).filter((k) => k.startsWith('TORC_')).sort().map(shown).join(' ');
   // the settings the server runs with, ToRc's own (another server has none)
   let tuned = '';

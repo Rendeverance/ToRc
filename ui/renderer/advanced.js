@@ -27,6 +27,8 @@ const SECTIONS = [
   ['development', 'Left from development'],
 ];
 const KIND_BADGE = { setting: 'badge accent', diagnostic: 'badge warn', development: 'badge' };
+// the switches the app sets itself (desktop/src/main.rs APP_OWNED): shown here, not taken
+const APP_OWNED = ['TORC_HOST', 'TORC_API_KEY'];
 
 // `openName`: a switch to show with its explanation already open.
 function openAdvanced(openName) {
@@ -90,6 +92,13 @@ function switchRow(w, open) {
     { placeholder: 'default' },
   );
   box.className = env[w.name] === undefined ? 'envbox' : 'envbox set';
+  // where the server listens and its key: the app sets these from Settings > Share on my network
+  if (APP_OWNED.includes(w.name)) {
+    box.disabled = true;
+    box.value = '';
+    box.placeholder = 'set by Share on my network';
+    box.className = 'envbox';
+  }
   const control = el('span', 'ctl');
   control.append(el('span', KIND_BADGE[w.kind] || 'badge', w.kind), box);
 

@@ -86,10 +86,14 @@ window.EXPLAIN = {
     'ranks r or lower and that isn’t in RAM is skipped, not fetched from the SSD. With 1, everything not in RAM ' +
     'except each token’s top expert is skipped. Off by default. Only for when you’d rather have the speed than ' +
     'the exact reply.',
+  TORC_API_KEY:
+    'The key another machine’s requests must carry (as "Authorization: Bearer <key>" or "x-api-key: <key>"); ' +
+    'requests from this machine never need it. For torc-server run by hand only: in the app, Share on my network ' +
+    'in Settings makes one and sets this itself.',
   TORC_HOST:
     'The address the server listens on. This machine only by default. Set it to open the server to your ' +
-    'network, and remember there’s no password on it. For torc-server run by hand: the app keeps its own server ' +
-    'on this machine whatever this says.',
+    'network, and set TORC_API_KEY with it, or anyone there can use it. For torc-server run by hand only: in the ' +
+    'app, use Share on my network in Settings, since the app sets this itself.',
   TORC_PIPE_BIND:
     'On a worker: the address it listens on. By default that’s every interface, and a worker has no ' +
     'authentication, so on a shared network set it to the address of the link between your two machines.',

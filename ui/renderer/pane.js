@@ -31,12 +31,33 @@ function modelCard() {
     head.append(off);
   }
   card.append(head);
+  // nothing loads by itself when ToRc starts: the model last chosen is one press away
+  if (!S.loaded && s.lastModel && !S.job) {
+    const again = el('button', 'btn primary pane-load', `Load ${baseName(s.lastModel).replace(/\.torc$/i, '')}`);
+    again.title = 'Load it with the settings on Load a model';
+    again.onclick = loadNow;
+    card.append(again);
+  }
+  // a setting the engine reads at start, changed since this model was loaded
+  const changed = changedSinceLoad();
+  if (changed.length) {
+    const note = el('div', 'pane-pending');
+    note.append(el('span', '', `Changed since loading: ${changed.join(', ')}`));
+    const again = el('button', 'btn', 'Load again');
+    again.title = 'Load the model again so the changes take effect';
+    again.onclick = loadNow;
+    note.append(again);
+    card.append(note);
+  }
 
-  const fact = (name, value) => {
+  const fact = (name, value, title) => {
     const r = el('div', 'kv');
     r.append(el('span', '', name), el('b', 'num', value));
+    if (title) r.title = title;
     card.append(r);
   };
+  // what the loaded model runs with, which a change waiting for Load doesn't alter
+  const run = (S.loaded && S.loadedWith) || s;
   const used = chat.used || 0;
   const percent = Math.min(100, Math.round((100 * used) / ctxSize()));
   fact('Context', `${num(used)} of ${num(ctxSize())}`);
@@ -45,10 +66,22 @@ function modelCard() {
   fill.style.width = `${percent}%`;
   meter.append(fill);
   card.append(meter);
-  fact('CPU threads', String(s.threads));
-  fact('NPU', npuState());
-  fact('GPU for long prompts', s.gpu ? 'on' : 'off');
-  fact('Machines', S.asWorker ? 'two, this the second' : s.worker ? 'two' : 'one');
+  fact('CPU threads', String(run.threads));
+  fact('NPU', npuState(run));
+  fact('GPU for long prompts', run.gpu ? 'on' : 'off');
+  fact('Machines', S.asWorker ? 'two, this the second' : run.worker ? 'two' : 'one');
+  if (S.loaded && !S.asWorker) {
+    // the shell shares it only with a key
+    const isShared = run.share && !!(run.apiKey || '').trim();
+    const at = S.shareAt || [];
+    const shared = at.length ? `shared, ${at[0].replace(/ \(.*\)$/, '')}` : 'shared, every network';
+    const how = isShared
+      ? `Other machines can use the engine’s API, with the API key from Settings, at this machine’s address on ` +
+        (at.length ? `any of its networks:${NL}${at.join(NL)}${NL}` : 'any of its networks. ') +
+        'Settings turns it off'
+      : 'Only this machine can use the engine’s API. Settings can share it on your network';
+    fact('API', isShared ? shared : 'this machine only', how);
+  }
   fact('Tools', s.tools === 'basic' ? 'basic' : 'ToolFunnel');
 
   const primer = el('div', 'kv kv-pick');
@@ -94,8 +127,8 @@ function modelCard() {
   return card;
 }
 
-function npuState() {
-  if (S.info.npu === 'snapdragon') return S.settings.npu ? 'on' : 'off';
+function npuState(run) {
+  if (S.info.npu === 'snapdragon') return (run || S.settings).npu ? 'on' : 'off';
   return S.info.npu === 'none' ? 'none' : 'not supported yet';
 }
 
@@ -135,7 +168,8 @@ function chatRow(c) {
 function setModel() {
   $('modelName').textContent = S.loaded || 'No model loaded';
   $('dot').className = S.loaded ? 'dot good' : 'dot';
-  $('modelNote').textContent = S.loaded ? `ctx ${num(S.chat.used || 0)} of ${num(ctxSize())}` : '';
+  const waiting = changedSinceLoad().length ? ' · changes wait for Load' : '';
+  $('modelNote').textContent = S.loaded ? `ctx ${num(S.chat.used || 0)} of ${num(ctxSize())}${waiting}` : '';
   $('btnLoad').textContent = S.loaded ? 'Change model' : 'Load a model';
 }
 

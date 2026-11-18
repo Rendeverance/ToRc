@@ -60,9 +60,11 @@ Q5_K, Q6_K, MXFP4.
     torc-server model.torc 8080 auto 16384
 
 The model, the port, the thread count (`auto` = every core of the fastest class) and the context length. Clients
-point at `http://127.0.0.1:8080/v1`; it speaks OpenAI chat completions, the OpenAI Responses API and Anthropic
-messages. It listens on this machine only unless `TORC_HOST` is set: there is no authentication, so warn the user
-before exposing it to a network. `TORC_WARM=wait` loads the model before the port opens. For a quick check of a Qwen
+point at `http://127.0.0.1:8080/v1` (`GET /health` for a liveness check, no key needed); it speaks OpenAI chat completions, the OpenAI Responses API and Anthropic
+messages. It listens on this machine only unless `TORC_HOST` is set. Opening it to a network, set `TORC_API_KEY` too:
+another machine's requests must then carry it (`Authorization: Bearer <key>` or `x-api-key: <key>`), this machine's
+never do. The traffic is plain HTTP, so warn the user before exposing it beyond a network they trust. In the desktop app that is Settings > Share on my network (the app sets
+`TORC_HOST` itself and ignores it in the switch list). `TORC_WARM=wait` loads the model before the port opens. For a quick check of a Qwen
 model without a client: `torc-chat model.torc "Hello"` (ChatML only; for other families, start the server). A web page
 from another site is refused whatever `TORC_HOST` says; non-browser clients send no Origin and are not affected.
 

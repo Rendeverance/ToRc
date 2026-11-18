@@ -262,7 +262,7 @@ fs.writeFileSync(path.join(root, 'data', 'settings.json'), JSON.stringify(settin
     );
   };
   await page('openSettings()');
-  await click('.sheet .btn', 'Open');
+  await click('.sheet .btn', 'Go to Load a model');
   check('Settings leads to the context and the other model settings', !!(await page("sheetIs('Load a model')")));
   await page('closeSheet()');
   for (const n of [128000, 16384]) {

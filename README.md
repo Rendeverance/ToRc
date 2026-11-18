@@ -85,6 +85,33 @@ Any GGUF of a supported architecture should work, including fine-tunes and ablit
 types are in the list. The app checks the architecture before converting; check the quant types yourself for now (the
 model's page on Hugging Face lists them).
 
+## The engine without the app
+
+The app is optional. The zip's `engine` folder holds `torc-server`, which runs on its own and speaks the OpenAI and
+Anthropic APIs, so any chat app, agent framework or script can use it:
+
+```
+engine/torc-server models/your-model.torc 8080 auto 16384
+```
+
+That's the model, the port, the threads and the context. Then set your client up with:
+
+- base URL `http://127.0.0.1:8080/v1` (without the `/v1` works too)
+- model: the name `GET /v1/models` lists, which is the file's name without `.torc`
+- API key: anything, or none, on the same machine
+
+To use it from other machines, start it with two switches set:
+
+```
+TORC_HOST=0.0.0.0 TORC_API_KEY=a-long-random-key engine/torc-server models/your-model.torc 8080 auto 16384
+```
+
+(in PowerShell, `$env:TORC_HOST = '0.0.0.0'; $env:TORC_API_KEY = 'a-long-random-key'` first). Other machines then
+use `http://<this machine's address>:8080/v1` with that key as their API key, while this machine still needs none.
+The traffic isn't encrypted, so keep it to a network you trust. Run Auto-tune once first (in the app, or
+`engine/torc-tune models/your-model.torc`) so the server starts with this machine's fastest settings.
+[GUIDE.md](GUIDE.md) has the rest: warming the model up, drafting, sampling and every switch.
+
 ## How fast
 
 Qwen3.6-35B-A3B Q4_0, **<ins>a 4k-token prompt</ins>** and a 128-token reply, in tokens a second as the server times them.

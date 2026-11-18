@@ -88,7 +88,8 @@ fn defaults() -> Value {
     json!({
         "saveChats": true, "chatDir": "", "autoCompact": true, "compactShare": 15, "compactMaxWords": 5000,
         "primer": "", "firstView": "chat",
-        "binDir": bin.to_string_lossy(), "port": 8080, "lastModel": "", "ctx": 16384, "replyMax": 16384, "threads": "auto",
+        "binDir": bin.to_string_lossy(), "port": 8080, "share": false, "apiKey": "", "lastModel": "", "ctx": 16384, "replyMax": 16384,
+        "threads": "auto",
         "npu": false, "gpu": false, "worker": "", "asWorker": false, "workerBind": "", "env": {},
         "tools": "basic", "basic": {"now": true, "calc": true, "ctx": true, "compact": false, "wake": false},
         "mcp": [], "toolfunnel": "", "agentSetup": false,
@@ -145,12 +146,14 @@ impl Shell {
     }
 }
 
-/// The TORC_* names with text values out of an env object; anything else is dropped
+/// The TORC_* names with text values out of an env object; anything else is dropped, and so are the switches the app
+/// sets itself (APP_OWNED)
 fn switches_only(env: &Value) -> Value {
     let named = |k: &str| {
-        k.strip_prefix("TORC_").is_some_and(|r| {
-            !r.is_empty() && r.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        })
+        !APP_OWNED.contains(&k)
+            && k.strip_prefix("TORC_").is_some_and(|r| {
+                !r.is_empty() && r.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            })
     };
     let kept = env.as_object().into_iter().flatten().filter(|(k, v)| named(k) && v.is_string());
     Value::Object(kept.map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -386,8 +389,10 @@ pub(crate) fn without_app_vars(cmd: &mut Command) -> &mut Command {
 /// What the Load screen asks for, read from the saved settings (never from the page).
 pub(crate) fn switches_for(s: &Value) -> Vec<(String, String)> {
     let mut own = s["env"].as_object().cloned().unwrap_or_default();
-    // the app talks to its server on 127.0.0.1 only, so the server must listen there
-    own.remove("TORC_HOST");
+    // where the server listens and its key are the app's to set (server_switches), never the switch list's
+    for k in APP_OWNED {
+        own.remove(*k);
+    }
     let mut env: Vec<(String, String)> =
         own.iter().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
     let set = |env: &mut Vec<(String, String)>, k: &str, v: &str| {
@@ -406,6 +411,24 @@ pub(crate) fn switches_for(s: &Value) -> Vec<(String, String)> {
     }
     if s["saveChats"] == false {
         set(&mut env, "TORC_MARKS", "0");
+    }
+    env
+}
+
+/// The switches the app sets itself, which the Advanced list shows but does not take.
+pub(crate) const APP_OWNED: &[&str] = &["TORC_HOST", "TORC_API_KEY"];
+
+/// The server's switches: the Load screen's, and where it listens. The app talks to its server on 127.0.0.1, so the
+/// server listens there, or on every network when Settings shares it (0.0.0.0 takes 127.0.0.1 too); an address of one
+/// network alone would shut the app out. Shared, it always has a key (only other machines need it, so the app's own
+/// requests carry none), and without one it isn't shared. Only the server gets these, not the tuner, the benchmark or
+/// a second machine.
+pub(crate) fn server_switches(s: &Value) -> Vec<(String, String)> {
+    let mut env = switches_for(s);
+    let key = s["apiKey"].as_str().map(str::trim).unwrap_or("");
+    if s["share"] == true && !key.is_empty() {
+        env.push(("TORC_HOST".into(), "0.0.0.0".into()));
+        env.push(("TORC_API_KEY".into(), key.into()));
     }
     env
 }
@@ -513,7 +536,7 @@ impl Shell {
         let mut cmd = Command::new(&exe);
         without_app_vars(&mut cmd);
         cmd.args([model.as_str(), &port.to_string(), &threads, &ctx.to_string()])
-            .envs(switches_for(&s))
+            .envs(server_switches(&s))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -1071,5 +1094,33 @@ mod tests {
     fn env_keeps_only_switches() {
         let env = serde_json::json!({"TORC_NPU": "1", "PATH": "x", "TORC_X": 1, "torc_lower": "1", "TORC_": "1"});
         assert_eq!(super::switches_only(&env), serde_json::json!({"TORC_NPU": "1"}));
+    }
+
+    #[test]
+    fn the_server_is_shared_only_when_settings_say() {
+        let host = |s: serde_json::Value| {
+            super::server_switches(&s).into_iter().find(|(k, _)| k == "TORC_HOST").map(|(_, v)| v)
+        };
+        // a TORC_HOST in the switch list never reaches the app's server: one network's address would shut the app out
+        let typed = serde_json::json!({"TORC_HOST": "192.168.1.20", "TORC_API_KEY": "typed"});
+        let get = |s: serde_json::Value, k: &str| {
+            super::server_switches(&s).into_iter().find(|(n, _)| n == k).map(|(_, v)| v)
+        };
+        assert_eq!(host(serde_json::json!({"env": typed})), None);
+        assert_eq!(host(serde_json::json!({"env": typed, "share": false, "apiKey": "k1"})), None);
+        // shared only with a key, and the key is the app's, never the switch list's
+        assert_eq!(host(serde_json::json!({"env": typed, "share": true})), None);
+        assert_eq!(host(serde_json::json!({"env": typed, "share": true, "apiKey": " "})), None);
+        assert_eq!(get(serde_json::json!({"env": typed, "share": true}), "TORC_API_KEY"), None);
+        let shared = serde_json::json!({"env": typed, "share": true, "apiKey": "k1"});
+        assert_eq!(host(shared.clone()), Some("0.0.0.0".into()));
+        assert_eq!(get(shared, "TORC_API_KEY"), Some("k1".into()));
+        assert_eq!(get(serde_json::json!({"env": typed, "apiKey": "k1"}), "TORC_API_KEY"), None);
+        // only the server gets them: the tuner, the benchmark and a second machine never see the address or the key
+        let others = super::switches_for(&serde_json::json!({"env": typed, "share": true, "apiKey": "k1"}));
+        assert!(others.iter().all(|(k, _)| k != "TORC_HOST" && k != "TORC_API_KEY"), "{others:?}");
+        // and the switch list never keeps them
+        let kept = super::switches_only(&serde_json::json!({"TORC_HOST": "x", "TORC_API_KEY": "y", "TORC_NPU": "1"}));
+        assert_eq!(kept, serde_json::json!({"TORC_NPU": "1"}));
     }
 }

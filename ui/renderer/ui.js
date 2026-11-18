@@ -19,6 +19,8 @@ const S = {
   switches: [],
   basicTools: [],
   loaded: null, // the loaded model's name
+  loadedWith: null, // the settings it was loaded with: a change after that waits for the next Load
+  shareAt: [], // where other machines reach the loaded model's server, when Settings shares it
   busy: false, // a reply is being written, or a compact is running
   job: false, // the tuner or the benchmark is running
   view: 'chat',
@@ -52,7 +54,49 @@ function newChat() {
 // Changes settings: the shell merges the change into what is saved and hands back the whole.
 async function setSettings(patch) {
   S.settings = await window.torc.settingsSet(patch);
+  showPending();
   return S.settings;
+}
+
+// The settings the engine reads when it starts, with the name a person knows each by. A change to one is saved at
+// once but only reaches the engine at the next Load; the rest (sampling, the longest reply, tools) apply to the next
+// reply by themselves.
+const LOAD_TIME = [
+  ['lastModel', 'the model file'],
+  ['ctx', 'context'],
+  ['threads', 'CPU threads'],
+  ['npu', 'NPU'],
+  ['gpu', 'GPU'],
+  ['worker', 'second machine'],
+  ['asWorker', 'second machine'],
+  ['workerBind', 'second machine'],
+  ['port', 'port'],
+  ['binDir', 'engine folder'],
+  ['share', 'sharing on your network'],
+  ['apiKey', 'API key'],
+  ['saveChats', 'saving chats'],
+  ['env', 'advanced settings'],
+];
+
+// What has changed since the loaded model was loaded, by name; nothing when no model is loaded.
+function changedSinceLoad() {
+  if (!S.loaded || !S.loadedWith) return [];
+  const names = [];
+  for (const [key, name] of LOAD_TIME) {
+    const now = JSON.stringify(S.settings[key] ?? null);
+    if (now !== JSON.stringify(S.loadedWith[key] ?? null) && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+// Says so wherever it shows: the side pane, the top bar, and the note at the top of Load a model.
+function showPending() {
+  if (S.chat) renderPane();
+  const note = $('pendingNote');
+  if (!note) return;
+  const changed = changedSinceLoad();
+  note.hidden = !changed.length;
+  note.firstChild.textContent = `Changed since ${S.loaded} was loaded: ${changed.join(', ')}. Load it again to use them.`;
 }
 
 function toast(text) {

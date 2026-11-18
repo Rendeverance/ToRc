@@ -11,7 +11,8 @@ whole file but only ever reads its own layers from it, so each one's memory hold
 learned (half to start with, then whatever balanced the two machines on earlier runs of that model).
 
 In the desktop app: on the worker, tick "This is the second machine" on the Load screen, pick the network the main
-machine reaches it on under "Listen on" (it waits on that one only), and load the model; the status line shows its
+machine reaches it on under "Wait for the first machine on", which shows once that box is ticked (it waits on
+that one only), and load the model; the status line shows its
 address. On the main machine, put that address in the Second machine box and load the same model. From a terminal:
 
 On the worker:
