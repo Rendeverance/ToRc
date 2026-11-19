@@ -59,6 +59,7 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_QSA_GATHER` | development | `0` turns the decode gather of the attention off |
 | `TORC_ATTN_FAST` | setting | `1`: attention scores over each query rounded to sixteen bits, an exact integer sum against the keys: faster at long context, and no longer bit-identical to the default (the scores differ by about 3e-5 of the largest). Off by default. For models with an 8-bit cache and heads of up to 256 |
 | `TORC_ATTN_F32`, `TORC_ATTN_F32_MIN`, `TORC_ATTN_TILE`, `TORC_ATTN_TILE_MIN`, `TORC_ATTN_ROWS2` | setting: `TORC_ATTN_TILE`; the rest development | attention page conversion to f32 and tiling (the tiled path: ARM only, on by default for the Qwen3.6-35B's architecture, `TORC_ATTN_TILE=0` or `1` to choose) |
+| `TORC_GGML_REF` | development | the kernel tests ask ggml itself as well: path to the harness `scripts/ggml_ref.sh` builds from a ggml checkout. Unset, those tests say so out loud and pass, so a machine without ggml still builds green |
 
 ## Memory and disk (models bigger than RAM)
 

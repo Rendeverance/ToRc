@@ -332,7 +332,7 @@ impl Weights {
     pub fn load_with(path: &str, cache: bool) -> Result<Weights> {
         let file = File::open(path)?;
         // a weight of a type ToRc has no kernel for stops the load here, named, rather than panicking in the first
-        // reply that reaches it (an Unsloth IQ3_S file holds IQ2_S experts, say)
+        // reply that reaches it (a file holding Q8_K weights, say: the format can carry it, the engine cannot read it)
         let pieces = file.experts.iter().flat_map(|x| x.pack.pieces().map(|p| (&p.name, p.ty)));
         if let Some((name, ty)) = file
             .tensors
@@ -831,8 +831,9 @@ mod type_tests {
     use format::write::{plan, write};
     use format::*;
 
-    /// A file whose experts' gate is IQ2_S (no kernel here) is refused at load, naming the weight and its type, and
-    /// the same file with Q8_0 there loads.
+    /// A file whose experts' gate is Q8_K (no kernel here) is refused at load, naming the weight and its type, and
+    /// the same file with Q8_0 there loads. IQ2_S, which this used to be about, is a weight ToRc can run now, so the
+    /// same file with IQ2_S there is now asserted to load.
     #[test]
     fn a_type_with_no_kernel_is_refused_at_load() {
         let dir = std::env::temp_dir().join(format!("torc-types-{}", std::process::id()));
@@ -883,16 +884,19 @@ mod type_tests {
             write(&path, plan(d, "qwen35moe").unwrap(), |_, _, _| Ok(()), |_, _, _| Ok(())).unwrap();
             path
         };
-        let bad = tiny(22, "iq2s.torc");
+        let bad = tiny(15, "q8k.torc");
         match super::Weights::load_with(&bad, false) {
-            Ok(_) => panic!("an IQ2_S weight was loaded"),
+            Ok(_) => panic!("a Q8_K weight was loaded"),
             Err(e) => assert!(
-                e.0.contains("blk.0.ffn_gate_exps.weight is IQ2_S (ggml type 22), a type ToRc has no kernel for"),
+                e.0.contains("blk.0.ffn_gate_exps.weight is Q8_K (ggml type 15), a type ToRc has no kernel for"),
                 "{}",
                 e.0
             ),
         }
         assert!(super::Weights::load_with(&tiny(8, "q8.torc"), false).is_ok());
+        // the IQ2_S file this test used to be written about: a kernel for it is what makes the model runnable at all,
+        // so the load gate has to let it through.
+        assert!(super::Weights::load_with(&tiny(22, "iq2s.torc"), false).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
