@@ -119,7 +119,7 @@ pub fn register(data: &[u8], rows: usize, cols: usize) -> usize {
     use kernels::neon::{Q4X4_GROUP, q4_0_repack4};
     let nb = cols / kernels::QK;
     let row_bytes = data.len() / rows;
-    assert!(rows % 4 == 0 && row_bytes == nb * 8 * kernels::Q4_0_BLOCK);
+    assert!(rows.is_multiple_of(4) && row_bytes == nb * 8 * kernels::Q4_0_BLOCK);
     let quad = nb * 8 * Q4X4_GROUP;
     // 64-byte aligned, as the file's tensors are
     #[repr(C, align(64))]
@@ -193,7 +193,7 @@ pub fn klay_on() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| {
         #[cfg(target_arch = "aarch64")]
         {
-            return crate::switches::get("TORC_KLAY").map_or(true, |v| v != "0")
+            return crate::switches::get("TORC_KLAY").is_none_or(|v| v != "0")
                 && std::arch::is_aarch64_feature_detected!("i8mm");
         }
         #[allow(unreachable_code)]

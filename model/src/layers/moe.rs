@@ -87,11 +87,13 @@ pub fn dot_rows(ty: u32, w: &[u8], rb: usize, x: Q8s, y: &mut [f32]) {
         });
         // a repacked copy of these rows (TORC_Q4X4=1) goes through q4x4_matmul, with the same bits, reading the 4 rows
         // of a pass as one stream
-        if ty == kernels::GGML_Q4_0 && *OURS > 0 && q4x4(ty, 1) {
-            if let Some(rp) = crate::repack::find(&w[..y.len() * rb], y.len()) {
-                // SAFETY: FEAT_DotProd was checked above; y holds y.len() rows (a multiple of 4, as find guarantees)
-                return unsafe { kernels::neon::q4x4_matmul(rp, y.len(), x.g, 1, y.as_mut_ptr(), y.len()) };
-            }
+        if ty == kernels::GGML_Q4_0
+            && *OURS > 0
+            && q4x4(ty, 1)
+            && let Some(rp) = crate::repack::find(&w[..y.len() * rb], y.len())
+        {
+            // SAFETY: FEAT_DotProd was checked above; y holds y.len() rows (a multiple of 4, as find guarantees)
+            return unsafe { kernels::neon::q4x4_matmul(rp, y.len(), x.g, 1, y.as_mut_ptr(), y.len()) };
         }
         if ty == kernels::GGML_Q4_0 && *OURS > 0 {
             // rows longer than 3072 columns go a row at a time: beyond that, the 2-row pass loses the hardware
@@ -290,7 +292,7 @@ fn use_q6m(m: &Mat, nv: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     if m.ty == 14
         && nv >= 4
-        && m.rows % 4 == 0
+        && m.rows.is_multiple_of(4)
         && crate::repack::klay_on()
         && crate::repack::find(m.data, m.rows).is_some()
     {
@@ -370,7 +372,7 @@ fn use_mmla(ty: u32, nv: usize) -> bool {
     {
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::arch::is_aarch64_feature_detected!("i8mm")
-                && crate::switches::get("TORC_MMLA").map_or(true, |v| v != "0")
+                && crate::switches::get("TORC_MMLA").is_none_or(|v| v != "0")
         });
         // from 16 vectors by default: short batches (MTP verify passes) stay on the dot kernels
         static MIN: std::sync::LazyLock<usize> =
@@ -489,18 +491,22 @@ unsafe fn dot_multi_rows(
     // a repacked copy of these rows (TORC_Q4X4=1) goes through gemm_q4x4 from 4 vectors and q4x4_matmul below that,
     // with the same bits
     #[cfg(target_arch = "aarch64")]
-    if nv >= 4 && !pk.is_empty() && q4x4(ty, nv) {
-        if let Some(rp) = crate::repack::find(&w[..rows * row_bytes], rows) {
-            unsafe { kernels::neon::gemm_q4x4(rp, rows, pk, nv, x.len() / nv, y, y_stride) };
-            return;
-        }
+    if nv >= 4
+        && !pk.is_empty()
+        && q4x4(ty, nv)
+        && let Some(rp) = crate::repack::find(&w[..rows * row_bytes], rows)
+    {
+        unsafe { kernels::neon::gemm_q4x4(rp, rows, pk, nv, x.len() / nv, y, y_stride) };
+        return;
     }
     #[cfg(target_arch = "aarch64")]
-    if nv <= 3 && q4x4(ty, nv) && std::arch::is_aarch64_feature_detected!("dotprod") {
-        if let Some(rp) = crate::repack::find(&w[..rows * row_bytes], rows) {
-            unsafe { kernels::neon::q4x4_matmul(rp, rows, x.g, nv, y, y_stride) };
-            return;
-        }
+    if nv <= 3
+        && q4x4(ty, nv)
+        && std::arch::is_aarch64_feature_detected!("dotprod")
+        && let Some(rp) = crate::repack::find(&w[..rows * row_bytes], rows)
+    {
+        unsafe { kernels::neon::q4x4_matmul(rp, rows, x.g, nv, y, y_stride) };
+        return;
     }
     // one vector (an expert with one token of a block): the single-vector row kernels, which are bit-identical to the
     // multi-vector ones over one vector (parity test)
@@ -707,7 +713,7 @@ unsafe fn dot_multi_rows(
         let wr = &w[..rows * row_bytes];
         // a laid-out copy of these K-quant rows (TORC_KLAY=1) goes through q45k_lay_matmul / q6_lay_matmul for 1-3
         // vectors, with the same bits
-        if matches!(ty, 12 | 13 | 14) && unsafe { klay_matmul(ty, wr, rows, x, nv, y, y_stride) } {
+        if matches!(ty, 12..=14) && unsafe { klay_matmul(ty, wr, rows, x, nv, y, y_stride) } {
             return;
         }
         if *MODE == 1 && matches!(ty, 3 | 6 | 7 | 8 | 11 | 12 | 13 | 14 | 20 | 21 | 23) {
@@ -750,7 +756,7 @@ unsafe fn dot_multi_rows(
 /// As for dot_multi_rows.
 #[cfg(target_arch = "aarch64")]
 unsafe fn klay_matmul(ty: u32, w: &[u8], rows: usize, x: Q8s, nv: usize, y: *mut f32, y_stride: usize) -> bool {
-    if !(matches!(ty, 12 | 13 | 14) && (1..=3).contains(&nv) && rows % 4 == 0 && crate::repack::klay_on()) {
+    if !(matches!(ty, 12..=14) && (1..=3).contains(&nv) && rows.is_multiple_of(4) && crate::repack::klay_on()) {
         return false;
     }
     match crate::repack::find(w, rows) {

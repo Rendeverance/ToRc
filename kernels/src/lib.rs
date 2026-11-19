@@ -155,7 +155,7 @@ pub fn delta_rule_f32(
     dim: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
-    if dim % 16 == 0 {
+    if dim.is_multiple_of(16) {
         neon::delta_rule_f32(src, state, q, k, v, alpha, beta, q_scale, o, dim);
         return;
     }

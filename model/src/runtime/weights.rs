@@ -188,6 +188,38 @@ pub(crate) fn total_phys() -> Option<u64> {
     avail_phys()
 }
 
+/// ggml's name for a weight type, for the messages (the types a .torc file can hold that have no kernel here, and
+/// the common ones).
+fn type_name(ty: u32) -> String {
+    let n = match ty {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        15 => "Q8_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        29 => "IQ1_M",
+        30 => "BF16",
+        39 => "MXFP4",
+        _ => return format!("ggml type {ty}"),
+    };
+    format!("{n} (ggml type {ty})")
+}
+
 /// A line of /proc/meminfo ("MemTotal:", "MemAvailable:"), in bytes.
 #[cfg(target_os = "linux")]
 fn meminfo(key: &str) -> Option<u64> {
@@ -299,6 +331,22 @@ impl Weights {
     /// small and mapped whole, and must not get a cache of its own from the main model's TORC_CACHE_MB).
     pub fn load_with(path: &str, cache: bool) -> Result<Weights> {
         let file = File::open(path)?;
+        // a weight of a type ToRc has no kernel for stops the load here, named, rather than panicking in the first
+        // reply that reaches it (an Unsloth IQ3_S file holds IQ2_S experts, say)
+        let pieces = file.experts.iter().flat_map(|x| x.pack.pieces().map(|p| (&p.name, p.ty)));
+        if let Some((name, ty)) = file
+            .tensors
+            .iter()
+            .map(|t| (&t.name, t.ty))
+            .chain(pieces)
+            .find(|&(_, ty)| kernels::dequant::block_geometry(ty).is_none())
+        {
+            return err(format!(
+                "{path}: {name} is {}, a type ToRc has no kernel for yet. Use a file of this model without it (a \
+                 Q4_K_M or Q4_0, say)",
+                type_name(ty)
+            ));
+        }
         let handle = fs::File::open(path)?;
         // SAFETY: the model file is not modified while it is mapped (it is only read, and model files do not change)
         let map = unsafe { Mmap::map(&handle) }.map_err(|e| format::Error(format!("cannot map {path}: {e}")))?;
@@ -502,14 +550,16 @@ impl Weights {
         // again), so its products go through q6_lay_matmul for 1-3 vectors and gemm_q6_lay from 4 (moe.rs use_q6m),
         // with the same bits
         #[cfg(target_arch = "aarch64")]
-        if crate::repack::klay_on() && crate::repack::klay_type_on(14) && crate::switches::on("TORC_KLAY_HEAD") {
-            if let Ok(t) = w.head() {
-                let (cols, rows) = t.shape();
-                if t.t.ty == 14 && rows % 4 == 0 {
-                    let t0 = std::time::Instant::now();
-                    let b = crate::repack::register_many_klay(&[(t.data, rows, cols, 14)]);
-                    eprintln!("klay: the head laid out, {} MB in {:.1} s", b >> 20, t0.elapsed().as_secs_f64());
-                }
+        if crate::repack::klay_on()
+            && crate::repack::klay_type_on(14)
+            && crate::switches::on("TORC_KLAY_HEAD")
+            && let Ok(t) = w.head()
+        {
+            let (cols, rows) = t.shape();
+            if t.t.ty == 14 && rows % 4 == 0 {
+                let t0 = std::time::Instant::now();
+                let b = crate::repack::register_many_klay(&[(t.data, rows, cols, 14)]);
+                eprintln!("klay: the head laid out, {} MB in {:.1} s", b >> 20, t0.elapsed().as_secs_f64());
             }
         }
         // TORC_EXPERTS_LARGE=1 (no expert cache, with the file in RAM): each layer's expert packs are copied into a
@@ -773,5 +823,76 @@ mod mem_tests {
             let avail = super::avail_phys().expect("free memory");
             assert!(avail > 0 && avail <= total, "{avail} of {total}");
         }
+    }
+}
+
+#[cfg(test)]
+mod type_tests {
+    use format::write::{plan, write};
+    use format::*;
+
+    /// A file whose experts' gate is IQ2_S (no kernel here) is refused at load, naming the weight and its type, and
+    /// the same file with Q8_0 there loads.
+    #[test]
+    fn a_type_with_no_kernel_is_refused_at_load() {
+        let dir = std::env::temp_dir().join(format!("torc-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tiny = |gate_ty: u32, name: &str| {
+            let path = dir.join(name).to_str().unwrap().to_string();
+            let piece = |name: &str, ty: u32, rows: u32, cols: u32, at| Piece {
+                name: name.into(),
+                ty,
+                rows,
+                cols,
+                at,
+                bytes: matrix_bytes(ty, rows as u64, cols as u64).unwrap(),
+                origin: Origin::default(),
+                stride: 0,
+            };
+            let gate = piece("blk.0.ffn_gate_exps.weight", gate_ty, 64, 256, 0);
+            let up = piece("blk.0.ffn_up_exps.weight", 8, 64, 256, page_up(gate.bytes));
+            let down = piece("blk.0.ffn_down_exps.weight", 8, 256, 64, page_up(up.at + up.bytes));
+            let pack_bytes = page_up(down.at + down.bytes);
+            let t = |name: &str, dims: [u64; 4]| Tensor {
+                name: name.into(),
+                ty: 0,
+                n_dims: 2,
+                dims,
+                bytes: 4 * dims[0] * dims[1],
+                ..Default::default()
+            };
+            let d = Directory {
+                metadata: 0u64.to_le_bytes().to_vec(),
+                source: None,
+                tensors: vec![
+                    t("token_embd.weight", [256, 10, 1, 1]),
+                    t("blk.0.ffn_gate_inp.weight", [256, 3, 1, 1]),
+                    t("blk.0.attn_q.weight", [256, 256, 1, 1]),
+                ],
+                experts: vec![Experts {
+                    layer: 0,
+                    n_expert: 3,
+                    n_used: 2,
+                    d_in: 256,
+                    width: 64,
+                    first: 0,
+                    pack: Pack { bytes: pack_bytes, gate, up, down },
+                    crcs: vec![],
+                }],
+            };
+            write(&path, plan(d, "qwen35moe").unwrap(), |_, _, _| Ok(()), |_, _, _| Ok(())).unwrap();
+            path
+        };
+        let bad = tiny(22, "iq2s.torc");
+        match super::Weights::load_with(&bad, false) {
+            Ok(_) => panic!("an IQ2_S weight was loaded"),
+            Err(e) => assert!(
+                e.0.contains("blk.0.ffn_gate_exps.weight is IQ2_S (ggml type 22), a type ToRc has no kernel for"),
+                "{}",
+                e.0
+            ),
+        }
+        assert!(super::Weights::load_with(&tiny(8, "q8.torc"), false).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

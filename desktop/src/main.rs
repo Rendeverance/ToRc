@@ -600,8 +600,10 @@ fn request(shell: &Shell, app: &AppHandle, port: u16, messages: &[Value], opts: 
         "presence_penalty": opts["presence_penalty"].as_f64().unwrap_or(0.0),
         "frequency_penalty": opts["frequency_penalty"].as_f64().unwrap_or(0.0),
     });
-    if opts["think"] == false {
-        body["chat_template_kwargs"] = json!({"enable_thinking": false});
+    // thinking switched on or off (the Thinking button, or a quiet request): left out, the model does as its
+    // template says
+    if let Some(think) = opts["think"].as_bool() {
+        body["chat_template_kwargs"] = json!({"enable_thinking": think});
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools);

@@ -225,6 +225,8 @@ pub fn init(n: usize) -> &'static Pool {
         let home = home();
         let rayon = crate::switches::is("TORC_POOL", "rayon");
         if rayon {
+            #[cfg(target_os = "macos")]
+            user_initiated();
             crate::init_threads(n);
             return Pool { threads: n, rayon, own: None, cpus, pinned: AtomicBool::new(false), home };
         }
@@ -524,6 +526,9 @@ impl OwnPool {
             spin: Duration::from_micros(spin),
             busy: AtomicBool::new(false),
         }));
+        // the thread that makes the pool is its thread 0 and works with the others
+        #[cfg(target_os = "macos")]
+        user_initiated();
         let workers = (1..n)
             .map(|t| {
                 let cpu = cpus.map(|c| c[t]);
@@ -616,6 +621,22 @@ pub(crate) fn pin_linux(c: i32) {
     unsafe { sched_setaffinity(0, std::mem::size_of_val(&set), set.as_ptr()) };
 }
 
+/// macOS: this thread's quality of service set to user-initiated, the class macOS gives work someone is waiting
+/// for, so the engine's threads are not scheduled as background work. TORC_QOS=0 leaves the class macOS gives.
+#[cfg(target_os = "macos")]
+pub fn user_initiated() {
+    if crate::switches::get("TORC_QOS").as_deref() == Some("0") {
+        return;
+    }
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+    }
+    // QOS_CLASS_USER_INITIATED, from <sys/qos.h>
+    const USER_INITIATED: u32 = 0x19;
+    // SAFETY: it changes only the calling thread's own class, and takes no pointers
+    unsafe { pthread_set_qos_class_self_np(USER_INITIATED, 0) };
+}
+
 fn worker(sh: &'static Shared, t: usize, n: usize, cpu: Option<i32>) {
     #[cfg(windows)]
     if let Some(m) = cpu.and_then(mask) {
@@ -627,6 +648,8 @@ fn worker(sh: &'static Shared, t: usize, n: usize, cpu: Option<i32>) {
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     let _ = cpu;
+    #[cfg(target_os = "macos")]
+    user_initiated();
     IN_JOB.with(|c| c.set(true));
     let mut last = 0u64;
     // whether the newest run left this thread out (a width below its number). It then parks at once instead of

@@ -19,6 +19,7 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_POOL` | development | worker pool implementation |
+| `TORC_QOS` | setting | macOS only: `0` leaves the engine's threads in the class macOS gives them; by default they are marked as work someone is waiting for (user-initiated), so macOS doesn't schedule them as background work |
 | `TORC_PIN` | setting | `0` leaves worker threads unpinned, `1` pins them; pinned by default on Windows only (Linux and macOS leave it to the OS); `1` pins on Linux too (experimental there, though a user has measured it faster on a Snapdragon X under Ubuntu), and changes nothing on macOS, which has no way to pin a thread. Unset, on Windows, Auto-tune's measured choice for the model is used when there is one (AUTOTUNE.md) |
 | `TORC_DECODE_THREADS` | setting | threads a reply step uses (the decode width; default: the tuned `decode_threads`, else all). On a part with two threads a core, one a core can write faster while the prompt still reads on all |
 | `TORC_SPREAD` | development | `0` uses CPUs 0..n instead of spreading over the fastest cores |

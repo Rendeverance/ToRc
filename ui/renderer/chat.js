@@ -25,8 +25,6 @@ function compactRequest(used) {
 
 // The nodes of the reply being written, so each new piece of text touches only them.
 let live = null; // { turn, body, think, line }
-// the turns whose Thinking fold the user has opened (this session only, not saved)
-const openThinking = new WeakSet();
 
 function render() {
   document.body.classList.toggle('terminal', S.view === 'terminal');
@@ -37,6 +35,7 @@ function render() {
   if (S.view === 'chat') renderChat();
   else renderTerminal();
   renderPane();
+  showThinking();
   contextNotice();
   const box = scroller();
   box.scrollTop = box.scrollHeight;
@@ -118,13 +117,13 @@ function turnNode(turn, old, last) {
   for (const use of turn.used || []) d.append(toolUseNode(use));
   let think = null;
   if (turn.thinking || (last && !user && S.busy)) {
-    const folded = el('details', 'think');
+    const folded = el('details', 'think thinking');
     think = document.createTextNode(turn.thinking || '');
     folded.append(el('summary', '', 'Thinking'), think);
     folded.hidden = !turn.thinking;
-    // a turn's thinking, once opened, stays open when the chat is drawn again (a tool call, the reply ending)
-    folded.open = openThinking.has(turn);
-    folded.ontoggle = () => (folded.open ? openThinking.add(turn) : openThinking.delete(turn));
+    // the Thinking folds open and close together, the ones still to come too, and the app remembers which
+    folded.open = !!S.settings.thinkingOpen;
+    folded.ontoggle = () => foldThinking(folded.open);
     d.append(folded);
   }
   const body = user ? el('div', 'body', turn.text) : rich(turn.text);
@@ -312,7 +311,12 @@ async function send() {
   const ended = new Promise((resolve) => (S.onEnd = resolve));
   let r;
   try {
-    r = await window.torc.chat(messages, { max: Math.min(replyMax(), room), ...samplingFor(true) });
+    // the Thinking button: as the model's maker set it (nothing sent), on, or off
+    const t = S.settings.thinking;
+    const think = t === 'on' ? true : t === 'off' ? false : undefined;
+    const opts = { max: Math.min(replyMax(), room), ...samplingFor(think !== false) };
+    if (think !== undefined) opts.think = think;
+    r = await window.torc.chat(messages, opts);
     await Promise.race([ended, new Promise((resolve) => setTimeout(resolve, 2000))]);
   } catch (e) {
     // the shell itself failed: the turn is undone below, as for any failed reply, rather than left busy
@@ -479,4 +483,22 @@ function onAsk(ask) {
   refuse.onclick = () => settle(false);
   bar.append(allow, refuse);
   $('asks').append(bar);
+}
+
+// The Thinking button's label, from the setting.
+function showThinking() {
+  const t = (S.settings && S.settings.thinking) || 'default';
+  $('btnThink').textContent = `Thinking: ${t}`;
+  // ToRc runs Gemma 4 without thinking and LFM2's chat format has no switch for it, so for them it would do nothing
+  const arch = (S.modelArch && S.modelArch.arch) || '';
+  $('btnThink').hidden = /^(gemma|lfm2)/.test(arch);
+}
+
+// Opens or closes every Thinking fold in the chat, and remembers it for the folds still to come.
+function foldThinking(open) {
+  for (const d of document.querySelectorAll('details.thinking')) if (d.open !== open) d.open = open;
+  if (!!S.settings.thinkingOpen === open) return;
+  // set here at once, so a fold drawn before the save comes back opens the new way, not the old
+  S.settings.thinkingOpen = open;
+  setSettings({ thinkingOpen: open }).catch(() => {});
 }

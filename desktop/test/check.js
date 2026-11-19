@@ -118,10 +118,44 @@ fs.writeFileSync(path.join(root, 'data', 'settings.json'), JSON.stringify(settin
   let turn = await say('What is 12 times 12? Answer with the number only.');
   check('a reply comes back', !!turn && turn.text.includes('144'), turn && turn.text.slice(0, 40));
   check('the engine reports its speeds', !!turn && /tok\/s/.test(turn.speeds || ''), turn && turn.speeds);
+  // the Thinking button: on, off, and back to the model's default; with it off the reply comes with no thinking
+  const think = async () => {
+    await page("$('btnThink').click()");
+    await sleep(400);
+    return page("$('btnThink').textContent");
+  };
+  const labels = [await think(), await think(), await think()].join(', ');
+  const cycle = labels === 'Thinking: on, Thinking: off, Thinking: default';
+  check('the Thinking button goes on, off and back to the default', cycle, labels);
+  await think();
+  await think();
+  turn = await say('What is 7 times 8? Answer with the number only.');
+  const unthought = !!turn && turn.text.includes('56') && !turn.thinking;
+  const offSaid = turn && `${(turn.thinking || '').length} chars of thinking | ${turn.text}`;
+  check('with Thinking off the reply has no thinking', unthought, offSaid);
+  await think();
   turn = await say('Use the calc tool to work out 123456789 * 3 + 1, then give the result.');
   const calc = !!turn && (turn.used || []).some((u) => u.name === 'calc');
   const sum = calc && turn.text.replace(/,/g, '').includes('370370368');
   check('the model calls calc', sum, turn && turn.text.slice(0, 60));
+  // the Thinking folds open and close together, and the next reply's fold opens the way the last were left
+  const folds = "[...document.querySelectorAll('details.thinking:not([hidden])')].map((d) => d.open)";
+  const fold = "document.querySelector('details.thinking:not([hidden]) summary').click()";
+  await page(fold);
+  await sleep(400);
+  const foldsOpen = await page(folds);
+  turn = await say('What is 9 times 9? Answer with the number only.');
+  const after = await page(folds);
+  await page(fold);
+  await sleep(400);
+  const closed = await page(folds);
+  const together =
+    foldsOpen.length >= 2 &&
+    foldsOpen.every(Boolean) &&
+    after.length > foldsOpen.length &&
+    after.every(Boolean) &&
+    closed.every((o) => !o);
+  check('the Thinking folds open and close together, new ones too', together, `${foldsOpen} | ${after} | ${closed}`);
   turn = await say('Thanks. One word: was that a big number?');
   check('the server reads only the new part of the chat', readOf(turn) > 0 && readOf(turn) < 400, readOf(turn));
   let r = await sayAllowing('Use the ctx tool, then tell me how many tokens this chat has used.');

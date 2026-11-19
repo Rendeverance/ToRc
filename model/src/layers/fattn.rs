@@ -1239,7 +1239,7 @@ mod neon {
     /// TORC_ATTN_F32: the cache rows base..base + nt as f32, exactly (K into kf and V into vf, nt x hd each).
     pub(super) fn page_f32(kv: &KvCache, base: usize, nt: usize, hd: usize, kf: &mut [f32], vf: &mut [f32]) {
         unsafe fn conv<E: Row>(src: &[E], out: &mut [f32]) {
-            assert!(out.len() >= src.len() && src.len() % 8 == 0);
+            assert!(out.len() >= src.len() && src.len().is_multiple_of(8));
             // SAFETY: src.len() numbers are read and as many written (checked)
             unsafe {
                 for i in (0..src.len()).step_by(8) {
@@ -1266,7 +1266,7 @@ mod neon {
     /// conversion).
     pub(super) fn f32_rows(kv: &KvCache, v: bool, row0: usize, nrows: usize, hd: usize, out: &mut [f32]) {
         unsafe fn conv<E: Row>(src: &[E], out: &mut [f32]) {
-            assert!(out.len() >= src.len() && src.len() % 8 == 0);
+            assert!(out.len() >= src.len() && src.len().is_multiple_of(8));
             // SAFETY: src.len() numbers are read and as many written (checked)
             unsafe {
                 for i in (0..src.len()).step_by(8) {
@@ -1371,7 +1371,7 @@ mod neon {
         let qp = qs.map(|q| q.as_ptr());
         // SAFETY: the rows, the query rows and sc are in bounds (checked)
         unsafe {
-            if NS % 4 == 0 {
+            if NS.is_multiple_of(4) {
                 for h in 0..NS / 4 {
                     let q4: [*const f32; 4] = std::array::from_fn(|s| qp[4 * h + s]);
                     scores_rows2::<4, f32>(kf.as_ptr(), ks, nt, hd, scale, q4, sc.as_mut_ptr().add(4 * h * PAGE));
@@ -1541,7 +1541,7 @@ mod neon {
             if kv.k16.is_empty() {
                 assert!(kv.k.len() >= at + nt * hd);
                 let k = kv.k.as_ptr().add(at);
-                if *ROWS2 && NS % 4 == 0 {
+                if *ROWS2 && NS.is_multiple_of(4) {
                     for h in 0..NS / 4 {
                         let q4: [*const f32; 4] = std::array::from_fn(|s| qp[4 * h + s]);
                         scores_rows2::<4, i8>(k, ks, nt, hd, scale, q4, sc.as_mut_ptr().add(4 * h * PAGE));

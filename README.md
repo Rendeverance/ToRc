@@ -223,8 +223,8 @@ The programs you use:
   plain one:
   `torc-run <model> <tokens.int32> [n] [threads|auto] [block=N] [nologits] [dump=logits.f32] [ref=reference.f32]`
 - `torc convert-gguf <in.gguf> <out.torc>`: makes a ToRc file (`torc` also checks and describes one)
-- `hwscan`: what this machine has (CPU, memory, GPU, NPU), for the benchmark's CSV. The inventory is Windows-only for
-  now: on Linux it knows the CPU count and little else
+- `hwscan`: what this machine has (CPU, memory, GPU, NPU), for the benchmark's CSV. The full inventory is Windows-only
+  for now: on a Mac it knows the CPU's name, the memory and the CPU count, on Linux the CPU count and little else
 
 The developer tools (the NPU and GPU checks, drive probes, the regression check across models, a tokenizer dump and
 others) are in `model/src/bin/dev`; each says what it does in its first lines.
@@ -286,7 +286,7 @@ head is requantised to Q4_0 at load, fewer bytes a token than the file's Q6_K, s
   access to suitable hardware or contributors can assist.
 - A fast attention option for long prompts, offered only once its agreement with the exact path is measured at longer
   contexts and the quality is acceptable.
-- Several users at once. The server takes one conversation at a time today.
+- Several replies written at once. The server writes one at a time today, and other requests wait their turn.
 - File tools: the model writing files into the workspace folder, asking you before each write, built as ToolFunnel
   tools.
 - Vision: models that read images, and pictures in the desktop app's chats.

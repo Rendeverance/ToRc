@@ -22,10 +22,10 @@ jobs:
         run: cargo test --release --workspace
       - name: Build with GPU attention
         run: cargo build --release -p torc-model --features gpu
-      - name: Check the Windows on ARM build compiles (NEON kernels and the NPU tier)
+      - name: The Windows on ARM build compiles and passes the lints (the NEON kernels and the NPU tier are ARM-only)
         run: |
           rustup target add aarch64-pc-windows-gnullvm
-          cargo check --release --workspace --target aarch64-pc-windows-gnullvm
+          cargo clippy --release --workspace --all-targets --target aarch64-pc-windows-gnullvm -- -D warnings
       - name: The desktop app (its own workspace)
         shell: bash
         run: |

@@ -53,9 +53,17 @@ function newChat() {
 
 // Changes settings: the shell merges the change into what is saved and hands back the whole.
 async function setSettings(patch) {
-  S.settings = await window.torc.settingsSet(patch);
+  // one save at a time, in the order they were asked for: two at once could finish the other way round, and the
+  // older change would be the one kept
+  const turn = (S.saving || Promise.resolve()).then(() => window.torc.settingsSet(patch));
+  S.saving = turn.catch(() => {});
+  const mine = (S.saves = (S.saves || 0) + 1);
+  const saved = await turn;
+  // only the last save asked for gives the settings shown: an earlier one's answer lacks the changes made since (a
+  // second press of the Thinking button, say), and the last one's has them all
+  if (mine === S.saves) S.settings = saved;
   showPending();
-  return S.settings;
+  return saved;
 }
 
 // The settings the engine reads when it starts, with the name a person knows each by. A change to one is saved at

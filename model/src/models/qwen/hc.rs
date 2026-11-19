@@ -102,7 +102,7 @@ pub fn dot_bf16_dbl_n<const T: usize>(w: &[u16], x: [&[f32]; T]) -> [f32; T] {
 fn dot_bf16_dbl_seg4_f64(wd: &[f64], xd: [&[f64]; 4], acc: &mut [[f64; 8]; 4]) {
     use core::arch::aarch64::*;
     let len = wd.len();
-    assert!(len % 8 == 0 && xd.iter().all(|v| v.len() >= len));
+    assert!(len.is_multiple_of(8) && xd.iter().all(|v| v.len() >= len));
     // SAFETY: NEON is baseline on aarch64, and the loads stay inside wd and the xd rows (i + 8 <= len)
     unsafe {
         let mut s = [[vdupq_n_f64(0.0); 4]; 4];

@@ -110,6 +110,8 @@ pub fn init_threads(n: usize) {
             if pin {
                 crate::pool::pin_linux(i as i32);
             }
+            #[cfg(target_os = "macos")]
+            crate::pool::user_initiated();
             let _ = (i, pin);
         })
         .build_global();

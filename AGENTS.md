@@ -60,7 +60,7 @@ Q5_K, Q6_K, MXFP4.
     torc-server model.torc 8080 auto 16384
 
 The model, the port, the thread count (`auto` = every core of the fastest class) and the context length. Clients
-point at `http://127.0.0.1:8080/v1` (`GET /health` for a liveness check, no key needed); it speaks OpenAI chat completions, the OpenAI Responses API and Anthropic
+point at `http://127.0.0.1:8080/v1` (`GET /health` for a liveness check, no key needed; `GET /slots` and `GET /metrics` in llama-server's formats); it speaks OpenAI chat completions, the OpenAI Responses API and Anthropic
 messages. It listens on this machine only unless `TORC_HOST` is set. Opening it to a network, set `TORC_API_KEY` too:
 another machine's requests must then carry it (`Authorization: Bearer <key>` or `x-api-key: <key>`), this machine's
 never do. The traffic is plain HTTP, so warn the user before exposing it beyond a network they trust. In the desktop app that is Settings > Share on my network (the app sets
@@ -68,7 +68,8 @@ never do. The traffic is plain HTTP, so warn the user before exposing it beyond 
 model without a client: `torc-chat model.torc "Hello"` (ChatML only; for other families, start the server). A web page
 from another site is refused whatever `TORC_HOST` says; non-browser clients send no Origin and are not affected.
 
-The server handles one conversation at a time. Greedy decoding by default; `temperature`, `top_k`, `top_p`, `seed`,
+The server writes one reply at a time; other chat requests queue in order, while /health, /slots, /metrics and the
+model list answer at once. Greedy decoding by default; `temperature`, `top_k`, `top_p`, `seed`,
 `presence_penalty` and `frequency_penalty` are honoured. Gemma 4 and gpt-oss are served the same way, with tool
 calls and saved chats (not on Gemma's whole-NPU tier). Every model takes tools: GLM, LFM2, Gemma 4 and gpt-oss in
 their own templates' call formats, the Qwen models in Qwen3.5's, ERNIE and Moonlight (whose templates have none) in

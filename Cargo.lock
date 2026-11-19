@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "hwscan"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ash",
  "serde",
@@ -822,21 +822,21 @@ dependencies = [
 
 [[package]]
 name = "torc-format"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "torc-kernels"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "torc-model"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "bytemuck",

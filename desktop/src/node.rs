@@ -49,16 +49,23 @@ impl Shell {
         if version_ok(&v) && self.tf_program(&v).exists() { v } else { String::new() }
     }
 
-    /// Node: the app's own copy if it fetched one, else the one on the PATH.
+    /// Node: the app's own copy if it fetched one, else the one on the PATH, else on a Mac the one Homebrew put in.
     pub fn node(&self) -> Option<PathBuf> {
         let own = self.tools_dir().join("node").join(if cfg!(windows) { "node.exe" } else { "bin/node" });
         if own.exists() {
             return Some(own);
         }
         let finder = if cfg!(windows) { "where" } else { "which" };
-        let out = crate::jobs::quiet(Command::new(finder).arg("node")).output().ok()?;
-        let first = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
-        (!first.is_empty() && Path::new(&first).exists()).then(|| PathBuf::from(first))
+        let on_path = crate::jobs::quiet(Command::new(finder).arg("node")).output().ok().and_then(|out| {
+            let first = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+            (!first.is_empty() && Path::new(&first).exists()).then(|| PathBuf::from(first))
+        });
+        if on_path.is_some() || !cfg!(target_os = "macos") {
+            return on_path;
+        }
+        // an app opened from the Finder doesn't get the PATH a terminal has, so Homebrew's Node is looked for where
+        // Homebrew puts it: /opt/homebrew on Apple silicon, /usr/local on Intel
+        ["/opt/homebrew/bin/node", "/usr/local/bin/node"].into_iter().map(PathBuf::from).find(|p| p.exists())
     }
 
     /// Node, fetched from nodejs.org when the machine has none: the archive for this system, checked against
@@ -68,7 +75,7 @@ impl Shell {
             return Ok(n);
         }
         let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
-        let tail = if cfg!(windows) { format!("-win-{arch}.zip") } else { format!("-linux-{arch}.tar.xz") };
+        let tail = node_archive(arch);
         say(app, "No Node on this machine: fetching the portable build from nodejs.org");
         let sums = String::from_utf8(get(&format!("{NODE_DIST}SHASUMS256.txt"))?).map_err(|e| e.to_string())?;
         let (want, file) = sums
@@ -334,4 +341,32 @@ fn untar(buf: &[u8]) -> Vec<(String, Vec<u8>)> {
         at += 512 + size.div_ceil(512) * 512;
     }
     out
+}
+
+/// The end of the name of nodejs.org's portable build for this system: Windows, macOS (darwin) or Linux.
+fn node_archive(arch: &str) -> String {
+    if cfg!(windows) {
+        format!("-win-{arch}.zip")
+    } else if cfg!(target_os = "macos") {
+        format!("-darwin-{arch}.tar.xz")
+    } else {
+        format!("-linux-{arch}.tar.xz")
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    /// Each system asks nodejs.org for its own build, by the names in SHASUMS256.txt.
+    #[test]
+    fn each_system_asks_for_its_own_build() {
+        let want = if cfg!(windows) {
+            "node-v22.0.0-win-arm64.zip"
+        } else if cfg!(target_os = "macos") {
+            "node-v22.0.0-darwin-arm64.tar.xz"
+        } else {
+            "node-v22.0.0-linux-arm64.tar.xz"
+        };
+        assert!(want.ends_with(&super::node_archive("arm64")));
+        assert!(!super::node_archive("x64").contains("arm64"));
+    }
 }

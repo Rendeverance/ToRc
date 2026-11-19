@@ -48,7 +48,9 @@ The bytes in a slot are the file's, so a model gives the same bits with the cach
 
 `TORC_CACHE_MB=m` sets the budget (0 turns the cache off). By default the cache is on when the file does not fit in
 80% of the installed memory, and its budget is the free memory less the weights that are always resident and a 6 GB
-margin (on a two-machine worker, less its own layers' share and 3 GB), never under 2 GB. `TORC_IO_PIECE_KB` (read
+margin (on a two-machine worker, less its own layers' share and 3 GB), never under 2 GB. On a Mac ToRc doesn't
+read the free memory yet, so the default there is the 2 GB: on a 16 GB M2 the 35B at Q4 read and wrote as fast with it
+as with 4 or 8 GB, and with the cache off it read prompts at a quarter of the speed. `TORC_IO_PIECE_KB` (read
 size, default the whole slot), `TORC_IO_DEPTH` (reads in flight, default 64) and `TORC_OWN_PREFETCH=0` (no read-ahead)
 tune the reads. On Windows the reads are overlapped, and `TORC_IO_THREADS` only matters with `TORC_IO=threads`.
 `TORC_IO_BUFFERED=1` reads through the page cache on either system, for comparing the two.

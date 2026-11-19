@@ -417,7 +417,7 @@ impl Gpu {
             let share = self.fixed.or(learned).unwrap_or(0.3);
             let how = match (self.fixed, learned) {
                 (Some(_), _) => "",
-                (None, Some(s)) if s == 0.0 => " (off: measured too slow for this model and layout earlier)",
+                (None, Some(0.0)) => " (off: measured too slow for this model and layout earlier)",
                 (None, Some(_)) => " (this machine's last) to start, then by measured speed",
                 (None, None) => " to start, then by measured speed",
             };
@@ -820,7 +820,7 @@ pub fn run_block(
     g.adapt(at, n, m, pos0, (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64());
     // TORC_GPU_STATS=1: where the time went so far, every 256 blocks (a server never reaches torc-run's summary)
     static STATS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switches::on("TORC_GPU_STATS"));
-    if *STATS && calls % 256 == 0 {
+    if *STATS && calls.is_multiple_of(256) {
         let s = |i: usize| NS[i].load(Ordering::Relaxed) as f64 * 1e-9;
         eprintln!(
             "gpu attention: {calls} blocks; s writing {:.2}, CPU's tokens {:.2}, waiting {:.2}, reading back {:.2}; share now {:.2}",

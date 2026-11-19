@@ -337,7 +337,7 @@ unsafe fn gemm_mmla_tiles<B: MmlaBlock, const T: usize>(
     y: *mut f32,
     y_stride: usize,
 ) {
-    assert!(nv > 0 && rows % (2 * T) == 0 && row_bytes >= nb * 8 * B::SIZE && pk.len() >= pack_len(nv, nb));
+    assert!(nv > 0 && rows.is_multiple_of(2 * T) && row_bytes >= nb * 8 * B::SIZE && pk.len() >= pack_len(nv, nb));
     assert!(w.len() >= rows * row_bytes);
     let np = nv.div_ceil(2);
     unsafe {
@@ -492,7 +492,7 @@ unsafe fn gemm_q4x4_tiles<const Q: usize>(
     y_stride: usize,
 ) {
     let quad = nb * 8 * Q4X4_GROUP;
-    assert!(rows % (4 * Q) == 0 && w.len() >= rows / 4 * quad);
+    assert!(rows.is_multiple_of(4 * Q) && w.len() >= rows / 4 * quad);
     let np = nv.div_ceil(2);
     unsafe {
         // acc[(p * 8 + k) * 2Q + t] is tile t of pair p at block position k; it lives on the stack for up to 1024
@@ -721,7 +721,7 @@ unsafe fn gemm_x4_tiles<B: X4, const Q: usize>(
     y_stride: usize,
 ) {
     let quad = nb * 8 * B::GROUP;
-    assert!(rows % (4 * Q) == 0 && w.len() >= rows / 4 * quad);
+    assert!(rows.is_multiple_of(4 * Q) && w.len() >= rows / 4 * quad);
     let np = nv.div_ceil(2);
     unsafe {
         // acc[(p * 8 + k) * 2Q + t] is tile t of pair p at block position k; it lives on the stack for up to 1024
@@ -3107,7 +3107,7 @@ unsafe fn gemm_q45k_lay_t<const FIVE: bool, const Q: usize>(
 ) {
     let lb = q45k_lay_bytes(FIVE);
     let quad = nb * lb;
-    assert!(rows % (4 * Q) == 0 && w.len() >= rows / 4 * quad);
+    assert!(rows.is_multiple_of(4 * Q) && w.len() >= rows / 4 * quad);
     let np = nv.div_ceil(2);
     static PANEL: std::sync::LazyLock<usize> =
         std::sync::LazyLock::new(|| crate::switches::num("TORC_KMM_PANEL").unwrap_or(16));
@@ -3287,7 +3287,7 @@ unsafe fn gemm_q6_lay_t<const Q: usize>(
     y_stride: usize,
 ) {
     let quad = nb * Q6_LAY_BYTES;
-    assert!(rows % (4 * Q) == 0 && w.len() >= rows / 4 * quad);
+    assert!(rows.is_multiple_of(4 * Q) && w.len() >= rows / 4 * quad);
     let np = nv.div_ceil(2);
     static PANEL: std::sync::LazyLock<usize> =
         std::sync::LazyLock::new(|| crate::switches::num("TORC_KMM_PANEL").unwrap_or(16));

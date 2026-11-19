@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.6 (19 November 2026)
+
+Mostly for Mac users (Mac changes have not been tested fully on a Mac yet), plus monitoring fixes and a Thinking
+switch in the app. A server that keeps answering monitors while the model is busy. Thanks to kilkonie on Reddit for
+Mac M5 feedback and data.
+
+- On a Mac with no Node, the app now fetches the macOS build from nodejs.org. Before, it fetched the Linux build,
+  which doesn't run on a Mac, so ToolFunnel and the benchmark couldn't start.
+- On a Mac the app also finds a Node that Homebrew installed. An app opened from the Finder doesn't get the PATH a
+  terminal has, so before it missed it and fetched its own.
+- On a Mac the engine's threads are marked as work someone is waiting for (macOS's user-initiated class), so macOS
+  doesn't slow them down as background work. `TORC_QOS=0` turns it off.
+- `hwscan` on a Mac reports the CPU's name and the memory.
+- `GET /slots` and `GET /metrics`, in llama-server's formats: `/metrics` has its prompt, reply and request counts
+  under the same names, so a monitor made for llama-server reads them. From another machine they need the API key.
+- While a reply is being written, `/health`, `/slots`, `/metrics` and the model list are answered straight away.
+  Before, every request waited for the reply to finish, so a monitor checking every second saw the server stall.
+  Chat requests that come in meanwhile wait their turn, in the order they arrive in full, and `/metrics` counts them.
+  Up to 128 connections can be open at once, as before; one more is told the server is busy. The request bodies
+  held at once, being read or waiting, stop at 256 MB in all; past that a request is told the server is busy too. A
+  waiting request whose client has gone by its turn is not started; a client that closed its sending side after its
+  request (nc -N, some scripts) looks gone, so it gets its reply only when it didn't have to wait.
+- PERFORMANCE.md: LFM2.5 on the Snapdragon mini PC with the NPU, faster than the CPU alone at every length.
+- A Thinking button beside the message box: as the model's maker set it, on, or off. Before, the app always left it
+  to the model, and Qwen3.6 thinks unless it is told not to. It works for the Qwen and GLM models that think; on a
+  model that doesn't, it changes nothing. On gpt-oss, off is its lowest reasoning effort. ToRc runs Gemma 4 without
+  thinking and LFM2 has no such switch, so the button isn't shown for them.
+- The chat's Thinking folds open and close together: open one and they all open, the replies still to come too,
+  and the app remembers it. Before, each had to be opened on its own.
+- A model file with a weight of a type ToRc has no kernel for yet (an Unsloth IQ3_S file has IQ2_S experts, say) is
+  refused when it loads, naming the weight and its type. Before, it loaded and then stopped in the middle of a reply.
+- EXPERT-CACHE.md says what the cache does by default on a Mac.
+- The checks every change has to pass now lint the ARM build too. The ARM-only code (the NEON kernels and the ARM
+  paths around them) had 22 warnings that were never seen, now fixed, with the same bits.
+
 ## 0.1.5 (18 November 2026)
 
 The desktop app made clearer for users, plus a couple of server additions. Thanks to RainerSC for his continued

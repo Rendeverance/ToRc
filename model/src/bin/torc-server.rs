@@ -20,9 +20,11 @@
  */
 //! torc-server <model> [port] [threads] [ctx] [name]: a chat server for every model ToRc runs.
 //!
-//! One conversation at a time, over HTTP: GET /health and /v1/models (also /v1/models/<name>), and POST
-//! /v1/chat/completions (OpenAI), /v1/messages (Anthropic) and /v1/responses (OpenAI Responses), each as one JSON reply
-//! or as that API's stream of events. GET /torc/settings gives the settings it runs with as a profile, and POST
+//! One conversation at a time, over HTTP: GET /health, /slots, /metrics and /v1/models (also /v1/models/<name>), and
+//! POST /v1/chat/completions (OpenAI), /v1/messages (Anthropic) and /v1/responses (OpenAI Responses), each as one JSON
+//! reply or as that API's stream of events. While a reply is being written, the requests that don't need the model
+//! (/health, /slots, /metrics, the model list) are answered at once, and the others wait their turn in the order
+//! their requests arrive in full. GET /torc/settings gives the settings it runs with as a profile, and POST
 //! /torc/settings reads one in for its next start (runtime/profile.rs, AUTOTUNE.md). This file is the HTTP side. The
 //! model answers through chat/serve.rs, each family from its own folder under models/, picked by the file's
 //! architecture.
@@ -117,8 +119,8 @@ static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 /// The "created" time /v1/models gives the model, in seconds since 1970: when its file was last written.
 static CREATED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-/// With a key set, how long another machine has to send its request's head: every client sends it at once, and the
-/// server takes one connection at a time, so a machine without the key must not hold it for REQUEST_DEADLINE.
+/// With a key set, how long another machine has to send its request's head: every client sends it at once, and a
+/// machine without the key must not hold one of the MAX_OPEN connections for REQUEST_DEADLINE.
 const KEYED_HEAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A key one header line carries: "Authorization: Bearer <key>" (OpenAI's clients) or "x-api-key: <key>"
@@ -228,10 +230,230 @@ fn refuse(s: &mut TcpStream, r: &mut BufReader<Deadline>, status: &str, body: &s
     let _ = std::io::copy(&mut r.by_ref().take(MAX_BODY as u64), &mut std::io::sink());
 }
 
-fn handle(e: &mut dyn Serve, mut s: TcpStream) {
-    // one connection at a time, so a client that stalls before finishing its request must not hold the server (the
-    // whole request has REQUEST_DEADLINE, see Deadline), and nor must one that stops reading the reply without closing
-    // (a write that can't go out in a minute ends it)
+/// The most connections open at once, those waiting for the model included (each holds what it has sent of its
+/// request until the model gets to it). One more is told the server is busy. 128 is the queue the operating system
+/// kept for the server before 0.1.6, when every connection waited there for its turn.
+const MAX_OPEN: usize = 128;
+
+/// The most busy refusals being sent at once; past that a connection over MAX_OPEN is closed unanswered.
+const MAX_REFUSING: usize = 32;
+
+/// The connections open now, and the busy refusals being sent.
+static OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REFUSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One of the refusals REFUSING counts, given back when it is dropped (also when its thread could not be started).
+struct Refusing;
+
+impl Drop for Refusing {
+    fn drop(&mut self) {
+        REFUSING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One of the connections OPEN counts, given back when it is dropped: when its request has been answered, whichever
+/// thread answered it.
+struct Open;
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The most request body bytes held at once, by the requests being read and those waiting for the model: 16 bodies of
+/// the largest size. Past it a request is told the server is busy.
+const MAX_HELD: usize = 16 * MAX_BODY;
+
+/// The request body bytes held now (MAX_HELD).
+static HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A request's share of HELD: the body bytes it has received, given back when it is dropped (when the request has been
+/// answered).
+struct Held(usize);
+
+impl Held {
+    /// Adds n received bytes to the share, or says no (and adds nothing) when that would take HELD past MAX_HELD.
+    fn grow(&mut self, n: usize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if HELD.fetch_add(n, SeqCst) + n > MAX_HELD {
+            HELD.fetch_sub(n, SeqCst);
+            return false;
+        }
+        self.0 += n;
+        true
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.fetch_sub(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A request that needs the model, read and let in, waiting its turn on the model's thread.
+struct Job {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+    s: TcpStream,
+    // whether another request was being answered or waiting when this one came: only then can its client have
+    // given up waiting
+    waited: bool,
+    _open: Open,
+    _held: Held,
+}
+
+/// The loaded model's name and context, for the routes answered off the model's thread.
+static SERVED: std::sync::OnceLock<(String, usize)> = std::sync::OnceLock::new();
+
+/// What the server is doing and has done, for /slots and /metrics: the model's thread writes it, the connections'
+/// threads read it.
+#[derive(Default)]
+struct Status {
+    /// a reply is being written (a token count or a settings request doesn't count)
+    busy: bool,
+    /// the number of the reply being written, or of the last one
+    task: u64,
+    /// requests let in and waiting for the model
+    waiting: usize,
+    /// the current reply's sampling settings, in llama-server's names
+    params: Value,
+    /// the current reply's pieces of text sent so far (about one a token)
+    decoded: u64,
+    /// since the server started: the prompt tokens read, those kept from before, and the seconds reading; the reply
+    /// tokens and their seconds; the longest prompt and reply together
+    prompt: u64,
+    cached: u64,
+    prompt_s: f64,
+    written: u64,
+    written_s: f64,
+    longest: u64,
+    /// the prompt tokens read and their seconds, and the reply tokens and theirs, since /metrics was last read
+    window: (u64, f64, u64, f64),
+}
+
+static STATUS: std::sync::LazyLock<std::sync::Mutex<Status>> = std::sync::LazyLock::new(Default::default);
+
+fn state() -> std::sync::MutexGuard<'static, Status> {
+    STATUS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// GET /slots, in llama-server's shape: one slot, since one reply is written at a time.
+fn slots() -> Value {
+    let st = state();
+    let ctx = SERVED.get().map_or(0, |s| s.1);
+    let max = st.params["n_predict"].as_i64().unwrap_or(-1);
+    let remain = if st.busy && max >= 0 { (max - st.decoded as i64).max(0) } else { -1 };
+    json!([{"id": 0, "id_task": st.task, "n_ctx": ctx, "is_processing": st.busy, "params": st.params,
+        "next_token": {"has_next_token": st.busy, "n_remain": remain, "n_decoded": st.decoded}}])
+}
+
+/// GET /metrics: Prometheus' text, under llama-server's names, so that a monitor made for it reads this too. Its
+/// tokens a second are over the time since the last read, from the replies that finished in it.
+fn metrics() -> String {
+    let mut st = state();
+    let (pn, ps, wn, ws) = std::mem::take(&mut st.window);
+    let per = |n: u64, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    let counters = [
+        ("prompt_tokens_total", "Number of prompt tokens processed, excluding cached tokens", st.prompt as f64),
+        ("prompt_tokens_cached_total", "Number of prompt tokens reused from the cache", st.cached as f64),
+        ("prompt_seconds_total", "Total time spent processing prompts", st.prompt_s),
+        ("tokens_predicted_total", "Number of generation tokens processed", st.written as f64),
+        ("tokens_predicted_seconds_total", "Total time spent generating tokens", st.written_s),
+        ("n_tokens_max", "Largest observed sequence length (prompt + generation)", st.longest as f64),
+    ];
+    let gauges = [
+        ("prompt_tokens_seconds", "Average prompt throughput in tokens/s", per(pn, ps)),
+        ("predicted_tokens_seconds", "Average generation throughput in tokens/s", per(wn, ws)),
+        ("requests_processing", "Number of requests processing", if st.busy { 1.0 } else { 0.0 }),
+        ("requests_deferred", "Number of requests deferred", st.waiting as f64),
+    ];
+    let mut out = String::new();
+    for (kind, items) in [("counter", &counters[..]), ("gauge", &gauges[..])] {
+        for (name, help, v) in items {
+            out += &format!("# HELP llamacpp:{name} {help}\n# TYPE llamacpp:{name} {kind}\nllamacpp:{name} {v}\n");
+        }
+    }
+    out
+}
+
+/// Whether a request's query has a parameter with a value (llama-server's test for ?fail_on_no_slot).
+fn has_param(path: &str, name: &str) -> bool {
+    let query = path.split_once('?').map_or("", |q| q.1);
+    query.split('&').any(|p| p.split_once('=').is_some_and(|(k, v)| k == name && !v.is_empty()))
+}
+
+/// The model, with what it does noted in STATUS as it goes.
+struct Noted<'a>(&'a mut dyn Serve);
+
+impl Serve for Noted<'_> {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn count(&self, c: &api::Chat) -> usize {
+        self.0.count(c)
+    }
+
+    fn reply(&mut self, c: &api::Chat, emit: &mut dyn FnMut(bool, &str) -> bool) -> format::Result<Reply> {
+        {
+            let mut st = state();
+            st.busy = true;
+            st.task += 1;
+            st.decoded = 0;
+            st.params = json!({"n_predict": c.max, "max_tokens": c.max, "seed": c.seed, "temperature": c.temperature,
+                "top_k": c.top_k.unwrap_or(40), "top_p": c.top_p, "presence_penalty": c.presence_penalty,
+                "frequency_penalty": c.frequency_penalty, "stream": c.stream});
+        }
+        let r = self.0.reply(c, &mut |reasoning, t| {
+            if !t.is_empty() {
+                state().decoded += 1;
+            }
+            emit(reasoning, t)
+        });
+        let (pn, ps, _, wn, ws) = self.0.timed();
+        let kept = self.0.kept();
+        let mut st = state();
+        st.busy = false;
+        let r = r?;
+        st.prompt += pn as u64;
+        st.cached += kept as u64;
+        st.prompt_s += ps;
+        st.written += wn as u64;
+        st.written_s += ws;
+        st.longest = st.longest.max((r.prompt + r.output) as u64);
+        st.window.0 += pn as u64;
+        st.window.1 += ps;
+        st.window.2 += wn as u64;
+        st.window.3 += ws;
+        Ok(r)
+    }
+
+    fn kept(&self) -> usize {
+        self.0.kept()
+    }
+
+    fn timed(&self) -> (usize, f64, f64, usize, f64) {
+        self.0.timed()
+    }
+
+    fn replies(&self) -> u64 {
+        self.0.replies()
+    }
+
+    fn idle(&mut self) {
+        self.0.idle()
+    }
+}
+
+/// A connection, on a thread of its own: reads the request and answers it there when it doesn't need the model
+/// (/health, /slots, /metrics, the model list), so those are answered even while a reply is being written. A request
+/// that needs the model goes to the model's thread (jobs) and waits its turn, in the order requests arrive in full.
+fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
+    // a client that stalls before finishing its request must not hold its thread for long (the whole request has
+    // REQUEST_DEADLINE, see Deadline), and nor must one that stops reading the reply without closing (a write that
+    // can't go out in a minute ends it)
     let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(60)));
     let Ok(rs) = s.try_clone() else { return };
     // with TORC_API_KEY set, another machine's request needs the key, and gets only a few seconds to send its head;
@@ -243,7 +465,7 @@ fn handle(e: &mut dyn Serve, mut s: TcpStream) {
     let mut r = BufReader::new(Deadline { s: rs, end: start + head_end });
     let mut left = MAX_HEAD;
     let Some(line) = head_line(&mut r, &mut left) else { return };
-    let (method, path) = {
+    let (method, raw) = {
         let mut it = line.split_whitespace();
         (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
     };
@@ -272,14 +494,14 @@ fn handle(e: &mut dyn Serve, mut s: TcpStream) {
         return refuse(&mut s, &mut r, "403 Forbidden", &why);
     }
     // whether the server is up, for monitors and frameworks that probe before they start: no key needed (it says
-    // nothing but that), as llama-server's /health. It is answered between requests, like everything else
-    if method == "GET" && route(&path) == "/v1/health" {
+    // nothing but that), as llama-server's /health
+    if method == "GET" && route(&raw) == "/v1/health" {
         drain(&mut r, len);
         respond(&mut s, "200 OK", "application/json", r#"{"status":"ok"}"#);
         return;
     }
     if !allowed(key, local, &given) {
-        return refuse(&mut s, &mut r, "401 Unauthorized", &key_refused(&path));
+        return refuse(&mut s, &mut r, "401 Unauthorized", &key_refused(&raw));
     }
     // let in: the rest of the request has what is left of the whole request's time
     r.get_mut().end = start + REQUEST_DEADLINE;
@@ -287,66 +509,134 @@ fn handle(e: &mut dyn Serve, mut s: TcpStream) {
         let why = json!({"error": format!("request body over {} MB", MAX_BODY >> 20)}).to_string();
         return refuse(&mut s, &mut r, "413 Payload Too Large", &why);
     }
-    let mut body = vec![0u8; len];
-    let mut got = 0;
-    while got < len {
-        match r.read(&mut body[got..]) {
-            Ok(n) if n > 0 => got += n,
-            _ => return,
+    // read as it arrives: memory is taken for what a client has sent, not for the length it says it will send. The
+    // bodies held at once, being read or waiting their turn, are capped (MAX_HELD) and counted as they arrive, so a
+    // burst of large requests can't take gigabytes on top of the model, and a client that only says it will send a
+    // large body holds none of the cap
+    let mut held = Held(0);
+    let mut body = Vec::new();
+    let mut chunk = vec![0u8; 64 << 10];
+    while body.len() < len {
+        let want = (len - body.len()).min(chunk.len());
+        let n = match r.read(&mut chunk[..want]) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        if !held.grow(n) {
+            let why = json!({"error": {"code": 503, "message": "the server is busy: too many requests waiting, try again shortly",
+                "type": "unavailable_error"}});
+            return refuse(&mut s, &mut r, "503 Service Unavailable", &why.to_string());
         }
+        body.extend_from_slice(&chunk[..n]);
     }
-    let path = route(&path);
-    let path = path.as_str();
-    match (method.as_str(), path) {
+    let path = route(&raw);
+    let name = SERVED.get().map_or("", |m| m.0.as_str());
+    match (method.as_str(), path.as_str()) {
         ("GET", "/v1/models") => {
-            let j = json!({"object": "list", "data": [model_entry(e.name())]});
+            let j = json!({"object": "list", "data": [model_entry(name)]});
             respond(&mut s, "200 OK", "application/json", &j.to_string());
         }
         // one model by its name, as OpenAI's clients ask before they use it
         ("GET", p) if p.starts_with("/v1/models/") => {
             let asked = unescape(&p["/v1/models/".len()..]);
-            if asked == e.name() {
-                respond(&mut s, "200 OK", "application/json", &model_entry(e.name()).to_string());
+            if asked == name {
+                respond(&mut s, "200 OK", "application/json", &model_entry(name).to_string());
             } else {
-                let text = format!("no model {asked} here: this server runs {}", e.name());
+                let text = format!("no model {asked} here: this server runs {name}");
                 let j = json!({"error": {"message": text, "type": "invalid_request_error", "code": "model_not_found"}});
                 respond(&mut s, "404 Not Found", "application/json", &j.to_string());
             }
         }
+        // what the server is doing, for monitors: as llama-server answers, ?fail_on_no_slot=1 makes a busy server a 503
+        ("GET", "/v1/slots") => {
+            if has_param(&raw, "fail_on_no_slot") && state().busy {
+                let j = json!({"error": {"code": 503, "message": "no slot available", "type": "unavailable_error"}});
+                respond(&mut s, "503 Service Unavailable", "application/json", &j.to_string());
+            } else {
+                respond(&mut s, "200 OK", "application/json", &slots().to_string());
+            }
+        }
+        ("GET", "/v1/metrics") => respond(&mut s, "200 OK", "text/plain; version=0.0.4", &metrics()),
+        ("GET", "/torc/settings")
+        | ("POST", "/torc/settings" | "/v1/chat/completions" | "/v1/messages" | "/v1/responses")
+        | ("POST", "/v1/messages/count_tokens") => {
+            let waited = {
+                let mut st = state();
+                st.waiting += 1;
+                st.busy || st.waiting > 1
+            };
+            if jobs.send(Job { method, path, body, s, waited, _open: open, _held: held }).is_err() {
+                state().waiting -= 1;
+            }
+        }
+        _ => respond(&mut s, "404 Not Found", "application/json", r#"{"error":"not found"}"#),
+    }
+}
+
+/// Whether a waiting request's client has gone: it closed the connection, or it was reset, while the request waited
+/// for its turn. A client still there has sent nothing more, so a look at what it sent finds nothing to read yet.
+fn gone(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let r = s.peek(&mut [0u8; 1]);
+    let _ = s.set_nonblocking(false);
+    match r {
+        Ok(n) => n == 0,
+        Err(err) => matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+    }
+}
+
+/// A request on the model's thread: the routes that need the model, or that change what it starts with next.
+fn run(e: &mut dyn Serve, j: Job) {
+    let Job { method, path, body, mut s, waited, .. } = j;
+    let s = &mut s;
+    match (method.as_str(), path.as_str()) {
         ("GET", "/torc/settings") => {
-            respond(&mut s, "200 OK", "application/json", &model::profile::export(e.name()).to_string());
+            respond(s, "200 OK", "application/json", &model::profile::export(e.name()).to_string());
         }
         ("POST", "/torc/settings") => {
             let Ok(p) = serde_json::from_slice::<Value>(&body) else {
-                return respond(&mut s, "400 Bad Request", "application/json", r#"{"error":"bad json"}"#);
+                return respond(s, "400 Bad Request", "application/json", r#"{"error":"bad json"}"#);
             };
             match model::profile::import(&p) {
                 Ok((layout, done)) => {
                     let j = json!({"ok": true, "written": done, "layout": layout, "running": model::tune::layout(),
                         "note": "used from the server's next start in that layout"});
-                    respond(&mut s, "200 OK", "application/json", &j.to_string());
+                    respond(s, "200 OK", "application/json", &j.to_string());
                 }
                 Err(err) => {
-                    respond(&mut s, "400 Bad Request", "application/json", &json!({"error": err}).to_string());
+                    respond(s, "400 Bad Request", "application/json", &json!({"error": err}).to_string());
                 }
             }
         }
-        ("POST", "/v1/chat/completions" | "/v1/messages" | "/v1/responses" | "/v1/messages/count_tokens") => {
+        _ => {
+            // a client that gave up while it waited would have its reply written for nobody (only a request that waited
+            // is looked at: a client that sends its request and then closes its side, as some scripts do, is still
+            // there to read the reply, and to a look it seems gone)
+            if waited && gone(s) {
+                eprintln!("torc-server: a waiting request's client left before its turn: not started");
+                return;
+            }
             let Ok(req) = serde_json::from_slice::<Value>(&body) else {
-                return respond(&mut s, "400 Bad Request", "application/json", r#"{"error":"bad json"}"#);
+                return respond(s, "400 Bad Request", "application/json", r#"{"error":"bad json"}"#);
             };
-            let (a, c) = match path {
+            let (a, c) = match path.as_str() {
                 "/v1/chat/completions" => (Api::Chat, api::from_chat_completions(&req)),
                 "/v1/responses" => (Api::Responses, api::from_responses(&req)),
                 _ => (Api::Messages, api::from_messages(&req)),
             };
             if path == "/v1/messages/count_tokens" {
                 let n = e.count(&c);
-                return respond(&mut s, "200 OK", "application/json", &json!({"input_tokens": n}).to_string());
+                return respond(s, "200 OK", "application/json", &json!({"input_tokens": n}).to_string());
             }
-            complete(e, &mut s, a, c);
+            complete(e, s, a, c);
         }
-        _ => respond(&mut s, "404 Not Found", "application/json", r#"{"error":"not found"}"#),
     }
 }
 
@@ -524,9 +814,9 @@ fn complete(e: &mut dyn Serve, s: &mut TcpStream, a: Api, c: api::Chat) {
 fn main() {
     model::set_npu_env();
     // every panic's message and backtrace is appended to panic.log next to the executable, and a panic on the main
-    // thread (a request's) ends the server there and then, rather than leaving the process alive with its listener
-    // closed and nothing in its log. A helper thread's panic carries on as before (the NPU helper's ends only its
-    // request)
+    // thread (where the model answers requests) ends the server there and then, rather than leaving the process alive
+    // with nothing in its log. Another thread's panic carries on as before: a connection's thread closes only that
+    // connection, and the NPU helper's ends only its request
     let dflt = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         dflt(info);
@@ -607,53 +897,103 @@ fn main() {
     };
     // the pinning torc-tune chose for this model on this machine, now that its tune file can be found
     model::pool::apply_tuned_pin();
-    listen(&mut *e, port);
+    listen(&mut *e, port, ctx);
 }
 
-/// Serves requests on the port, one at a time, until the process ends.
-fn listen(e: &mut dyn Serve, port: u16) {
+/// Serves requests on the port until the process ends. Connections are taken on a thread of their own, each read on
+/// its own thread (handle), and the model works on one request at a time here, on the main thread, in the order their
+/// requests arrive in full.
+fn listen(e: &mut dyn Serve, port: u16, ctx: usize) {
     // this machine only, unless TORC_HOST says otherwise; then TORC_API_KEY, when set, is what another machine's
     // requests must carry (this machine's never need it)
     let host = model::switches::get("TORC_HOST").unwrap_or_else(|| "127.0.0.1".into());
     let key = model::switches::get("TORC_API_KEY").map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let keyed = key.is_some();
     let _ = KEY.set(key);
+    let _ = SERVED.set((e.name().to_string(), ctx));
     let l = TcpListener::bind((host.as_str(), port)).unwrap_or_else(|err| {
         eprintln!("torc-server: cannot listen on {host}:{port}: {err}");
         std::process::exit(1)
     });
     let needs = if keyed { ", other machines need the API key" } else { "" };
     eprintln!("torc-server: {} on {host}:{port}{needs}", e.name());
+    let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+    let accepting = std::thread::Builder::new().name("accept".into()).spawn(move || {
+        use std::sync::atomic::Ordering::SeqCst;
+        for c in l.incoming() {
+            let c = match c {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("torc-server: accept: {err}");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    continue;
+                }
+            };
+            // too many open: this one is told the server is busy, on a thread of its own so that the refusal's wait
+            // for the rest of the request holds nothing up; past that many refusals it is closed unanswered
+            if OPEN.fetch_add(1, SeqCst) >= MAX_OPEN {
+                OPEN.fetch_sub(1, SeqCst);
+                if REFUSING.fetch_add(1, SeqCst) < MAX_REFUSING {
+                    let refusing = Refusing;
+                    let _ = std::thread::Builder::new().name("busy".into()).spawn(move || {
+                        let _refusing = refusing;
+                        busy(c);
+                    });
+                } else {
+                    REFUSING.fetch_sub(1, SeqCst);
+                }
+                continue;
+            }
+            let open = Open;
+            let jobs = jobs.clone();
+            let _ = std::thread::Builder::new().name("conn".into()).spawn(move || handle(c, &jobs, open));
+        }
+    });
+    if let Err(err) = accepting {
+        eprintln!("torc-server: cannot start taking connections: {err}");
+        std::process::exit(1)
+    }
     // between requests: after TORC_IDLE_SAVE seconds without one (default 60, 0 = never) the current chat goes to disk
     // as well (save_leaving), so a reload or a restart comes back to it warm
     let idle = model::switches::num::<u64>("TORC_IDLE_SAVE").unwrap_or(60);
-    let _ = l.set_nonblocking(true);
+    let mut e = Noted(e);
     let mut last = std::time::Instant::now();
     loop {
-        match l.accept() {
-            Ok((c, _)) => {
-                // on Windows an accepted socket inherits the listener's mode
-                let _ = c.set_nonblocking(false);
+        match queue.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(job) => {
+                {
+                    let mut st = state();
+                    st.waiting = st.waiting.saturating_sub(1);
+                }
                 // only a reply counts: a client's model polls between chats do not keep the chat off the disk
                 let n = e.replies();
-                handle(e, c);
+                run(&mut e, job);
                 if e.replies() != n {
                     last = std::time::Instant::now();
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if idle > 0 && last.elapsed().as_secs() >= idle {
                     e.idle();
                     last = std::time::Instant::now() + std::time::Duration::from_secs(86400 * 365);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(err) => {
-                eprintln!("torc-server: accept: {err}");
-                std::thread::sleep(std::time::Duration::from_millis(200));
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("torc-server: no longer taking connections");
+                std::process::exit(1)
             }
         }
     }
+}
+
+/// Tells a connection over MAX_OPEN that the server is busy, so that its client can try again, and reads what it
+/// sends for a moment so that the refusal arrives rather than a reset (see refuse).
+fn busy(mut s: TcpStream) {
+    let Ok(rs) = s.try_clone() else { return };
+    let mut r = BufReader::new(Deadline { s: rs, end: std::time::Instant::now() + LINGER });
+    let j = json!({"error": {"code": 503, "message": "the server is busy: too many requests waiting, try again shortly",
+        "type": "unavailable_error"}});
+    refuse(&mut s, &mut r, "503 Service Unavailable", &j.to_string());
 }
 
 // The server's guards that need no socket: which pages count as this machine's, and which errors are the caller's.
@@ -750,6 +1090,30 @@ mod guards {
     }
 
     #[test]
+    fn metrics_read_as_llama_servers_do() {
+        let text = metrics();
+        for name in ["prompt_tokens_total", "tokens_predicted_total", "requests_processing", "requests_deferred"] {
+            assert!(text.contains(&format!("\n# TYPE llamacpp:{name} ")), "{name}: {text}");
+        }
+        // every sample line is a name and a number, after its HELP and TYPE lines
+        for l in text.lines().filter(|l| !l.starts_with('#')) {
+            let (n, v) = l.split_once(' ').unwrap();
+            assert!(n.starts_with("llamacpp:") && v.parse::<f64>().is_ok(), "{l}");
+        }
+        assert_eq!(slots()[0]["id"], 0);
+        assert!(slots()[0]["next_token"]["n_decoded"].is_u64());
+    }
+
+    #[test]
+    fn a_query_parameter_needs_a_value() {
+        assert!(has_param("/slots?fail_on_no_slot=1", "fail_on_no_slot"));
+        assert!(has_param("/slots?a=b&fail_on_no_slot=true", "fail_on_no_slot"));
+        for p in ["/slots", "/slots?fail_on_no_slot", "/slots?fail_on_no_slot=", "/slots?no_fail_on_no_slot=1"] {
+            assert!(!has_param(p, "fail_on_no_slot"), "{p}");
+        }
+    }
+
+    #[test]
     fn model_names_lose_their_escapes() {
         assert_eq!(unescape("Llama%203%208B"), "Llama 3 8B");
         assert_eq!(unescape("qwen3.6-35b-a3b-q4_0"), "qwen3.6-35b-a3b-q4_0");
@@ -758,5 +1122,17 @@ mod guards {
         for s in ["100%", "%zz", "a%2", "%"] {
             assert_eq!(unescape(s), s, "{s}");
         }
+    }
+
+    /// The bodies held at once stop at MAX_HELD, and a request's share is given back when it is done.
+    #[test]
+    fn held_bodies_are_capped() {
+        let (mut a, mut b) = (Held(0), Held(0));
+        assert!(a.grow(MAX_HELD - 10), "under the cap");
+        assert!(!b.grow(11), "past the cap");
+        assert!(b.grow(10), "up to the cap");
+        drop((a, b));
+        let mut c = Held(0);
+        assert!(c.grow(MAX_HELD), "given back");
     }
 }
