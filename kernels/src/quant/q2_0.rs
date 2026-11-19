@@ -16,11 +16,7 @@ const VECTORS: usize = 16;
 /// Thirty-two weights against the same thirty-two activations.
 #[inline(always)]
 fn dot_group(w: &[i8], a: &[i8]) -> i32 {
-    let mut s = 0i32;
-    for j in 0..32 {
-        s += w[j] as i32 * a[j] as i32;
-    }
-    s
+    super::dots::dot_w32(w, a)
 }
 
 /// One block's 64 weights, unpacked to integers in -1..2: the codes offset by -1 as they are read, so the dots below

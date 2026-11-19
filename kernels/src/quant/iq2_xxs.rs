@@ -15,6 +15,11 @@ pub const IQ2_XXS_BLOCK: usize = 66;
 const VECTORS: usize = 16;
 
 /// Thirty-two values against the same thirty-two activations.
+///
+/// This format keeps its own loop, measured rather than argued: through `super::dots` - the form the other six
+/// formats call, and faster there - IQ2_XXS is about 6 % slower at nv >= 16 on a 7735HS, in both rounds of the
+/// bench (15.85 and 15.94 GMAC/s as written, 14.93 and 15.09 through the shared dot). Its unpack is a table lookup
+/// per eight weights followed by a short straight loop, and that shape the compiler handles on its own.
 #[inline(always)]
 fn dot_group(w: &[i8], a: &[i8]) -> i32 {
     let mut s = 0i32;

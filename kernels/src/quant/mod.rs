@@ -2,6 +2,7 @@
 //! reference dequantisation, the Q8_K activations and IQ3_S's grid.
 
 pub mod dequant;
+pub mod dots;
 pub mod f16;
 pub mod iq1_m;
 pub mod iq1s_grid;

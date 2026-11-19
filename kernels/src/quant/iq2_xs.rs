@@ -16,11 +16,7 @@ const VECTORS: usize = 16;
 /// Sixteen values against the same sixteen activations - the width one of the group's two exponents covers.
 #[inline(always)]
 fn dot_half(w: &[i8], a: &[i8]) -> i32 {
-    let mut s = 0i32;
-    for j in 0..16 {
-        s += w[j] as i32 * a[j] as i32;
-    }
-    s
+    super::dots::dot_w16(w, a)
 }
 
 /// Rows of IQ2_XS against nv vectors, portably (ggml's ggml_vec_dot_iq2_xs_q8_K): two exponents a 32-weight group,

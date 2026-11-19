@@ -14,11 +14,7 @@ const VECTORS: usize = 16;
 /// The sixteen values of one group against the same sixteen activations.
 #[inline(always)]
 fn dot_group(w: &[i8], a: &[i8]) -> i32 {
-    let mut s = 0i32;
-    for j in 0..16 {
-        s += w[j] as i32 * a[j] as i32;
-    }
-    s
+    super::dots::dot_w16u(w, a)
 }
 
 /// Rows of Q2_K against nv vectors, portably (ggml's ggml_vec_dot_q2_K_q8_K): per group of 16, the group's scale

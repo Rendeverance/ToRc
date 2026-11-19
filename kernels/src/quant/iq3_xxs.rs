@@ -16,11 +16,7 @@ const VECTORS: usize = 16;
 /// Thirty-two values against the same thirty-two activations.
 #[inline(always)]
 fn dot_group(w: &[i8], a: &[i8]) -> i32 {
-    let mut s = 0i32;
-    for j in 0..32 {
-        s += w[j] as i32 * a[j] as i32;
-    }
-    s
+    super::dots::dot_w32(w, a)
 }
 
 /// Rows of IQ3_XXS against nv vectors, portably (ggml's ggml_vec_dot_iq3_xxs_q8_K): two grid entries make a

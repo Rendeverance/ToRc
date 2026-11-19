@@ -1281,8 +1281,15 @@ fn bench_portable_quants() {
         }
         t.elapsed().as_secs_f64() / n as f64
     };
-    let names: [(u32, &str); 6] =
-        [(10, "Q2_K  "), (16, "IQ2XXS"), (17, "IQ2_XS"), (18, "IQ3XXS"), (22, "IQ2_S "), (29, "IQ1_M ")];
+    let names: [(u32, &str); 7] = [
+        (10, "Q2_K  "),
+        (16, "IQ2XXS"),
+        (17, "IQ2_XS"),
+        (18, "IQ3XXS"),
+        (22, "IQ2_S "),
+        (29, "IQ1_M "),
+        (42, "Q2_0  "),
+    ];
     for (ty, name) in names {
         let (w, rb) = weights(&mut rng, ty, rows, nb);
         let mut line = format!("{name}:");

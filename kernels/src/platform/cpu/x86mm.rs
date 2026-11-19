@@ -104,6 +104,54 @@ unsafe fn wssd<const VNNI: u8>(acc: __m256i, p: __m256i, s: __m256i) -> __m256i 
     }
 }
 
+/// A run of 16 (or 32) weights against a run of activations, whole: what quant::dots asks for, once per vector per
+/// block, from code that unpacked the block already. The weights come signed out of a grid or a nibble, so this is the
+/// signed-by-signed shape of the module header: |w| into the unsigned slot and w's sign carried onto the activations.
+/// Exact as written: the widest operands these formats reach are 15 and 127, so a pair of products stays at 3810 in
+/// int16, and madd's groups of four stay in int32. VNNI (dot4's other arm) would fold the pair and the add into one
+/// instruction; it is left out here because these calls are one per 16 or 32 weights, where the pair and the add are
+/// two instructions and the call's own load and store dominate, and no machine of ours has AVX-VNNI to measure it on.
+#[inline(always)]
+pub(crate) unsafe fn dot_w16(w: *const i8, a: *const i8) -> i32 {
+    unsafe {
+        let wv = _mm_loadu_si128(w as *const __m128i);
+        let av = _mm_loadu_si128(a as *const __m128i);
+        let p = _mm_maddubs_epi16(_mm_sign_epi8(wv, wv), _mm_sign_epi8(av, wv));
+        let s = _mm_madd_epi16(p, _mm_set1_epi16(1));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b00_11_10_01>(s));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+        _mm_cvtsi128_si32(s)
+    }
+}
+
+/// 16 where the weights are plain codes and never negative (Q2_K's 0..3), so the sign fold above is not needed:
+/// the codes go straight into the unsigned slot. That path is decode, where a shorter chain matters more than the
+/// instruction it saves.
+#[inline(always)]
+pub(crate) unsafe fn dot_w16u(w: *const i8, a: *const i8) -> i32 {
+    unsafe {
+        let p = _mm_maddubs_epi16(_mm_loadu_si128(w as *const __m128i), _mm_loadu_si128(a as *const __m128i));
+        let s = _mm_madd_epi16(p, _mm_set1_epi16(1));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b00_11_10_01>(s));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+        _mm_cvtsi128_si32(s)
+    }
+}
+
+/// 32 of them, in 256-bit registers: one maddubs, dot4's AVX2 arm, and the eight int32 lanes folded.
+#[inline(always)]
+pub(crate) unsafe fn dot_w32(w: *const i8, a: *const i8) -> i32 {
+    unsafe {
+        let wv = _mm256_loadu_si256(w as *const __m256i);
+        let av = _mm256_loadu_si256(a as *const __m256i);
+        let s = dot4::<0>(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(av, wv));
+        let mut q = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256::<1>(s));
+        q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_11_10_01>(q));
+        q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+        _mm_cvtsi128_si32(q)
+    }
+}
+
 /// The 8 fp16 values at p + off, p + stride + off, .., widened exactly (neon.rs fcvtl_x, 8 at once).
 #[inline(always)]
 unsafe fn halves8(p: *const u8, stride: usize, off: usize) -> __m256 {
