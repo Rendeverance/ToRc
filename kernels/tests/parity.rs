@@ -54,7 +54,7 @@ fn quantized(rng: &mut Rng, nv: usize, nb: usize) -> Q8 {
 }
 
 /// (ggml type, block bytes, numbers a block, offsets of its fp16 fields): the types the row kernels take.
-const TYPES: [(u32, usize, usize, &[usize]); 19] = [
+const TYPES: [(u32, usize, usize, &[usize]); 20] = [
     (2, 18, 32, &[0]),        // Q4_0
     (3, 20, 32, &[0, 2]),     // Q4_1
     (6, 22, 32, &[0]),        // Q5_0
@@ -73,6 +73,7 @@ const TYPES: [(u32, usize, usize, &[usize]); 19] = [
     (22, 82, 256, &[0]),      // IQ2_S
     (23, 136, 256, &[0]),     // IQ4_XS
     (29, 56, 256, &[]),       // IQ1_M (its scale is four nibbles, set in weights)
+    (42, 18, 64, &[0]),       // Q2_0
     (39, 17, 32, &[]),        // MXFP4 (its scale is one E8M0 byte, set in weights)
 ];
 
@@ -206,7 +207,7 @@ fn matmul(ty: u32, w: &[u8], rb: usize, rows: usize, xq: Q8s, nv: usize) -> Vec<
     all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")
 ))]
 fn is_portable(ty: u32) -> bool {
-    matches!(ty, 10 | 16 | 17 | 18 | 22 | 29)
+    matches!(ty, 10 | 16 | 17 | 18 | 22 | 29 | 42)
 }
 
 #[cfg(any(
@@ -220,7 +221,9 @@ fn portable(ty: u32, w: &[u8], rb: usize, rows: usize, xq: Q8s, nv: usize, y: &m
         17 => kernels::iq2xs_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
         18 => kernels::iq3xxs_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
         22 => kernels::iq2s_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
-        _ => kernels::iq1m_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+        29 => kernels::iq1m_matmul_scalar(w, rb, rows, xq.k, nv, y, rows),
+        // Q2_0's blocks are 64 wide, so its activations are the 32-wide groups, as in the model's dispatch.
+        _ => kernels::q2_0_matmul_scalar(w, rb, rows, xq.g, nv, y, rows),
     }
 }
 
@@ -1370,7 +1373,7 @@ fn ggml_decodes_the_same_blocks() {
 
     // every type the portable kernels carry: one, three and eight blocks, four rows each
     let mut plan: Vec<(u32, usize, bool)> = Vec::new();
-    for ty in [10u32, 16, 17, 18, 22, 29] {
+    for ty in [10u32, 16, 17, 18, 22, 29, 42] {
         for nb in [1usize, 3, 8] {
             for _ in 0..4 {
                 plan.push((ty, nb, false));
@@ -1399,7 +1402,9 @@ fn ggml_decodes_the_same_blocks() {
             }
         }
         let xq = quantized(&mut rng, 1, nb);
-        for n in [ty, bs as u32, nb as u32] {
+        // the bytes of the whole row, not of one block: Q2_0's blocks are 64 wide, so a row of nb units holds
+        // 4*nb of them and a per-block count would hand the harness a third of the row
+        for n in [ty, rb as u32, nb as u32] {
             req.write_all(&n.to_le_bytes()).unwrap();
         }
         req.write_all(&w).unwrap();
@@ -1443,11 +1448,29 @@ fn ggml_decodes_the_same_blocks() {
 
         // and the product, which the two accumulate in different orders
         let mut y = [0f32; 1];
-        portable(ty, w, *rb, 1, xq.view(), 1, &mut y);
+        if ty == 42 {
+            // ggml's q8_0 scale is fp16 where this crate keeps it in f32, so this type is fed the same integers at
+            // a scale of one on both sides: the weights, the unpacking and the integer dots are then exact on both.
+            // The activation scale itself is covered by the f64 reference test, which uses the real groups.
+            let g: Vec<kernels::Groups32> =
+                xq.k.iter()
+                    .map(|b| {
+                        let mut g = kernels::Groups32::default();
+                        g.qs.copy_from_slice(&b.qs);
+                        // the sums of a q8_K block are per 16 and of a q8_0 group per 32; not used by this kernel
+                        g.d = [1.0; 8];
+                        g
+                    })
+                    .collect();
+            kernels::q2_0_matmul_scalar(w, *rb, 1, &g, 1, &mut y, 1);
+        } else {
+            portable(ty, w, *rb, 1, xq.view(), 1, &mut y);
+        }
         let mut mag = 0f64;
         for (j, &wi) in deq.iter().enumerate() {
             let b = &xq.k[j / QK];
-            mag += (wi as f64 * (b.d as f64 * b.qs[j % QK] as f64)).abs();
+            let d = if ty == 42 { 1.0 } else { b.d as f64 }; // the q2_0 groups go across at unit scale
+            mag += (wi as f64 * (d * b.qs[j % QK] as f64)).abs();
         }
         let rel = (y[0] as f64 - dot as f64).abs() / (mag + 1e-30);
         let e = report.entry(ty).or_insert((0, 0.0, 0));

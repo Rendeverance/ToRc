@@ -7,9 +7,14 @@
  * Built by scripts/ggml_ref.sh from a ggml checkout: the two translation units it links carry the formats
  * (ggml-quants.c) and their scalar dots (ggml-cpu/quants.c), which are the definitions every fast path copies.
  *
- * Input ("TORCREF1"): nrec records of (type, block bytes, blocks), the packed weights, then per block the scale,
+ * Input ("TORCREF1"): nrec records of (type, weight bytes for the whole row, blocks), the packed weights, then per
+ * block the scale,
  * the 256 values and the 16 sums of 16 that go with them. Output ("TORCOUT1"): per record the dequantised floats
- * and the product. */
+ * and the product.
+ *
+ * Q2_0's dot takes ggml's q8_0 vectors, not q8_K, and their scale is fp16 there where this crate keeps it in f32.
+ * So for that type the 256 values above are split into 32-wide groups under a scale of one on both sides: the
+ * weights, the unpacking and the integer dots are compared exactly, the rounding of an activation scale is not. */
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -73,6 +78,8 @@ size_t ggml_type_size(int type) {
             return sizeof(block_iq2_s);
         case 29:
             return sizeof(block_iq1_m);
+        case 42:
+            return sizeof(block_q2_0);
         default:
             return 0;
     }
@@ -92,6 +99,8 @@ const char * ggml_type_name(int type) {
             return "iq2_s";
         case 29:
             return "iq1_m";
+        case 42:
+            return "q2_0";
         default:
             return "not linked into this harness";
     }
@@ -138,6 +147,9 @@ void ggml_vec_dot_iq3_xxs_q8_K_generic(int n, float *s, size_t bs, const void *v
                                        size_t by, int nrc);
 void ggml_vec_dot_iq1_m_q8_K_generic(int n, float *s, size_t bs, const void *vx, size_t bx, const void *vy, size_t by,
                                      int nrc);
+void dequantize_row_q2_0(const block_q2_0 *x, float *y, int64_t k);
+void ggml_vec_dot_q2_0_q8_0_generic(int n, float *s, size_t bs, const void *vx, size_t bx, const void *vy, size_t by,
+                                    int nrc);
 
 static uint32_t rd(FILE *f, void *p, size_t n) {
     if (fread(p, 1, n, f) != n) {
@@ -179,9 +191,9 @@ int main(int argc, char **argv) {
 
     for (uint32_t r = 0; r < nrec; ++r) {
         const uint32_t ty = rd_u32(in), bytes = rd_u32(in), nb = rd_u32(in);
-        uint8_t *w = malloc(bytes * nb);
+        uint8_t *w = malloc(bytes);
         block_q8_K *q = malloc(sizeof(*q) * nb);
-        rd(in, w, (size_t)bytes * nb);
+        rd(in, w, bytes);
         for (uint32_t i = 0; i < nb; ++i) {
             rd(in, &q[i].d, sizeof(q[i].d));
             rd(in, q[i].qs, QK_K);
@@ -215,6 +227,18 @@ int main(int argc, char **argv) {
                 dequantize_row_iq1_m((const block_iq1_m *)w, dq, n);
                 ggml_vec_dot_iq1_m_q8_K_generic(n, &dot, 1, w, 1, q, 1, 1);
                 break;
+            case 42: {
+                /* the q8_K vector of the record, re-cut into q8_0 groups under a scale of one (see the header) */
+                block_q8_0 * g = calloc((size_t)nb * QK_K / QK8_0, sizeof(*g));
+                for (uint32_t i = 0; i < nb * QK_K / QK8_0; ++i) {
+                    g[i].d = 0x3C00; /* fp16 one */
+                    memcpy(g[i].qs, q[i / (QK_K / QK8_0)].qs + (i % (QK_K / QK8_0)) * QK8_0, QK8_0);
+                }
+                dequantize_row_q2_0((const block_q2_0 *)w, dq, n);
+                ggml_vec_dot_q2_0_q8_0_generic(n, &dot, 1, w, 1, g, 1, 1);
+                free(g);
+                break;
+            }
             default:
                 fprintf(stderr, "ggml_ref: no reference for type %u\n", ty);
                 return 3;

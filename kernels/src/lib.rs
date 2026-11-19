@@ -44,6 +44,7 @@ pub use quant::iq3_s::*;
 pub use quant::iq3_xxs::*;
 pub use quant::iq4::*;
 pub use quant::mxfp4::*;
+pub use quant::q2_0::*;
 pub use quant::q2_k::*;
 pub use quant::q3_k::*;
 pub use quant::q4_0::*;

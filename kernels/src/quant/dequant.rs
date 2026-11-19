@@ -34,6 +34,7 @@ pub fn block_geometry(ty: u32) -> Option<(usize, usize)> {
         1 => (2, 1),
         30 => (2, 1),
         2 => (18, 32),
+        42 => (18, 64),
         3 => (20, 32),
         6 => (22, 32),
         7 => (24, 32),
@@ -71,6 +72,13 @@ pub fn dequantize(ty: u32, w: &[u8], y: &mut [f32]) -> bool {
                 for j in 0..16 {
                     y[j] = ((b[2 + j] & 15) as i32 - 8) as f32 * d;
                     y[j + 16] = ((b[2 + j] >> 4) as i32 - 8) as f32 * d;
+                }
+            }
+            // Two bits, four codes, no zero-point stored: the codes are the values, offset by one.
+            42 => {
+                let d = h(b, 0);
+                for j in 0..64 {
+                    y[j] = (((b[2 + j / 4] >> (2 * (j % 4))) & 3) as i32 - 1) as f32 * d;
                 }
             }
             3 => {

@@ -18,6 +18,7 @@ pub mod iq3xxs_grid;
 pub mod iq4;
 pub mod ksigns;
 pub mod mxfp4;
+pub mod q2_0;
 pub mod q2_k;
 pub mod q3_k;
 pub mod q4_0;

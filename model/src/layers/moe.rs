@@ -810,9 +810,9 @@ unsafe fn native_multi(
     y_stride: usize,
 ) -> bool {
     let wr = &w[..rows * row_bytes];
-    // Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ2_S and IQ1_M have no vector kernel on either CPU yet, so they run through
-    // this crate's portable ones - the same definitions the parity tests check the vector kernels against.
-    if matches!(ty, 10 | 16 | 17 | 18 | 22 | 29) {
+    // Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ2_S, IQ1_M and Q2_0 have no vector kernel on either CPU yet, so they run
+    // through this crate's portable ones - the same definitions the parity tests check the vector kernels against.
+    if matches!(ty, 10 | 16 | 17 | 18 | 22 | 29 | 42) {
         // SAFETY: y[v * y_stride + r] is writable for v < nv and r < rows (this function's contract), so the slice
         // up to the last of them is
         let ys = unsafe { std::slice::from_raw_parts_mut(y, (nv - 1) * y_stride + rows) };
@@ -824,7 +824,9 @@ unsafe fn native_multi(
             17 => kernels::iq2xs_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
             18 => kernels::iq3xxs_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
             22 => kernels::iq2s_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
-            _ => kernels::iq1m_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+            29 => kernels::iq1m_matmul_scalar(wr, row_bytes, rows, x.k, nv, ys, y_stride),
+            // Q2_0's blocks are 64 wide, so its activations are the 32-wide groups, not the 256-wide blocks.
+            _ => kernels::q2_0_matmul_scalar(wr, row_bytes, rows, x.g, nv, ys, y_stride),
         }
         return true;
     }
