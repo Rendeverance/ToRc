@@ -1068,6 +1068,61 @@ fn bench_q6() {
     }
 }
 
+/// An ignored benchmark: Q3_K rows (512 x 2048) one thread, GMAC/s: q3k_matmul over the source, gemm_q3_lay and
+/// q3k_lay_matmul over q3k_lay4's layout, with Q6_K's gemm_q6k for scale. cargo test --release -p torc-kernels --test
+/// parity bench_q3 -- --ignored --nocapture
+#[cfg(target_arch = "aarch64")]
+#[test]
+#[ignore]
+fn bench_q3() {
+    if !native() || !std::arch::is_aarch64_feature_detected!("i8mm") {
+        return;
+    }
+    use kernels::neon;
+    let mut rng = Rng(11);
+    let (rows, nb) = (512usize, 8usize);
+    let time = |f: &mut dyn FnMut()| {
+        f();
+        let t = std::time::Instant::now();
+        let mut n = 0u32;
+        while t.elapsed().as_secs_f64() < 0.4 {
+            f();
+            n += 1;
+        }
+        t.elapsed().as_secs_f64() / n as f64
+    };
+    let (w, rb) = weights(&mut rng, 11, rows, nb);
+    let (w6, rb6) = weights(&mut rng, 14, rows, nb);
+    let quad = nb * neon::Q3_LAY_BYTES;
+    let mut lay = vec![0u8; rows / 4 * quad];
+    for r in (0..rows).step_by(4) {
+        neon::q3k_lay4(&w[r * rb..], rb, nb, &mut lay[r / 4 * quad..(r / 4 + 1) * quad]);
+    }
+    for nv in [1usize, 2, 3, 4, 8, 16, 32, 64] {
+        let xq = quantized(&mut rng, nv, nb);
+        let mut y = vec![0f32; nv * rows];
+        let macs = (rows * nb * QK * nv) as f64;
+        let mut pk = vec![neon::PackedQ6::default(); neon::pack_q6_len(nv, nb)];
+        neon::pack_q6(&xq.k, nv, &mut pk);
+        // SAFETY: I8MM checked; rows a multiple of 4; y holds nv x rows; lay holds rows / 4 quads
+        let d = time(&mut || unsafe { neon::q3k_matmul(&w, rb, rows, &xq.k, nv, y.as_mut_ptr(), rows) });
+        let l = time(&mut || unsafe { neon::gemm_q3_lay(&lay, rows, &pk, nv, nb, y.as_mut_ptr(), rows) });
+        let g6 = time(&mut || unsafe { neon::gemm_q6k(&w6, rb6, rows, &pk, nv, nb, y.as_mut_ptr(), rows) });
+        let mut line = format!(
+            "nv {nv:3}: Q3_K matmul {:6.1} lay {:6.1}  (Q6_K gemm {:6.1})",
+            macs / d / 1e9,
+            macs / l / 1e9,
+            macs / g6 / 1e9
+        );
+        if nv <= 3 {
+            // SAFETY: as above
+            let s = time(&mut || unsafe { neon::q3k_lay_matmul(&lay, rows, &xq.k, nv, y.as_mut_ptr(), rows) });
+            line += &format!(" lay-matmul {:6.1}", macs / s / 1e9);
+        }
+        println!("{line}  (GMAC/s)");
+    }
+}
+
 /// An ignored benchmark: one vector against many matrices that cannot stay in cache (256 Q4_K / Q5_K matrices of
 /// 512 x 2048, ~150 / 180 MB, split over 8 threads): the decode case, where the weights stream from RAM.
 /// q45k_matmul over the source against q45k_lay_matmul over the layout, GB/s of weights read and GMAC/s.

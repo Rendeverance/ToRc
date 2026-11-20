@@ -738,6 +738,28 @@ impl Weights {
         Ok(mats)
     }
 
+    /// TORC_KLAY=1: the layers' own Q3_K matrices (and a Q3_K output head), as (bytes, rows, cols, type), for the
+    /// same layout as the experts' Q3_K. Not the token embeddings, which are looked up a row at a time.
+    #[cfg(target_arch = "aarch64")]
+    fn klay_dense_mats(&self) -> Vec<(&[u8], usize, usize, u32)> {
+        if !crate::repack::klay_type_on(11) {
+            return Vec::new();
+        }
+        let mut mats = Vec::new();
+        for t in &self.file.tensors {
+            if t.ty != 11 || !(t.name.starts_with("blk.") || t.name == "output.weight") {
+                continue;
+            }
+            if let Some(r) = self.tensor(&t.name) {
+                let (cols, rows) = r.shape();
+                if rows % 4 == 0 {
+                    mats.push((r.data, rows, cols, 11));
+                }
+            }
+        }
+        mats
+    }
+
     /// TORC_KLAY=1: lays out every layer now, for a process that runs every layer anyway (torc-server on one machine,
     /// or as the main machine of two, which writes alone), so the layout costs load time rather than the first prompt.
     /// Returns the seconds it took (0 when off).
@@ -780,6 +802,22 @@ impl Weights {
                                 drop_pages(d);
                             }
                         }
+                    }
+                    // the layers' own Q3_K matrices too (the DeltaNet gates and the like, in Q3_K_S / Q3_K_M files),
+                    // whose prompts otherwise go a row at a time: laid out once, their mapped pages handed back
+                    let dense = self.klay_dense_mats();
+                    if !dense.is_empty() {
+                        let t1 = std::time::Instant::now();
+                        let b = crate::repack::register_many_klay(&dense);
+                        for (d, ..) in &dense {
+                            drop_pages(d);
+                        }
+                        eprintln!(
+                            "klay: {} of the layers' own Q3_K matrices, {:.0} MB in {:.0} ms",
+                            dense.len(),
+                            b as f64 / 1e6,
+                            t1.elapsed().as_secs_f64() * 1e3
+                        );
                     }
                 });
                 let mats = match self.klay_mats(g) {

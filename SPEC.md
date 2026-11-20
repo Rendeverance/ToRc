@@ -91,6 +91,11 @@ without drafting. How many drafts a pass verifies is chosen by `model/src/runtim
 **The head laid out (TORC_KLAY_HEAD=1, off by default):** a Q6_K head in the experts' 4-row layout; q6_lay_matmul
 for 1-3 vectors and gemm_q6_lay from 4 (moe.rs use_q6m; test laid_out_q6_same_bits).
 
+**The layers' own Q3_K matrices laid out (TORC_KLAY, on by default on ARM with I8MM):** a Q3_K_S / Q3_K_M file's
+dense Q3_K matrices (the DeltaNet gates and the like) go into the experts' Q3_K layout with them (weights.rs
+klay_dense_mats), their mapped pages handed back; q3k_lay_matmul for 1-3 vectors and gemm_q3_lay from 4, with the bits
+of q3k_matmul (test laid_out_q3_same_bits).
+
 **The MTP block's fill over a prompt:** the prompt's rows only feed the block's attention cache, so a fill computes
 their keys and values alone (attn::attn_fill_kv), with no queries, attention or output, and the same cache bits
 (TORC_MTP_FILLHASH=1 runs both fills and compares; TORC_MTP_FILL_FULL=1 runs the whole block).

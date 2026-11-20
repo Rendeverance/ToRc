@@ -289,12 +289,13 @@ fn use_q6(ty: u32, nv: usize) -> bool {
     false
 }
 
-/// use_q6 for a dense matrix: also true for a Q6_K matrix with a laid-out copy (TORC_KLAY_HEAD=1, the vocabulary head)
-/// from 4 vectors, whose products then go through gemm_q6_lay (1-3 vectors go through q6_lay_matmul in dot_multi_rows),
-/// with the same bits.
+/// use_q6 for a dense matrix: also true for a Q6_K or Q3_K matrix with a laid-out copy (TORC_KLAY_HEAD=1 for the Q6_K
+/// vocabulary head; every layer's own Q3_K matrix with TORC_KLAY, weights::klay_dense_mats) from 4 vectors, whose
+/// products then go through gemm_q6_lay / gemm_q3_lay (1-3 vectors through q6_lay_matmul / q3k_lay_matmul in
+/// dot_multi_rows), with the same bits.
 fn use_q6m(m: &Mat, nv: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
-    if m.ty == 14
+    if (m.ty == 14 || m.ty == 11)
         && nv >= 4
         && m.rows.is_multiple_of(4)
         && crate::repack::klay_on()
@@ -3036,6 +3037,19 @@ mod tests {
     /// from 4, against q6k_dot_rows / q6k_matmul), from 1 to 9 vectors.
     #[test]
     fn laid_out_q6_same_bits() {
+        laid_out_same_bits(14, 210, 208);
+    }
+
+    /// The layers' own Q3_K matrices with TORC_KLAY (weights::klay_dense_mats): q3k_lay_matmul for 1-3 vectors and
+    /// gemm_q3_lay from 4 give the bits of q3k_matmul over an unregistered copy, from 1 to 9 vectors.
+    #[test]
+    fn laid_out_q3_same_bits() {
+        laid_out_same_bits(11, 110, 108);
+    }
+
+    /// A matrix of type ty (blocks of bs bytes, the fp16 scale at byte d_at) registered laid out against an
+    /// unregistered copy, through apply_group_multi.
+    fn laid_out_same_bits(ty: u32, bs: usize, d_at: usize) {
         if !crate::repack::klay_on() {
             return;
         }
@@ -3049,18 +3063,18 @@ mod tests {
             s ^= s << 17;
             s
         };
-        let mut w = vec![0u8; rows * nb * 210];
+        let mut w = vec![0u8; rows * nb * bs];
         for b in w.iter_mut() {
             *b = next() as u8;
         }
-        // each block's fp16 scale (bytes 208-209) is set to a modest finite number
-        for blk in w.chunks_exact_mut(210) {
+        // each block's fp16 scale is set to a modest finite number
+        for blk in w.chunks_exact_mut(bs) {
             let h = (next() as u16 & 0x83ff) | ((((next() % 20) + 4) as u16) << 10);
-            blk[208..210].copy_from_slice(&h.to_le_bytes());
+            blk[d_at..d_at + 2].copy_from_slice(&h.to_le_bytes());
         }
         let plain = w.clone();
         let w: &'static [u8] = Vec::leak(w);
-        crate::repack::register_many_klay(&[(w, rows, cols, 14)]);
+        crate::repack::register_many_klay(&[(w, rows, cols, ty)]);
         for nv in 1..=9 {
             let xf: Vec<f32> = (0..nv * cols).map(|_| (next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0).collect();
             let mut xq = Q8::new(nv * nb);
@@ -3068,9 +3082,9 @@ mod tests {
                 kernels::q8k_quantize(&xf[v * cols..(v + 1) * cols], xq.sub_mut(v * nb..(v + 1) * nb));
             }
             let (mut a, mut b) = (vec![0f32; nv * rows], vec![0f32; nv * rows]);
-            apply_group_multi(&mut [(Mat { ty: 14, rows, cols, data: w }, &mut a[..])], xq.view(), nv);
-            apply_group_multi(&mut [(Mat { ty: 14, rows, cols, data: &plain }, &mut b[..])], xq.view(), nv);
-            assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "nv {nv}: laid out differs");
+            apply_group_multi(&mut [(Mat { ty, rows, cols, data: w }, &mut a[..])], xq.view(), nv);
+            apply_group_multi(&mut [(Mat { ty, rows, cols, data: &plain }, &mut b[..])], xq.view(), nv);
+            assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "type {ty} nv {nv}: laid out differs");
         }
     }
 }
