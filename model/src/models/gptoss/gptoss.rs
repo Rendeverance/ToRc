@@ -181,6 +181,16 @@ impl Oss {
     pub fn load(path: &str, n_ctx: u32) -> Result<Oss> {
         let w = Weights::load(path)?;
         let h = OssHp::from_meta(&w.file.metadata)?;
+        // the model's identity, so what is learned while it runs is kept in its tune file for the next start (gemma.rs)
+        crate::pipe::set_ident(
+            &w.file.header.model_id,
+            w.file.header.file_bytes,
+            h.n_layer as u32,
+            h.d_model as u32,
+            0,
+            w.file.tensors.len(),
+            n_ctx,
+        );
         let mut layers = Vec::with_capacity(h.n_layer);
         for l in 0..h.n_layer as u32 {
             let group = w

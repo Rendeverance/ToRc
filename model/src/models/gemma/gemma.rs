@@ -279,6 +279,17 @@ impl Gemma {
         crate::repack::set_default(crate::switches::get("TORC_NPU").is_none_or(|v| v.is_empty() || v == "0"));
         let w = Weights::load(path)?;
         let h = GemmaHp::from_meta(&w.file.metadata)?;
+        // the model's identity, so what is learned while it runs (the GPU tier's share, or that the GPU is no gain
+        // here) is kept in its tune file for the next start: without it there is no tune file to keep it in
+        crate::pipe::set_ident(
+            &w.file.header.model_id,
+            w.file.header.file_bytes,
+            h.n_layer as u32,
+            h.d_model as u32,
+            0,
+            w.file.tensors.len(),
+            n_ctx,
+        );
         let mut layers = Vec::with_capacity(h.n_layer);
         for l in 0..h.n_layer as u32 {
             let group = w

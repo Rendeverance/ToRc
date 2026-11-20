@@ -113,6 +113,20 @@ pub fn set_resident(on: bool) {
     RESIDENT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the loaded model reads its prompt block from the tune file (the Qwen family's Model::load says so). Gemma 4
+/// and gpt-oss keep a tune file too, for what the GPU tier learns, but read the block from TORC_BLOCK alone.
+static READS_BLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that the loaded model reads its prompt block from the tune file (Model::load).
+pub fn set_reads_block() {
+    READS_BLOCK.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the loaded model reads its prompt block from the tune file.
+pub fn reads_block() -> bool {
+    READS_BLOCK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The NPU's prompt block and hot experts a layer on one machine, by architecture, with the whole model in memory.
 /// The Qwen3.6-35B was measured reading faster with these than with the general 256 and 16, writing as fast and giving
 /// the same replies, and the other Qwen3.5 / 3.6 MoE models share its build. Every other model keeps the general

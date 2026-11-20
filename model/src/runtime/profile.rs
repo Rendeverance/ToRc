@@ -19,10 +19,11 @@ const NAMES: [(&str, u64, u64); 5] =
 const LAYOUTS: [&str; 4] = ["one-cpu", "one-npu", "two-cpu", "two-npu"];
 
 /// The values this server runs with, wherever each came from. The block is given for the models that read it from the
-/// tune file (the Qwen family's: Gemma 4 and gpt-oss read TORC_BLOCK alone and keep no tune file).
+/// tune file (the Qwen family's: Gemma 4 and gpt-oss read TORC_BLOCK alone; their tune file keeps what the GPU tier
+/// learns).
 pub fn in_use() -> Value {
     let mut m = Map::new();
-    if crate::pipe::model_id() != 0 {
+    if crate::tune::reads_block() {
         m.insert("block".into(), json!(crate::tune::block()));
     }
     m.insert("guided".into(), json!(crate::moe::guided() as u8));
@@ -50,7 +51,7 @@ pub fn chosen() -> Value {
     let s = crate::switches::given;
     json!({
         // TORC_BLOCK=0 counts as not set (tune::block)
-        "block": by(crate::switches::num::<usize>("TORC_BLOCK").is_some_and(|b| b > 0), "block", true),
+        "block": by(crate::switches::num::<usize>("TORC_BLOCK").is_some_and(|b| b > 0), "block", crate::tune::reads_block()),
         "guided": by(s("TORC_NPU_GUIDED"), "guided", true),
         "pin": by(s("TORC_PIN"), "pin", !cfg!(target_os = "linux")),
         "decode_threads": by(s("TORC_DECODE_THREADS"), "decode_threads", true),
@@ -157,7 +158,8 @@ pub fn import(p: &Value) -> Result<(String, Vec<String>), String> {
     let from = p["hardware"].as_str().unwrap_or("").to_string();
     let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let mut done = Vec::new();
-    for (name, v) in vals {
+    // a model that reads its block from TORC_BLOCK alone (Gemma 4, gpt-oss) gets no tuned block written for it
+    for (name, v) in vals.into_iter().filter(|&(n, _)| n != "block" || crate::tune::reads_block()) {
         let entry = json!({"value": v, "imported": true, "measured_on": from, "when": when});
         crate::tune::put_in(&lay, name, entry).map_err(|e| e.to_string())?;
         done.push(format!("{name} {v}"));
