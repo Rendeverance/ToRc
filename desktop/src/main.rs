@@ -141,8 +141,8 @@ impl Shell {
                 s[k] = if k == "env" { switches_only(v) } else { v.clone() };
             }
         }
-        // a save that fails (a full disk, a folder that can't be written) is said so to the page, which tells the person,
-        // rather than shown as saved; the settings handed back are then the ones in use until the app closes
+        // a save that fails (a full disk, a folder that can't be written) is said so to the page, which tells the
+        // person, rather than shown as saved; the settings handed back are then the ones in use until the app closes
         match self.save(&self.settings_file(), &serde_json::to_string_pretty(&s).unwrap_or_default()) {
             Ok(()) => s,
             Err(e) => {
