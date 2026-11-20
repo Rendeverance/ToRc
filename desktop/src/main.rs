@@ -613,6 +613,10 @@ fn request(shell: &Shell, app: &AppHandle, port: u16, messages: &[Value], opts: 
     if let Some(think) = opts["think"].as_bool() {
         body["chat_template_kwargs"] = json!({"enable_thinking": think});
     }
+    // gpt-oss's reasoning effort (low, medium or high), from its Effort button: left out, the model reasons at medium
+    if let Some(effort) = opts["effort"].as_str().filter(|e| ["low", "medium", "high"].contains(e)) {
+        body["reasoning_effort"] = json!(effort);
+    }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }

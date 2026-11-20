@@ -39,6 +39,14 @@ async function start() {
   $('btnSend').onclick = () => (S.busy ? torc.stop() : send());
   $('btnAttach').onclick = async () => attachPaths(await torc.pick('text'));
   $('btnThink').onclick = () => {
+    // gpt-oss reasons at a chosen effort rather than on or off: the button steps through its three levels
+    if (isOss()) {
+      const effort = { default: 'low', low: 'medium', medium: 'high', high: 'default' }[S.settings.effort || 'default'];
+      S.settings.effort = effort;
+      showThinking();
+      setSettings({ effort }).catch(() => {});
+      return;
+    }
     const next = { default: 'on', on: 'off', off: 'default' }[S.settings.thinking || 'default'];
     // set here at once, so a second press before the save comes back moves on from this one, not the old
     S.settings.thinking = next;

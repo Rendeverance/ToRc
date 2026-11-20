@@ -312,10 +312,13 @@ async function send() {
   let r;
   try {
     // the Thinking button: as the model's maker set it (nothing sent), on, or off
-    const t = S.settings.thinking;
+    // gpt-oss: its Effort button instead (low, medium or high; default sends nothing, which is medium)
+    const t = isOss() ? 'default' : S.settings.thinking;
     const think = t === 'on' ? true : t === 'off' ? false : undefined;
     const opts = { max: Math.min(replyMax(), room), ...samplingFor(think !== false) };
     if (think !== undefined) opts.think = think;
+    const effort = S.settings.effort || 'default';
+    if (isOss() && effort !== 'default') opts.effort = effort;
     r = await window.torc.chat(messages, opts);
     await Promise.race([ended, new Promise((resolve) => setTimeout(resolve, 2000))]);
   } catch (e) {
@@ -485,10 +488,16 @@ function onAsk(ask) {
   $('asks').append(bar);
 }
 
-// The Thinking button's label, from the setting.
+// Whether the loaded model is gpt-oss, whose button sets its reasoning effort rather than thinking on or off.
+function isOss() {
+  return ((S.modelArch && S.modelArch.arch) || '') === 'gpt-oss';
+}
+
+// The Thinking button's label, from the setting (for gpt-oss, its Effort).
 function showThinking() {
   const t = (S.settings && S.settings.thinking) || 'default';
-  $('btnThink').textContent = `Thinking: ${t}`;
+  const e = (S.settings && S.settings.effort) || 'default';
+  $('btnThink').textContent = isOss() ? `Effort: ${e}` : `Thinking: ${t}`;
   // ToRc runs Gemma 4 without thinking and LFM2's chat format has no switch for it, so for them it would do nothing
   const arch = (S.modelArch && S.modelArch.arch) || '';
   $('btnThink').hidden = /^(gemma|lfm2)/.test(arch);
