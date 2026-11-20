@@ -83,8 +83,11 @@ Quant types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K, Q4_K, Q5
 IQ2_XS, IQ2_S, IQ3_XXS and IQ1_M through portable kernels that run on any CPU.
 
 Any GGUF of a supported architecture should work, including fine-tunes and abliterated versions, as long as its quant
-types are in the list. The app checks the architecture before converting; check the quant types yourself for now (the
-model's page on Hugging Face lists them).
+types are in the list. The app checks before converting that the model will run and tells you why if it won't;
+`torc plan <model.gguf>` does the same from the command line.
+
+For replies, active parameters matter, not the file size: the 35B-A3B writes faster than Gemma's 26B-A4B on the same
+machine, because each token reads about 3 billion weights instead of 4.
 
 ## The engine without the app
 
@@ -123,6 +126,9 @@ Qwen3.6-35B-A3B Q4_0, **<ins>a 4k-token prompt</ins>** and a 128-token reply, in
 | One of them, CPU + NPU + GPU | 283 | 55.7 |
 | Desktop, i5-12600K, CPU only | 182 | 41 |
 | The same desktop, llama.cpp b12360 at its best thread count | 107 | 21 |
+
+The top row is two machines working together. On one machine, expect the second row, a little lower if its clocks drop
+under a long load (thermals: we haven't seen that on the IdeaCentre mini PCs, but it can happen on a laptop).
 
 **Bigger than memory: Qwen3.8 Flash Next, a 107 GB file, on the same two boxes with 64 GB of RAM between them, the
 experts that don't fit read from the SSDs as they are needed. About 67 tokens a second reading a 16k-token prompt and
