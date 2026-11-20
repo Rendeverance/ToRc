@@ -1,6 +1,6 @@
 //! lay.rs - the experts' K-quant rows rearranged 4 at a time for the ARM SMMLA / SDOT kernels (neon.rs gemm_q45k_lay,
-//! q45k_lay_matmul, gemm_q6_lay, q6_lay_matmul). This is plain Rust, so a converter on any machine can write laid-out
-//! files. The integers and scales are the source's, only rearranged.
+//! q45k_lay_matmul, gemm_q6_lay, q6_lay_matmul, gemm_q3_lay, q3k_lay_matmul). This is plain Rust, so a converter on any
+//! machine can write laid-out files. The integers and scales are the source's, only rearranged.
 
 const Q4K: usize = 144;
 const Q5K: usize = 176;
@@ -116,6 +116,57 @@ pub fn q6_lay4(src: &[u8], row_bytes: usize, nb: usize, out: &mut [u8]) {
                     let (w0, w1) = (q6_weight(r, 16 * g + m % 8), q6_weight(r, 16 * g + 8 + m % 8));
                     o[72 + (2 * g + t) * 16 + m] = (w0 & 15) | ((w1 & 15) << 4);
                     o[584 + 16 * g + m] |= ((w0 >> 4) << (4 * t)) | ((w1 >> 4) << (4 * t + 2));
+                }
+            }
+        }
+    }
+}
+
+/// The bytes of one block of 4 Q3_K rows laid out by q3k_lay4: the source's 4 x 110, and 16 more.
+pub const Q3_LAY_BYTES: usize = 8 + 64 + 256 + 128;
+
+/// Weight n (0..256) of a Q3_K block as u = value + 4 (0..7), in q3k_dotv's order: group g = n / 16 = 8c + 2j + hh
+/// takes bits 2j of qs[32c + 16hh ..] and bit j + 4c of hmask[16hh ..].
+fn q3_weight(blk: &[u8], n: usize) -> u8 {
+    let (g, l) = (n / 16, n % 16);
+    let (c, j, hh) = (g / 8, g % 8 / 2, g % 2);
+    let lo = (blk[32 + 32 * c + 16 * hh + l] >> (2 * j)) & 3;
+    lo | (((blk[16 * hh + l] >> (j + 4 * c)) & 1) << 2)
+}
+
+/// Lays out 4 Q3_K rows (nb blocks each, row_bytes apart) for gemm_q3_lay / q3k_lay_matmul, block after block
+/// (Q3_LAY_BYTES each, 1.036x the source). Each block holds the 4 fp16 d values and, for each group g of 16 weights,
+/// the 4 rows' int8 scales [s0 s1 s2 s3] (unpacked, less 32), where q6_lay4 puts them, so the Q6_K kernels' bodies
+/// read them. Then for each group one register of the low 2 bits of SMMLA's A operands ([row i w0-7, row j w0-7] and
+/// [w8-15, w8-15] of tile t, rows 2t and 2t + 1): byte m holds tile 0's operand 0 in bits 0-1, its operand 1 in bits
+/// 2-3, and tile 1's in bits 4-5 and 6-7. Then for each pair of groups one register of the bits that take 4 off:
+/// byte m's bit 2t + o is that of tile t's operand o in the even group, and bit 4 + 2t + o in the odd one. A weight is
+/// its low bits less 4 where that bit is set (where the source's high bit is clear). The integers and scales are the
+/// source's, only rearranged, so products over it have the source's bits. out holds nb * Q3_LAY_BYTES.
+pub fn q3k_lay4(src: &[u8], row_bytes: usize, nb: usize, out: &mut [u8]) {
+    const Q3K: usize = 110;
+    assert!(src.len() >= 3 * row_bytes + nb * Q3K && out.len() >= nb * Q3_LAY_BYTES);
+    for b in 0..nb {
+        let blk = |i: usize| &src[i * row_bytes + b * Q3K..i * row_bytes + (b + 1) * Q3K];
+        let o = &mut out[b * Q3_LAY_BYTES..(b + 1) * Q3_LAY_BYTES];
+        o[72..].fill(0);
+        let sc: [[i8; 16]; 4] =
+            core::array::from_fn(|i| crate::q3k_unpack_scales(blk(i)[96..108].try_into().expect("12 scale bytes")));
+        for i in 0..4 {
+            o[2 * i..2 * i + 2].copy_from_slice(&blk(i)[108..110]);
+        }
+        for g in 0..16 {
+            for i in 0..4 {
+                o[8 + 4 * g + i] = sc[i][g] as u8;
+            }
+            for t in 0..2 {
+                let (ri, rj) = (blk(2 * t), blk(2 * t + 1));
+                for m in 0..16 {
+                    let r = if m < 8 { ri } else { rj };
+                    let (w0, w1) = (q3_weight(r, 16 * g + m % 8), q3_weight(r, 16 * g + 8 + m % 8));
+                    o[72 + 16 * g + m] |= ((w0 & 3) << (4 * t)) | ((w1 & 3) << (4 * t + 2));
+                    let k = 4 * (g % 2) + 2 * t;
+                    o[328 + 16 * (g / 2) + m] |= ((!w0 >> 2) & 1) << k | ((!w1 >> 2) & 1) << (k + 1);
                 }
             }
         }

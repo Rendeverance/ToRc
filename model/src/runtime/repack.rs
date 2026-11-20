@@ -184,10 +184,11 @@ pub fn find(w: &[u8], rows: usize) -> Option<&'static [u8]> {
     Some(&e.packed[q0 * e.pq..(q0 + rows / 4) * e.pq])
 }
 
-/// Whether the experts' K-quant matrices (klay_kind: Q4_K, Q5_K, Q6_K) are also held laid out for SMMLA (lay4), with
-/// their products going through gemm_q45k_lay / gemm_q6_lay, and 1-3 vectors through q45k_lay_matmul / q6_lay_matmul,
-/// all with the same bits. On by default; TORC_KLAY=0 turns it off. ARM with FEAT_I8MM, and no expert cache. It is a
-/// copy of the mapped originals (1.028x the Q4_K bytes, 1.023x the Q5_K, 1x the Q6_K), made per layer (at load in
+/// Whether the experts' K-quant matrices (klay_kind: Q3_K, Q4_K, Q5_K, Q6_K) are also held laid out for SMMLA (lay4),
+/// with their products going through gemm_q45k_lay / gemm_q6_lay / gemm_q3_lay, and 1-3 vectors through
+/// q45k_lay_matmul / q6_lay_matmul / q3k_lay_matmul, all with the same bits. On by default; TORC_KLAY=0 turns it off.
+/// ARM with FEAT_I8MM, and no expert cache. It is a copy of the mapped originals (1.036x the Q3_K bytes, 1.028x the
+/// Q4_K, 1.023x the Q5_K, 1x the Q6_K), made per layer (at load in
 /// torc-server, at first use elsewhere: weights::klay_group), after which the originals' pages leave the working set.
 pub fn klay_on() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| {
@@ -206,8 +207,9 @@ pub fn klay_on() -> bool {
 /// rows). There is one entry per type here, with its lay function in lay4 and its kernels in moe.rs's klay_* dispatch.
 #[cfg(target_arch = "aarch64")]
 pub fn klay_kind(ty: u32) -> Option<(usize, usize)> {
-    use kernels::neon::{Q4_K_BLOCK, Q5_K_BLOCK, Q6_K_BLOCK, Q6_LAY_BYTES, q45k_lay_bytes};
+    use kernels::neon::{Q3_LAY_BYTES, Q4_K_BLOCK, Q5_K_BLOCK, Q6_K_BLOCK, Q6_LAY_BYTES, q45k_lay_bytes};
     match ty {
+        11 => Some((kernels::Q3_K_BLOCK, Q3_LAY_BYTES)),
         12 => Some((Q4_K_BLOCK, q45k_lay_bytes(false))),
         13 => Some((Q5_K_BLOCK, q45k_lay_bytes(true))),
         14 => Some((Q6_K_BLOCK, Q6_LAY_BYTES)),
@@ -228,6 +230,7 @@ fn lay4(ty: u32, src: &[u8], row_bytes: usize, nb: usize, out: &mut [u8]) {
     match ty {
         12 | 13 => kernels::neon::q45k_lay4(ty == 13, src, row_bytes, nb, out),
         14 => kernels::neon::q6_lay4(src, row_bytes, nb, out),
+        11 => kernels::neon::q3k_lay4(src, row_bytes, nb, out),
         _ => unreachable!("klay type {ty}"),
     }
 }

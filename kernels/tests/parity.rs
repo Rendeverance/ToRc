@@ -470,6 +470,42 @@ fn gemm_q6_lay_matches() {
     }
 }
 
+/// q3k_lay4 + gemm_q3_lay / q3k_lay_matmul: the same bits as q3k_matmul, 4-row and 8-row passes, panels, odd vector
+/// counts.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn gemm_q3_lay_matches() {
+    if !native() || !std::arch::is_aarch64_feature_detected!("i8mm") {
+        return;
+    }
+    use kernels::neon;
+    let mut rng = Rng(73);
+    for (nb, rows) in [(1usize, 4usize), (3, 64), (8, 36)] {
+        let (w, rb) = weights(&mut rng, 11, rows, nb);
+        let quad = nb * neon::Q3_LAY_BYTES;
+        let mut lay = vec![0u8; rows / 4 * quad];
+        for r in (0..rows).step_by(4) {
+            neon::q3k_lay4(&w[r * rb..], rb, nb, &mut lay[r / 4 * quad..(r / 4 + 1) * quad]);
+        }
+        for nv in [1usize, 2, 3, 4, 5, 8, 9, 16, 17, 40] {
+            let xq = quantized(&mut rng, nv, nb);
+            let want = bits(&matmul(11, &w, rb, rows, xq.view(), nv));
+            let mut pk = vec![neon::PackedQ6::default(); neon::pack_q6_len(nv, nb)];
+            neon::pack_q6(&xq.k, nv, &mut pk);
+            let mut y = vec![0f32; nv * rows];
+            // SAFETY: I8MM checked; rows a multiple of 4; lay holds rows / 4 quads; y holds nv x rows
+            unsafe { neon::gemm_q3_lay(&lay, rows, &pk, nv, nb, y.as_mut_ptr(), rows) };
+            assert_eq!(bits(&y), want, "q3 lay nb {nb} rows {rows} nv {nv}");
+            if nv <= 3 {
+                let mut y1 = vec![0f32; nv * rows];
+                // SAFETY: DotProd (native); as above
+                unsafe { neon::q3k_lay_matmul(&lay, rows, &xq.k, nv, y1.as_mut_ptr(), rows) };
+                assert_eq!(bits(&y1), want, "q3 lay_matmul nb {nb} rows {rows} nv {nv}");
+            }
+        }
+    }
+}
+
 /// ARM: Q8_0 rows laid out by q8_0_lay4 under gemm_x4::<Q8x4> (from the packed vectors) and x4_matmul::<Q8x4> (1-3
 /// vectors) give q8_0_matmul' bits over the source, as do the generic passes over Q4_0's repack (Q4x4).
 #[cfg(target_arch = "aarch64")]

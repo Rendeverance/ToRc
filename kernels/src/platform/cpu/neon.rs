@@ -2917,7 +2917,7 @@ unsafe fn gemm_q45k_t<const FIVE: bool>(
     }
 }
 
-pub use crate::lay::{Q6_LAY_BYTES, q6_lay4, q45k_lay_bytes, q45k_lay4};
+pub use crate::lay::{Q3_LAY_BYTES, Q6_LAY_BYTES, q3k_lay4, q6_lay4, q45k_lay_bytes, q45k_lay4};
 
 /// Q5_K: each operand's fifth bit (bit 4) is ORed in from the sub-block's fifth-bit register h (tile t's operand n is
 /// in bit n + 4t of each byte).
@@ -3248,6 +3248,38 @@ unsafe fn q6_lay_ops(g0: *const u8, g: usize, t: usize) -> [int8x16_t; 2] {
     }
 }
 
+/// Group g's two A operands for tile t, from a q3k_lay4 block g0 (signed, the source's value: the low bits, less 4
+/// where the block's bit says so).
+#[inline(always)]
+unsafe fn q3_lay_ops(g0: *const u8, g: usize, t: usize) -> [int8x16_t; 2] {
+    unsafe {
+        let (m3, m4) = (vdupq_n_u8(3), vdupq_n_u8(4));
+        let r = vld1q_u8(g0.add(72 + 16 * g));
+        let h = vld1q_u8(g0.add(328 + 16 * (g / 2)));
+        let (lo, k) = ((4 * t) as i8, (4 * (g % 2) + 2 * t) as i8);
+        let o = |s: i8| {
+            let l = vandq_u8(vshlq_u8(r, vdupq_n_s8(-(lo + 2 * s))), m3);
+            // the operand's bit k + s, moved to bit 2 (4)
+            let f = vandq_u8(vshlq_u8(h, vdupq_n_s8(2 - (k + s))), m4);
+            vsubq_s8(vreinterpretq_s8_u8(l), vreinterpretq_s8_u8(f))
+        };
+        [o(0), o(1)]
+    }
+}
+
+/// gemm_q6_lay over rows laid out by q3k_lay4 (rows / 4 groups of nb * Q3_LAY_BYTES bytes): the same body, with
+/// q3_lay_ops for the operands. For each block and (row, vector) it forms q3k_matmul's exact integer sum (the scaled
+/// group sums of the signed values, where q3k_matmul takes 4 x the scaled activation sums off the unsigned ones), takes
+/// the same fused step and goes through the blocks in the same order, so the bits are the same as q3k_matmul's. pk is
+/// pack_q6 of the vectors.
+///
+/// # Safety
+/// As for gemm_q6_lay, with q3k_lay4's layout.
+#[target_feature(enable = "i8mm")]
+pub unsafe fn gemm_q3_lay(w: &[u8], rows: usize, pk: &[PackedQ6], nv: usize, nb: usize, y: *mut f32, y_stride: usize) {
+    unsafe { gemm_lay16::<true>(w, rows, pk, nv, nb, y, y_stride) }
+}
+
 /// gemm_q6k over rows laid out by q6_lay4 (rows / 4 groups of nb * Q6_LAY_BYTES bytes). The operands come out of a
 /// mask, a shift and an OR, and the scales are already bytes in row order. For each block and (row, vector) it forms
 /// the same exact integer sum, takes the same fused step, and goes through the blocks in the same order, so the bits
@@ -3260,24 +3292,13 @@ unsafe fn q6_lay_ops(g0: *const u8, g: usize, t: usize) -> [int8x16_t; 2] {
 /// y_stride + r, and nothing else touches those elements during the call.
 #[target_feature(enable = "i8mm")]
 pub unsafe fn gemm_q6_lay(w: &[u8], rows: usize, pk: &[PackedQ6], nv: usize, nb: usize, y: *mut f32, y_stride: usize) {
-    let quad = nb * Q6_LAY_BYTES;
-    assert!(nv > 0 && rows.is_multiple_of(4) && pk.len() >= pack_q6_len(nv, nb) && w.len() >= rows / 4 * quad);
-    static MIN8: std::sync::LazyLock<usize> =
-        std::sync::LazyLock::new(|| crate::switches::num("TORC_KMM8_MIN").unwrap_or(8));
-    let r8 = if nv >= *MIN8 { rows / 8 * 8 } else { 0 };
-    unsafe {
-        if r8 > 0 {
-            gemm_q6_lay_t::<2>(w, r8, pk, nv, nb, y, y_stride);
-        }
-        if r8 < rows {
-            gemm_q6_lay_t::<1>(&w[r8 / 4 * quad..], rows - r8, pk, nv, nb, y.add(r8), y_stride);
-        }
-    }
+    unsafe { gemm_lay16::<false>(w, rows, pk, nv, nb, y, y_stride) }
 }
 
-/// gemm_q6_lay's body: Q quads (4Q rows, 2Q tiles) a pass (rows must be a multiple of 4Q).
+/// gemm_q6_lay (Q3 = false) and gemm_q3_lay (Q3 = true): their layouts keep the d values, the scales and the groups of
+/// 16 weights in the same places, and differ in the operands' bits.
 #[target_feature(enable = "i8mm")]
-unsafe fn gemm_q6_lay_t<const Q: usize>(
+unsafe fn gemm_lay16<const Q3: bool>(
     w: &[u8],
     rows: usize,
     pk: &[PackedQ6],
@@ -3286,7 +3307,34 @@ unsafe fn gemm_q6_lay_t<const Q: usize>(
     y: *mut f32,
     y_stride: usize,
 ) {
-    let quad = nb * Q6_LAY_BYTES;
+    let quad = nb * if Q3 { Q3_LAY_BYTES } else { Q6_LAY_BYTES };
+    assert!(nv > 0 && rows.is_multiple_of(4) && pk.len() >= pack_q6_len(nv, nb) && w.len() >= rows / 4 * quad);
+    static MIN8: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| crate::switches::num("TORC_KMM8_MIN").unwrap_or(8));
+    let r8 = if nv >= *MIN8 { rows / 8 * 8 } else { 0 };
+    unsafe {
+        if r8 > 0 {
+            gemm_q6_lay_t::<2, Q3>(w, r8, pk, nv, nb, y, y_stride);
+        }
+        if r8 < rows {
+            gemm_q6_lay_t::<1, Q3>(&w[r8 / 4 * quad..], rows - r8, pk, nv, nb, y.add(r8), y_stride);
+        }
+    }
+}
+
+/// gemm_lay16's body: Q quads (4Q rows, 2Q tiles) a pass (rows must be a multiple of 4Q).
+#[target_feature(enable = "i8mm")]
+unsafe fn gemm_q6_lay_t<const Q: usize, const Q3: bool>(
+    w: &[u8],
+    rows: usize,
+    pk: &[PackedQ6],
+    nv: usize,
+    nb: usize,
+    y: *mut f32,
+    y_stride: usize,
+) {
+    let lb = if Q3 { Q3_LAY_BYTES } else { Q6_LAY_BYTES };
+    let quad = nb * lb;
     assert!(rows.is_multiple_of(4 * Q) && w.len() >= rows / 4 * quad);
     let np = nv.div_ceil(2);
     static PANEL: std::sync::LazyLock<usize> =
@@ -3319,14 +3367,17 @@ unsafe fn gemm_q6_lay_t<const Q: usize>(
                         let mut a = [[vdupq_n_s8(0); 2]; 4];
                         let mut sc = [vdupq_n_s32(0); 4];
                         for q in 0..Q {
-                            let g0 = base.add(q * quad + b * Q6_LAY_BYTES);
+                            let g0 = base.add(q * quad + b * lb);
                             // int8 scales [r0 r1 r2 r3] go to the tile lanes [r0 r0 r1 r1] and [r2 r2 r3 r3]
                             let v = vmovl_s8(vreinterpret_s8_u32(vld1_dup_u32(g0.add(8 + 4 * g) as *const u32)));
                             let z = vzip1q_s16(v, v);
                             sc[2 * q] = vmovl_s16(vget_low_s16(z));
                             sc[2 * q + 1] = vmovl_high_s16(z);
-                            a[2 * q] = q6_lay_ops(g0, g, 0);
-                            a[2 * q + 1] = q6_lay_ops(g0, g, 1);
+                            (a[2 * q], a[2 * q + 1]) = if Q3 {
+                                (q3_lay_ops(g0, g, 0), q3_lay_ops(g0, g, 1))
+                            } else {
+                                (q6_lay_ops(g0, g, 0), q6_lay_ops(g0, g, 1))
+                            };
                         }
                         for p in p0..p1 {
                             let e = pk.get_unchecked(p * nb + b);
@@ -3340,7 +3391,7 @@ unsafe fn gemm_q6_lay_t<const Q: usize>(
                     // the block's fused step for each (pair, tile), going through the blocks in order as gemm_q6k does
                     let mut dt = [vdupq_n_f32(0.0); 4];
                     for q in 0..Q {
-                        let d = fcvtl(vld1_u16(base.add(q * quad + b * Q6_LAY_BYTES) as *const u16));
+                        let d = fcvtl(vld1_u16(base.add(q * quad + b * lb) as *const u16));
                         dt[2 * q] = vzip1q_f32(d, d);
                         dt[2 * q + 1] = vzip2q_f32(d, d);
                     }
@@ -3389,28 +3440,64 @@ pub unsafe fn q6_lay_matmul(w: &[u8], rows: usize, x: &[BlockQ8K], nv: usize, y:
     );
     unsafe {
         match nv {
-            1 => q6_lay_pass::<1>(w, rows, x, nb, y, y_stride),
-            2 => q6_lay_pass::<2>(w, rows, x, nb, y, y_stride),
-            _ => q6_lay_pass::<3>(w, rows, x, nb, y, y_stride),
+            1 => q6_lay_pass::<1, false>(w, rows, x, nb, y, y_stride),
+            2 => q6_lay_pass::<2, false>(w, rows, x, nb, y, y_stride),
+            _ => q6_lay_pass::<3, false>(w, rows, x, nb, y, y_stride),
         }
     }
 }
 
+/// q6_lay_matmul over rows laid out by q3k_lay4, with q3_lay_ops for the operands: for each (row, vector) and block
+/// the same exact integer sum and fused step as q3k_matmul, so the bits are the same.
+///
+/// # Safety
+/// As for q6_lay_matmul, with q3k_lay4's layout.
 #[target_feature(enable = "dotprod")]
-unsafe fn q6_lay_pass<const NV: usize>(w: &[u8], rows: usize, x: &[BlockQ8K], nb: usize, y: *mut f32, y_stride: usize) {
-    let quad = nb * Q6_LAY_BYTES;
+pub unsafe fn q3k_lay_matmul(w: &[u8], rows: usize, x: &[BlockQ8K], nv: usize, y: *mut f32, y_stride: usize) {
+    let nb = x.len() / nv;
+    assert!(
+        rows.is_multiple_of(4)
+            && (1..=3).contains(&nv)
+            && x.len() == nv * nb
+            && w.len() >= rows / 4 * nb * Q3_LAY_BYTES
+    );
+    unsafe {
+        match nv {
+            1 => q6_lay_pass::<1, true>(w, rows, x, nb, y, y_stride),
+            2 => q6_lay_pass::<2, true>(w, rows, x, nb, y, y_stride),
+            _ => q6_lay_pass::<3, true>(w, rows, x, nb, y, y_stride),
+        }
+    }
+}
+
+/// q6_lay_matmul's pass (Q3 = false) and q3k_lay_matmul's (Q3 = true).
+#[target_feature(enable = "dotprod")]
+unsafe fn q6_lay_pass<const NV: usize, const Q3: bool>(
+    w: &[u8],
+    rows: usize,
+    x: &[BlockQ8K],
+    nb: usize,
+    y: *mut f32,
+    y_stride: usize,
+) {
+    let lb = if Q3 { Q3_LAY_BYTES } else { Q6_LAY_BYTES };
+    let quad = nb * lb;
     unsafe {
         for r0 in (0..rows).step_by(4) {
             let base = w.as_ptr().add(r0 / 4 * quad);
             let mut acc = [vdupq_n_f32(0.0); NV];
             for b in 0..nb {
-                let g0 = base.add(b * Q6_LAY_BYTES);
+                let g0 = base.add(b * lb);
                 let mut isum = [vdupq_n_s32(0); NV];
                 for g in 0..16 {
                     // the 4 rows' scales as lanes [r0 r1 r2 r3]
                     let v = vmovl_s8(vreinterpret_s8_u32(vld1_dup_u32(g0.add(8 + 4 * g) as *const u32)));
                     let sc = vmovl_s16(vget_low_s16(v));
-                    let (a0, a1) = (q6_lay_ops(g0, g, 0), q6_lay_ops(g0, g, 1));
+                    let (a0, a1) = if Q3 {
+                        (q3_lay_ops(g0, g, 0), q3_lay_ops(g0, g, 1))
+                    } else {
+                        (q6_lay_ops(g0, g, 0), q6_lay_ops(g0, g, 1))
+                    };
                     for v in 0..NV {
                         let xp = x.get_unchecked(v * nb + b).qs.as_ptr().add(16 * g);
                         let dup = |o: usize| vreinterpretq_s8_s64(vld1q_dup_s64(xp.add(o) as *const i64));

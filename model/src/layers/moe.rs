@@ -163,6 +163,10 @@ pub fn dot_rows(ty: u32, w: &[u8], rb: usize, x: Q8s, y: &mut [f32]) {
             // SAFETY: FEAT_DotProd was checked above; the kernel asserts the sizes; y holds y.len() rows (one vector)
             return unsafe { kernels::neon::q45k_matmul(ty == 13, w, rb, y.len(), x.k, 1, y.as_mut_ptr(), y.len()) };
         }
+        // a laid-out copy of these rows (TORC_KLAY=1) goes through q3k_lay_matmul, with the same bits
+        if ty == 11 && unsafe { klay_matmul(ty, &w[..y.len() * rb], y.len(), x, 1, y.as_mut_ptr(), y.len()) } {
+            return;
+        }
         if ty == 11 && *KQ {
             // Q3_K SAFETY: as above
             return unsafe { kernels::neon::q3k_matmul(w, rb, y.len(), x.k, 1, y.as_mut_ptr(), y.len()) };
@@ -301,11 +305,12 @@ fn use_q6m(m: &Mat, nv: usize) -> bool {
     use_q6(m.ty, nv)
 }
 
-/// use_q6 for the experts: with their Q6_K laid out (TORC_KLAY=1, repack::klay_type_on), SMMLA from 4 vectors as for
-/// the Q4_K / Q5_K experts (1-3 vectors go through q6_lay_matmul), so no product reads the original rows again.
+/// use_q6 for the experts: with their Q6_K or Q3_K laid out (TORC_KLAY=1, repack::klay_type_on), SMMLA from 4 vectors
+/// as for the Q4_K / Q5_K experts (gemm_q6_lay / gemm_q3_lay, which take the vectors packed as gemm_q6k does; 1-3
+/// vectors go through q6_lay_matmul / q3k_lay_matmul), so no product reads the original rows again.
 fn use_q6e(ty: u32, nv: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
-    if ty == 14 && nv >= 4 && crate::repack::klay_on() && crate::repack::klay_type_on(14) {
+    if (ty == 14 || ty == 11) && nv >= 4 && crate::repack::klay_on() && crate::repack::klay_type_on(ty) {
         return true;
     }
     use_q6(ty, nv)
@@ -529,6 +534,24 @@ unsafe fn dot_multi_rows(
         }
         return;
     }
+    // Q3_K with a laid-out copy (TORC_KLAY=1, use_q6e packed the vectors): gemm_q3_lay, with q3k_matmul's bits
+    #[cfg(target_arch = "aarch64")]
+    if !pk6.is_empty()
+        && ty == 11
+        && rows >= 4
+        && let Some(lay) = crate::repack::klay_on()
+            .then(|| crate::repack::find(&w[..rows / 4 * 4 * row_bytes], rows / 4 * 4))
+            .flatten()
+    {
+        let (r4, nb) = (rows / 4 * 4, x.len() / nv);
+        unsafe {
+            kernels::neon::gemm_q3_lay(lay, r4, pk6, nv, nb, y, y_stride);
+            if r4 < rows {
+                rest_multi(ty, &w[r4 * row_bytes..], row_bytes, rows - r4, x, nv, y.add(r4), y_stride);
+            }
+        }
+        return;
+    }
     #[cfg(target_arch = "aarch64")]
     if !pk6.is_empty() && ty == 14 {
         let r4 = rows / 4 * 4;
@@ -711,9 +734,9 @@ unsafe fn dot_multi_rows(
             }
         });
         let wr = &w[..rows * row_bytes];
-        // a laid-out copy of these K-quant rows (TORC_KLAY=1) goes through q45k_lay_matmul / q6_lay_matmul for 1-3
-        // vectors, with the same bits
-        if matches!(ty, 12..=14) && unsafe { klay_matmul(ty, wr, rows, x, nv, y, y_stride) } {
+        // a laid-out copy of these K-quant rows (TORC_KLAY=1) goes through q45k_lay_matmul / q6_lay_matmul /
+        // q3k_lay_matmul for 1-3 vectors, with the same bits
+        if matches!(ty, 11..=14) && unsafe { klay_matmul(ty, wr, rows, x, nv, y, y_stride) } {
             return;
         }
         if *MODE == 1 && matches!(ty, 3 | 6 | 7 | 8 | 11 | 12 | 13 | 14 | 20 | 21 | 23) {
@@ -748,15 +771,16 @@ unsafe fn dot_multi_rows(
     unsafe { rest_multi(ty, w, row_bytes, rows, x, nv, y, y_stride) }
 }
 
-/// K-quant rows (Q4_K / Q5_K / Q6_K; w their bytes, rows a multiple of 4) against 1-3 vectors, using their laid-out
-/// copy (TORC_KLAY=1, repack.rs): q45k_lay_matmul / q6_lay_matmul, with the same bits as q45k_matmul / q6k_matmul.
+/// K-quant rows (Q3_K / Q4_K / Q5_K / Q6_K; w their bytes, rows a multiple of 4) against 1-3 vectors, using their
+/// laid-out copy (TORC_KLAY=1, repack.rs): q3k_lay_matmul / q45k_lay_matmul / q6_lay_matmul, with the same bits as
+/// q3k_matmul / q45k_matmul / q6k_matmul.
 /// Returns false, having done nothing, when there is no copy or the vector count is not 1-3.
 ///
 /// # Safety
 /// As for dot_multi_rows.
 #[cfg(target_arch = "aarch64")]
 unsafe fn klay_matmul(ty: u32, w: &[u8], rows: usize, x: Q8s, nv: usize, y: *mut f32, y_stride: usize) -> bool {
-    if !(matches!(ty, 12..=14) && (1..=3).contains(&nv) && rows.is_multiple_of(4) && crate::repack::klay_on()) {
+    if !(matches!(ty, 11..=14) && (1..=3).contains(&nv) && rows.is_multiple_of(4) && crate::repack::klay_on()) {
         return false;
     }
     match crate::repack::find(w, rows) {
@@ -764,6 +788,8 @@ unsafe fn klay_matmul(ty: u32, w: &[u8], rows: usize, x: Q8s, nv: usize, y: *mut
         Some(lay) => unsafe {
             if ty == 14 {
                 kernels::neon::q6_lay_matmul(lay, rows, x.k, nv, y, y_stride)
+            } else if ty == 11 {
+                kernels::neon::q3k_lay_matmul(lay, rows, x.k, nv, y, y_stride)
             } else {
                 kernels::neon::q45k_lay_matmul(ty == 13, lay, rows, x.k, nv, y, y_stride)
             }
