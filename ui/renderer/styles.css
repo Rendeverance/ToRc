@@ -275,6 +275,10 @@ body:not(.terminal) .top .model, body:not(.terminal) #btnLoad { display: none; }
 /* the progress bar sits in the middle of the strip, wider, without making the strip any taller */
 .strip { position: relative; }
 .strip .bar { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(360px, 30vw); height: 8px; }
+/* a narrow window has no middle to spare: the bar goes back in line, first, so the speeds never run under it */
+@media (max-width: 960px) {
+  .strip .bar { position: static; transform: none; width: 110px; flex: none; }
+}
 .turn .body .codewrap { margin: 8px 0; }
 .turn .body .code-acts { display: flex; justify-content: flex-end; gap: 6px; margin-bottom: -4px; }
 .turn .body .code-acts .btn { padding: 2px 8px; font-size: 11.5px; opacity: .85; }

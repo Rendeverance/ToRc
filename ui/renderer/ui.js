@@ -59,6 +59,11 @@ async function setSettings(patch) {
   S.saving = turn.catch(() => {});
   const mine = (S.saves = (S.saves || 0) + 1);
   const saved = await turn;
+  // a save that didn't reach the disk: the change still holds until the app closes, and the person is told
+  if (saved && saved.saveError) {
+    toast(`The settings couldn't be saved, so this change lasts until the app closes (${saved.saveError})`);
+    delete saved.saveError;
+  }
   // only the last save asked for gives the settings shown: an earlier one's answer lacks the changes made since (a
   // second press of the Thinking button, say), and the last one's has them all
   if (mine === S.saves) S.settings = saved;
