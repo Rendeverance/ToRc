@@ -17,6 +17,55 @@ fn dot_group(w: &[i8], a: &[i8]) -> i32 {
     super::dots::dot_w16u(w, a)
 }
 
+/// A block's 256 values, in the order the activations are in: group g's values at byte `g % 2 * 16` of its 32-byte
+/// half, shifted `(g % 8) / 2 * 2` bits. On x86-64 that reading is four shifts and masks per sixteen source bytes,
+/// each run going to its group as is (x86mm::unpack_q2_k); elsewhere it is one code at a time, as the format is packed.
+#[inline(always)]
+fn unpack(blk: &[u8], qv: &mut [i8; 256]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
+    unsafe {
+        crate::x86mm::unpack_q2_k(blk.as_ptr(), qv.as_mut_ptr())
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")))]
+    for g in 0..16 {
+        let (chunk, half, shift) = (32 * (g / 8), 16 * (g % 2), 2 * ((g % 8) / 2));
+        let (src, dst) = (&blk[16 + chunk + half..], &mut qv[16 * g..]);
+        for l in 0..16 {
+            dst[l] = ((src[l] >> shift) & 3) as i8;
+        }
+    }
+}
+
+/// One block against one vector: the scale-weighted sum of the value dots, and the sums of the activations over the
+/// groups weighted by the group minima. With a single vector nothing is shared, so this is the whole of reading the
+/// block; on x86-64 it unpacks by the run and uses the shared dots, elsewhere it takes the codes straight from the
+/// block, which needs no buffer for a block one vector sees once.
+#[inline(always)]
+fn ints_from_block(blk: &[u8], xa: &BlockQ8K) -> (i32, i32) {
+    let sc = &blk[0..16];
+    let (mut sumi, mut summs) = (0i32, 0i32);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
+    {
+        let mut qv = [0i8; 256];
+        unpack(blk, &mut qv);
+        for g in 0..16 {
+            sumi += (sc[g] & 0xF) as i32 * dot_group(&qv[16 * g..], &xa.qs[16 * g..]);
+            summs += xa.bsums[g] as i32 * (sc[g] >> 4) as i32;
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")))]
+    for g in 0..16 {
+        let (chunk, half, shift) = (32 * (g / 8), 16 * (g % 2), 2 * ((g % 8) / 2));
+        let mut isuml = 0i32;
+        for l in 0..16 {
+            isuml += xa.qs[16 * g + l] as i32 * (((blk[16 + chunk + half + l] >> shift) & 3) as i32);
+        }
+        sumi += (sc[g] & 0xF) as i32 * isuml;
+        summs += xa.bsums[g] as i32 * (sc[g] >> 4) as i32;
+    }
+    (sumi, summs)
+}
+
 /// Rows of Q2_K against nv vectors, portably (ggml's ggml_vec_dot_q2_K_q8_K): per group of 16, the group's scale
 /// times the integer dot of its values with the activations, summed; minus the block minimum times the activations'
 /// sums over the same groups. y[v * y_stride + r] for v < nv and r < rows.
@@ -45,17 +94,7 @@ pub fn q2k_matmul_scalar(
             let mut acc = 0f32;
             for b in 0..nb {
                 let (blk, xa) = (&wr[b * Q2_K_BLOCK..(b + 1) * Q2_K_BLOCK], &x[b]);
-                let (sc, q2) = (&blk[0..16], &blk[16..80]);
-                let (mut sumi, mut summs) = (0i32, 0i32);
-                for g in 0..16 {
-                    let (chunk, half, shift) = (32 * (g / 8), 16 * (g % 2), 2 * ((g % 8) / 2));
-                    let mut isuml = 0i32;
-                    for l in 0..16 {
-                        isuml += xa.qs[16 * g + l] as i32 * (((q2[chunk + half + l] >> shift) & 3) as i32);
-                    }
-                    sumi += (sc[g] & 0xF) as i32 * isuml;
-                    summs += xa.bsums[g] as i32 * (sc[g] >> 4) as i32;
-                }
+                let (sumi, summs) = ints_from_block(blk, xa);
                 let d = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]]));
                 let dm = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]]));
                 acc = (xa.d * d).mul_add(sumi as f32, acc);
@@ -72,16 +111,10 @@ pub fn q2k_matmul_scalar(
             let mut acc = [0f32; VECTORS];
             for b in 0..nb {
                 let blk = &wr[b * Q2_K_BLOCK..(b + 1) * Q2_K_BLOCK];
-                let (sc, q2) = (&blk[0..16], &blk[16..80]);
+                let sc = &blk[0..16];
                 // The block's values in the order the activations are in, once for every vector in this chunk.
                 let mut qv = [0i8; 256];
-                for g in 0..16 {
-                    let (chunk, half, shift) = (32 * (g / 8), 16 * (g % 2), 2 * ((g % 8) / 2));
-                    let (src, dst) = (&q2[chunk + half..], &mut qv[16 * g..]);
-                    for l in 0..16 {
-                        dst[l] = ((src[l] >> shift) & 3) as i8;
-                    }
-                }
+                unpack(blk, &mut qv);
                 let d = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]]));
                 let dm = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]]));
                 for j in 0..k {

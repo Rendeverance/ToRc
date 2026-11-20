@@ -152,6 +152,63 @@ pub(crate) unsafe fn dot_w32(w: *const i8, a: *const i8) -> i32 {
     }
 }
 
+/// Q2_0's 64 codes - four to a byte, low bits first - written out as the integers -1..2 they stand for. The scalar
+/// form is a shift, a mask and an offset per weight: 64 of them per block, which on a one-vector row (a decoded
+/// token) is the whole cost of reading the block. Here it is a shift and a mask per four codes, and the four runs are
+/// interleaved into the order the weights and activations are in.
+///
+/// The source is Q2_0's block, whose first two bytes are the scale: the codes start at `blk + 2`.
+#[inline(always)]
+pub(crate) unsafe fn unpack_q2_0(blk: *const u8, out: *mut i8) {
+    unsafe {
+        let src = _mm_loadu_si128(blk.add(2) as *const __m128i);
+        let lo3 = _mm_set1_epi8(3);
+        // field g of every byte: shifting the 16-bit pair right by 2g brings bits 2g..2g+1 of its low byte to the
+        // bottom, and the mask drops whatever came over from the byte above it
+        let f = [
+            _mm_and_si128(src, lo3),
+            _mm_and_si128(_mm_srli_epi16::<2>(src), lo3),
+            _mm_and_si128(_mm_srli_epi16::<4>(src), lo3),
+            _mm_and_si128(_mm_srli_epi16::<6>(src), lo3),
+        ];
+        let a = _mm_unpacklo_epi8(f[0], f[1]);
+        let b = _mm_unpacklo_epi8(f[2], f[3]);
+        let c = _mm_unpackhi_epi8(f[0], f[1]);
+        let d = _mm_unpackhi_epi8(f[2], f[3]);
+        let one = _mm256_set1_epi8(1);
+        let w0 = _mm256_sub_epi8(_mm256_setr_m128i(_mm_unpacklo_epi16(a, b), _mm_unpackhi_epi16(a, b)), one);
+        let w1 = _mm256_sub_epi8(_mm256_setr_m128i(_mm_unpacklo_epi16(c, d), _mm_unpackhi_epi16(c, d)), one);
+        _mm256_storeu_si256(out as *mut __m256i, w0);
+        _mm256_storeu_si256(out.add(32) as *mut __m256i, w1);
+    }
+}
+
+/// Q2_K's 256 codes (0..3, plain, no offset) in weight order. Its packing already keeps one weight per byte - the
+/// four fields of a byte belong to the four groups of that byte's parity - so unlike Q2_0 there is nothing to
+/// interleave: four shifts and masks per sixteen source bytes, and each run goes straight to its group. This mirrors
+/// q2_k.rs's own chunk/half/shift reading of the block, byte for byte.
+#[inline(always)]
+pub(crate) unsafe fn unpack_q2_k(blk: *const u8, out: *mut i8) {
+    unsafe {
+        let lo3 = _mm_set1_epi8(3);
+        for h in 0..4usize {
+            // the four 16-byte halves of the code area, which starts after the scales at blk + 16: half h carries the
+            // groups (h / 2) * 8 + 2j + (h % 2) for j in 0..4
+            let src = _mm_loadu_si128(blk.add(16 + 16 * h) as *const __m128i);
+            for j in 0..4usize {
+                let v = match j {
+                    0 => _mm_and_si128(src, lo3),
+                    1 => _mm_and_si128(_mm_srli_epi16::<2>(src), lo3),
+                    2 => _mm_and_si128(_mm_srli_epi16::<4>(src), lo3),
+                    _ => _mm_and_si128(_mm_srli_epi16::<6>(src), lo3),
+                };
+                let g = (h / 2) * 8 + 2 * j + (h % 2);
+                _mm_storeu_si128(out.add(16 * g) as *mut __m128i, v);
+            }
+        }
+    }
+}
+
 /// The 8 fp16 values at p + off, p + stride + off, .., widened exactly (neon.rs fcvtl_x, 8 at once).
 #[inline(always)]
 unsafe fn halves8(p: *const u8, stride: usize, off: usize) -> __m256 {
