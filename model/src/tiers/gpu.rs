@@ -429,26 +429,29 @@ impl Gpu {
     }
 
     /// After a block of `at` split m / n at pos0: the next share from the GPU's and the CPU's speeds on it, cpu seconds
-    /// on the CPU's tokens and wait seconds waiting for the GPU after them. When the GPU finished first its time is
-    /// unknown (at most cpu), so the share only steps up. Kept between SHARE_MIN and 0.95, so both sides keep being
-    /// measured.
+    /// on the CPU's tokens and wait seconds waiting for the GPU after them, `total` the whole block on this path (the
+    /// keys written to the GPU, the submissions, the CPU's tokens, the wait and the read-back). When the GPU finished
+    /// first its time is unknown (at most cpu), so the share only steps up. Kept between SHARE_MIN and 0.95, so both
+    /// sides keep being measured.
     ///
     /// A GPU that does not pay is switched off (share 0, kept in the tune file), on either of two measurements:
     /// - its fair share stays under 2% for 8 blocks running: at the SHARE_MIN floor it would hold the CPU waiting
     ///   on every block;
-    /// - two checks running, each over 32 blocks, find that those blocks took longer with the GPU (cpu + wait) than
-    ///   the CPU would have taken alone at the speed it showed on its own tokens (cpu x the block's work / the CPU's
-    ///   part of it). This catches a GPU that is quick when run alone but slow to start each job (a desktop's
-    ///   integrated GPU beside a fast CPU): its share looks fair on the blocks it finishes first, yet over many blocks
-    ///   the CPU spends longer waiting for it than working. The CPU's speed is taken while the GPU runs beside it, so
-    ///   the comparison leans towards keeping the GPU.
-    fn adapt(&mut self, at: Use, n: usize, m: usize, pos0: usize, cpu: f64, wait: f64) {
+    /// - two checks running, each over 32 blocks, find that those blocks took longer with the GPU (`total`: everything
+    ///   the GPU path costs, not only the CPU's tokens and the wait, so writing the keys across and reading the result
+    ///   back count too) than the CPU would have taken alone at the speed it showed on its own tokens (cpu x the
+    ///   block's work / the CPU's part of it). This catches a GPU that is quick when run alone but slow to start each
+    ///   job (a desktop's integrated GPU beside a fast CPU): its share looks fair on the blocks it finishes first, yet
+    ///   over many blocks the CPU spends longer waiting for it than working. The CPU's speed is taken while the GPU
+    ///   runs beside it, so the comparison leans towards keeping the GPU.
+    #[allow(clippy::too_many_arguments)]
+    fn adapt(&mut self, at: Use, n: usize, m: usize, pos0: usize, cpu: f64, wait: f64, total: f64) {
         if self.fixed.is_some() || m >= n || cpu <= 0.0 {
             return;
         }
         let Some(st) = self.shares.get_mut(&at) else { return };
         let (wg, wc) = (work(m, pos0), work(n, pos0) - work(m, pos0));
-        st.pair += cpu + wait;
+        st.pair += total;
         st.alone += cpu * (wg + wc) / wc;
         let next = if wait > 0.02 * cpu {
             let (rg, rc) = (wg / (cpu + wait), wc / cpu);
@@ -812,12 +815,13 @@ pub fn run_block(
         return Some(hi);
     }
     rb.unmap();
-    for (i, d) in [t1 - t0, t2 - t1, t3 - t2, t3.elapsed()].into_iter().enumerate() {
+    let t4 = std::time::Instant::now();
+    for (i, d) in [t1 - t0, t2 - t1, t3 - t2, t4 - t3].into_iter().enumerate() {
         NS[i].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
     }
     let calls = NS[4].fetch_add(1, Ordering::Relaxed) + 1;
     g.pace(nh, m, pos0, (t3 - t0).as_secs_f64());
-    g.adapt(at, n, m, pos0, (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64());
+    g.adapt(at, n, m, pos0, (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(), (t4 - t0).as_secs_f64());
     // TORC_GPU_STATS=1: where the time went so far, every 256 blocks (a server never reaches torc-run's summary)
     static STATS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switches::on("TORC_GPU_STATS"));
     if *STATS && calls.is_multiple_of(256) {
