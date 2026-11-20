@@ -41,12 +41,14 @@ The executables land in `target/release`. Built with llvm-mingw, copy its `libun
 
 ToRc reads its own format, converted from a GGUF (for a split GGUF, name the first part):
 
+    torc plan model.gguf
     torc convert-gguf model.gguf model.torc
     torc check model.torc
     torc check model.torc --against model.gguf
     torc info model.torc
 
-Always run both checks after a conversion or a copy. `check` verifies every hash and checksum; `--against` compares
+`plan` says whether the model will run here and, if not, why; `convert-gguf` runs it first and refuses a model that
+can't. Always run both checks after a conversion or a copy. `check` verifies every hash and checksum; `--against` compares
 every tensor and expert with the GGUF byte for byte. A file that fails is not to be used. Models keep their own
 licences; ToRc ships no weights.
 

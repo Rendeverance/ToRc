@@ -1,10 +1,11 @@
-//! torc: convert, check and describe model files.
+//! torc: convert, check and describe model files, and say whether one will run (plan).
 
 use format::{check, read::Model};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  torc convert-gguf <in.gguf> <out.torc> [--hash-source]  (a split GGUF: name its first part)
+  torc plan <in.gguf|file.torc>                         (will it run on this build and machine, and if not, why)
+  torc convert-gguf <in.gguf> <out.torc> [--hash-source]  (a split GGUF: name its first part; asks plan first)
   torc gguf-info <in.gguf>
   torc check <file.torc>
   torc check <file.torc> --against <in.gguf>          (every tensor and expert against its source bytes)
@@ -71,7 +72,17 @@ fn info(path: &str) -> format::Result<()> {
 
 fn run(args: &[String]) -> format::Result<()> {
     match args.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
+        ["plan", path] => {
+            let p = model::preflight::check_path(path)
+                .map_err(|e| format::Error(format!("{path} won't run in this build of ToRc: {}", e.0)))?;
+            println!("{path} will run: {}, {} layers, {}", p.arch, p.layers, p.memory_note());
+            Ok(())
+        }
         ["convert-gguf", src, dst, rest @ ..] if rest.is_empty() || rest == ["--hash-source"] => {
+            // the checks the load would make, before the time and the disk go on a file that couldn't run
+            model::preflight::check_path(src).map_err(|e| {
+                format::Error(format!("not converting {src}: it won't run in this build of ToRc: {}", e.0))
+            })?;
             let r = format::convert::convert_gguf(src, dst, !rest.is_empty())?;
             println!(
                 "wrote {dst}: {:.2} GiB, {} tensors, {} MoE layers, {:.1} s",

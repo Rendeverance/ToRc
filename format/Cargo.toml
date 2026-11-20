@@ -4,14 +4,10 @@ version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The ToRc model file format: reader, writer, GGUF converter, checker and shards"
+description = "The ToRc model file format: reader, writer, GGUF converter, checker and shards (the torc command that drives them is in torc-model, which also knows what a model needs to run)"
 
 [lib]
 name = "format"
-
-[[bin]]
-name = "torc"
-path = "src/bin/torc.rs"
 
 [dependencies]
 blake3 = { version = "1", features = ["rayon", "pure"] }

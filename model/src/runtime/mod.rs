@@ -10,6 +10,7 @@ pub mod markfile;
 pub mod pipe;
 pub mod plan;
 pub mod pool;
+pub mod preflight;
 pub mod profile;
 pub mod repack;
 pub mod scratch;

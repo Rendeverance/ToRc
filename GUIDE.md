@@ -52,13 +52,16 @@ The executables land in `target/release`. Built with llvm-mingw (gnullvm), they 
 ToRc has its own model format ([FORMAT.md](FORMAT.md)), converted from GGUF (a split GGUF: name its first part):
 
 ```
+torc plan model.gguf
 torc convert-gguf model.gguf model.torc
 torc check model.torc
 torc check model.torc --against model.gguf
 torc info model.torc
 ```
 
-`check` verifies the hashes and every checksum, `--against` compares every tensor and expert with the GGUF byte for
+`plan` tells you in a second or two whether a model will run and, if not, why (an architecture or a weight type
+ToRc doesn't run yet, or a model it runs only in its mixture-of-experts form), and how it fits your memory.
+`convert-gguf` asks it first, so a model that couldn't run isn't converted. `check` verifies the hashes and every checksum, `--against` compares every tensor and expert with the GGUF byte for
 byte, and `info` tells you what's in the file. ToRc doesn't ship weights - models keep their own licences.
 
 ## Running it

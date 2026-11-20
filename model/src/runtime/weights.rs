@@ -190,6 +190,25 @@ pub(crate) fn total_phys() -> Option<u64> {
 
 /// ggml's name for a weight type, for the messages (the types a .torc file can hold that have no kernel here, and
 /// the common ones).
+/// The first weight of `file` (a tensor or an expert piece) whose type ToRc has no kernel for, with that type.
+pub fn unsupported_weight(file: &File) -> Option<(String, u32)> {
+    let pieces = file.experts.iter().flat_map(|x| x.pack.pieces().map(|p| (&p.name, p.ty)));
+    file.tensors
+        .iter()
+        .map(|t| (&t.name, t.ty))
+        .chain(pieces)
+        .find(|&(_, ty)| kernels::dequant::block_geometry(ty).is_none())
+        .map(|(name, ty)| (name.clone(), ty))
+}
+
+/// What the load and the preflight say about such a weight.
+pub fn unsupported_message(name: &str, ty: u32) -> String {
+    format!(
+        "{name} is {}, a type ToRc has no kernel for yet. Use a file of this model without it (a Q4_K_M or Q4_0, say)",
+        type_name(ty)
+    )
+}
+
 fn type_name(ty: u32) -> String {
     let n = match ty {
         0 => "F32",
@@ -333,19 +352,8 @@ impl Weights {
         let file = File::open(path)?;
         // a weight of a type ToRc has no kernel for stops the load here, named, rather than panicking in the first
         // reply that reaches it (a file holding Q8_K weights, say: the format can carry it, the engine cannot read it)
-        let pieces = file.experts.iter().flat_map(|x| x.pack.pieces().map(|p| (&p.name, p.ty)));
-        if let Some((name, ty)) = file
-            .tensors
-            .iter()
-            .map(|t| (&t.name, t.ty))
-            .chain(pieces)
-            .find(|&(_, ty)| kernels::dequant::block_geometry(ty).is_none())
-        {
-            return err(format!(
-                "{path}: {name} is {}, a type ToRc has no kernel for yet. Use a file of this model without it (a \
-                 Q4_K_M or Q4_0, say)",
-                type_name(ty)
-            ));
+        if let Some((name, ty)) = unsupported_weight(&file) {
+            return err(format!("{path}: {}", unsupported_message(&name, ty)));
         }
         let handle = fs::File::open(path)?;
         // SAFETY: the model file is not modified while it is mapped (it is only read, and model files do not change)

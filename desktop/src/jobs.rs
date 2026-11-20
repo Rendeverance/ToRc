@@ -244,7 +244,19 @@ impl Shell {
         let first = String::from_utf8_lossy(&info.stdout).lines().next().unwrap_or("").to_string();
         let arch = first.split(", arch ").nth(1).and_then(|r| r.split(',').next()).unwrap_or("").trim().to_string();
         let archs = run("torc-server", &["--archs"]).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        let supported = archs.as_deref().is_some_and(|l| l.split(' ').any(|a| a == arch));
+        // torc plan makes the load's own checks (architecture, weight types, the model's settings, each layer's
+        // experts), so a model that couldn't run is refused here, with the reason, before it is converted
+        let mut plan = Command::new(bin.join(format!("torc{EXE}")));
+        crate::without_app_vars(&mut plan);
+        let plan = quiet(plan.args(["plan", src])).output().ok();
+        let supported = plan.as_ref().is_some_and(|o| o.status.success());
+        let why = plan
+            .filter(|o| !o.status.success())
+            .map(|o| {
+                let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                e.split_once("won't run in this build of ToRc: ").map_or(e.clone(), |(_, w)| w.to_string())
+            })
+            .unwrap_or_default();
         let src_path = PathBuf::from(src);
         let stem = src_path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let folder =
@@ -252,7 +264,7 @@ impl Shell {
         let out = folder.unwrap_or_default().join(format!("{stem}.torc"));
         let bytes = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
         let free = out.parent().and_then(free_bytes);
-        json!({"ok": true, "arch": arch, "supported": supported, "archs": archs.unwrap_or_default(),
+        json!({"ok": true, "arch": arch, "supported": supported, "why": why, "archs": archs.unwrap_or_default(),
             "bytes": bytes, "free": free, "out": out.display().to_string()})
     }
 

@@ -271,9 +271,10 @@ async function openConvert(src) {
   if (!c.ok) return body.append(el('div', 'note warn', c.error));
   const gb = (c.bytes / 2 ** 30).toFixed(1);
   if (!c.supported) {
-    return body.append(
-      el('div', 'note warn', `This is a ${c.arch} model, which ToRc doesn't run yet. It runs: ${c.archs}.`),
-    );
+    const why = c.why
+      ? `This model won't run in ToRc yet: ${c.why}.`
+      : `This is a ${c.arch} model, which ToRc doesn't run yet. It runs: ${c.archs}.`;
+    return body.append(el('div', 'note warn', why));
   }
   const out = field('text', c.out, () => {});
   const free = c.free == null ? '' : ` (${(c.free / 2 ** 30).toFixed(1)} GB free)`;

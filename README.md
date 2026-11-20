@@ -223,7 +223,8 @@ The programs you use:
   reads a file of token ids and writes each position's logits, which is how every faster path is checked against the
   plain one:
   `torc-run <model> <tokens.int32> [n] [threads|auto] [block=N] [nologits] [dump=logits.f32] [ref=reference.f32]`
-- `torc convert-gguf <in.gguf> <out.torc>`: makes a ToRc file (`torc` also checks and describes one)
+- `torc convert-gguf <in.gguf> <out.torc>`: makes a ToRc file (`torc` also checks and describes one, and
+  `torc plan <model>` says whether a model will run, and if not, why)
 - `hwscan`: what this machine has (CPU, memory, GPU, NPU), for the benchmark's CSV. The full inventory is Windows-only
   for now: on a Mac it knows the CPU's name, the memory and the CPU count, on Linux the CPU count and little else
 

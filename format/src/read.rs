@@ -40,6 +40,31 @@ impl Model {
         self.tensors.iter().find(|t| t.name == name)
     }
 
+    /// The model a converter's plan describes (write::plan), held in memory: the directory, regions and blocks the
+    /// written file would have, with CRCs, region hashes and the model id still zero. `path` names the source.
+    pub fn from_plan(path: &str, p: crate::write::Plan) -> Model {
+        let header = Header {
+            file_bytes: p.file_bytes,
+            directory: p.directory,
+            resident: p.resident,
+            experts: p.experts,
+            model_id: [0; 32],
+            arch: p.arch,
+        };
+        let blocks = blocks::blocks(&header.arch, &p.dir);
+        Model {
+            path: path.into(),
+            metadata: p.dir.metadata,
+            source: p.dir.source,
+            tensors: p.dir.tensors,
+            experts: p.dir.experts,
+            blocks,
+            resident: p.resident,
+            expert_region: p.experts,
+            header,
+        }
+    }
+
     pub fn open(path: &str) -> Result<Model> {
         let mut f = File::open(path).map_err(|e| Error(format!("cannot open {path}: {e}")))?;
         let len = f.metadata()?.len();

@@ -278,8 +278,75 @@ fn hash_file(path: &str) -> Result<[u8; 32]> {
 
 /// Converts `src` (a GGUF, or the first part of a split one) into the ToRc file `dst`. `hash_source`: also record each
 /// source file's BLAKE3 (a full extra read of the GGUF).
+/// A GGUF read and laid out as a ToRc file, nothing written yet: what convert_gguf writes, and what plan_gguf checks.
+struct Prepared {
+    g: Gguf,
+    plan: write::Plan,
+    /// each resident tensor's source (bytes, columns), in the plan's order
+    sources: Vec<(u64, u64)>,
+    /// each MoE record's pieces' sources (bytes, columns), in the plan's order
+    piece_src: Vec<[(u64, u64); 3]>,
+    n_tensors: usize,
+    n_layers: usize,
+}
+
+/// The file a GGUF would become, laid out in memory without writing it: its directory, regions and blocks, as
+/// read::Model::open would find them in the converted file (CRCs and hashes zero). For checking a model before
+/// spending the time and the disk on converting it.
+pub fn plan_gguf(src: &str) -> Result<crate::read::Model> {
+    let p = prepare(src, false)?;
+    Ok(crate::read::Model::from_plan(src, p.plan))
+}
+
 pub fn convert_gguf(src: &str, dst: &str, hash_source: bool) -> Result<Report> {
     let t0 = Instant::now();
+    let Prepared { g, plan, sources, piece_src, n_tensors, n_layers } = prepare(src, hash_source)?;
+
+    let mut srcs = g.files.iter().map(File::open).collect::<std::io::Result<Vec<_>>>()?;
+    let tens: Vec<Tensor> = plan.dir.tensors.clone();
+    let xs: Vec<Experts> = plan.dir.experts.clone();
+    let mut tmp = Vec::new();
+    let srcs_cell = std::cell::RefCell::new(&mut srcs);
+    let tmp_cell = std::cell::RefCell::new(&mut tmp);
+    let h = write::write(
+        dst,
+        plan,
+        |i, at, buf| {
+            let t = &tens[i];
+            let (sb, sc) = sources[i];
+            let m = SourceMatrix { origin: t.origin, ty: t.ty, src_bytes: sb, src_cols: sc, dst_cols: t.dims[0] };
+            let mut s = srcs_cell.borrow_mut();
+            source_range(&mut s[t.origin.file as usize], &m, at, buf, &mut tmp_cell.borrow_mut())
+        },
+        |j, e, buf| {
+            let x = &xs[j];
+            let mut s = srcs_cell.borrow_mut();
+            for (k, pc) in x.pack.pieces().into_iter().enumerate() {
+                let (sb, sc) = piece_src[j][k];
+                let origin = Origin { offset: pc.origin.offset + e as u64 * pc.stride, ..pc.origin };
+                let m = SourceMatrix { origin, ty: pc.ty, src_bytes: sb, src_cols: sc, dst_cols: pc.cols as u64 };
+                let at = pc.at as usize;
+                source_range(
+                    &mut s[pc.origin.file as usize],
+                    &m,
+                    0,
+                    &mut buf[at..at + pc.bytes as usize],
+                    &mut tmp_cell.borrow_mut(),
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(Report {
+        file_bytes: h.file_bytes,
+        tensors: n_tensors,
+        moe_layers: n_layers,
+        seconds: t0.elapsed().as_secs_f64(),
+    })
+}
+
+/// Reads a GGUF and lays it out: everything convert_gguf does before it writes a byte.
+fn prepare(src: &str, hash_source: bool) -> Result<Prepared> {
     let g = Gguf::open(src)?;
     let meta = meta::Meta::parse(&g.metadata)?;
     let n_used = meta.arch_u32("expert_used_count").unwrap_or(0);
@@ -360,48 +427,7 @@ pub fn convert_gguf(src: &str, dst: &str, hash_source: bool) -> Result<Report> {
     let n_tensors = dir.tensors.len();
     let n_layers = dir.experts.len();
     let plan = write::plan(dir, &g.arch)?;
-
-    let mut srcs = g.files.iter().map(File::open).collect::<std::io::Result<Vec<_>>>()?;
-    let tens: Vec<Tensor> = plan.dir.tensors.clone();
-    let xs: Vec<Experts> = plan.dir.experts.clone();
-    let mut tmp = Vec::new();
-    let srcs_cell = std::cell::RefCell::new(&mut srcs);
-    let tmp_cell = std::cell::RefCell::new(&mut tmp);
-    let h = write::write(
-        dst,
-        plan,
-        |i, at, buf| {
-            let t = &tens[i];
-            let (sb, sc) = sources[i];
-            let m = SourceMatrix { origin: t.origin, ty: t.ty, src_bytes: sb, src_cols: sc, dst_cols: t.dims[0] };
-            let mut s = srcs_cell.borrow_mut();
-            source_range(&mut s[t.origin.file as usize], &m, at, buf, &mut tmp_cell.borrow_mut())
-        },
-        |j, e, buf| {
-            let x = &xs[j];
-            let mut s = srcs_cell.borrow_mut();
-            for (k, pc) in x.pack.pieces().into_iter().enumerate() {
-                let (sb, sc) = piece_src[j][k];
-                let origin = Origin { offset: pc.origin.offset + e as u64 * pc.stride, ..pc.origin };
-                let m = SourceMatrix { origin, ty: pc.ty, src_bytes: sb, src_cols: sc, dst_cols: pc.cols as u64 };
-                let at = pc.at as usize;
-                source_range(
-                    &mut s[pc.origin.file as usize],
-                    &m,
-                    0,
-                    &mut buf[at..at + pc.bytes as usize],
-                    &mut tmp_cell.borrow_mut(),
-                )?;
-            }
-            Ok(())
-        },
-    )?;
-    Ok(Report {
-        file_bytes: h.file_bytes,
-        tensors: n_tensors,
-        moe_layers: n_layers,
-        seconds: t0.elapsed().as_secs_f64(),
-    })
+    Ok(Prepared { g, plan, sources, piece_src, n_tensors, n_layers })
 }
 
 #[cfg(test)]
