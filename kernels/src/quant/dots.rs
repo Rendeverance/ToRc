@@ -8,6 +8,10 @@
 //! is written out (x86mm::dot_w16, dot_w32); elsewhere the loop below runs, unchanged from the per-format code it came
 //! out of. The x86 arm is gated on the same three features `platform::cpu::x86mm` is a module behind, so a build
 //! without them - a plain x86-64 target, or any other arch - takes the scalar loop instead of failing to name it.
+//!
+//! On aarch64 dot_w32 is written out too (neon::dot_w32). There the compiler does vectorise these loops, well enough
+//! for the 16-wide ones (IQ2_S and IQ2_XS measured 3 to 7 % slower through NEON's form), but Q2_0 measured +12 to
+//! +68 % at 2-64 vectors through it, and IQ3_XXS level (Snapdragon X, bench_portable_quants, three rounds each).
 
 /// Sixteen weights against sixteen activations.
 #[inline(always)]
@@ -47,7 +51,12 @@ pub(crate) fn dot_w32(w: &[i8], a: &[i8]) -> i32 {
     debug_assert!(w.len() >= 32 && a.len() >= 32);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
     return unsafe { crate::x86mm::dot_w32(w.as_ptr(), a.as_ptr()) };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")))]
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { crate::neon::dot_w32(w.as_ptr(), a.as_ptr()) };
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"),
+        target_arch = "aarch64"
+    )))]
     {
         let mut s = 0i32;
         for j in 0..32 {

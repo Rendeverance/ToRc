@@ -20,6 +20,8 @@ fn dot_group(w: &[i8], a: &[i8]) -> i32 {
 /// A block's 256 values, in the order the activations are in: group g's values at byte `g % 2 * 16` of its 32-byte
 /// half, shifted `(g % 8) / 2 * 2` bits. On x86-64 that reading is four shifts and masks per sixteen source bytes,
 /// each run going to its group as is (x86mm::unpack_q2_k); elsewhere it is one code at a time, as the format is packed.
+/// (On aarch64 the compiler vectorises this loop well: neon::unpack_q2_k measured 3 to 4 % slower here at 2-8 vectors
+/// on a Snapdragon X, so it is used only for one vector, in ints_from_block.)
 #[inline(always)]
 fn unpack(blk: &[u8], qv: &mut [i8; 256]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
@@ -38,22 +40,34 @@ fn unpack(blk: &[u8], qv: &mut [i8; 256]) {
 
 /// One block against one vector: the scale-weighted sum of the value dots, and the sums of the activations over the
 /// groups weighted by the group minima. With a single vector nothing is shared, so this is the whole of reading the
-/// block; on x86-64 it unpacks by the run and uses the shared dots, elsewhere it takes the codes straight from the
-/// block, which needs no buffer for a block one vector sees once.
+/// block; on x86-64 and aarch64 it unpacks by the run and uses the shared dots (on aarch64 through neon::unpack_q2_k:
+/// 9.2 -> 12.5 GMAC/s on a Snapdragon X), elsewhere it takes the codes straight from the block, which needs no buffer
+/// for a block one vector sees once.
 #[inline(always)]
 fn ints_from_block(blk: &[u8], xa: &BlockQ8K) -> (i32, i32) {
     let sc = &blk[0..16];
     let (mut sumi, mut summs) = (0i32, 0i32);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"),
+        target_arch = "aarch64"
+    ))]
     {
         let mut qv = [0i8; 256];
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            crate::neon::unpack_q2_k(blk.as_ptr(), qv.as_mut_ptr())
+        };
+        #[cfg(not(target_arch = "aarch64"))]
         unpack(blk, &mut qv);
         for g in 0..16 {
             sumi += (sc[g] & 0xF) as i32 * dot_group(&qv[16 * g..], &xa.qs[16 * g..]);
             summs += xa.bsums[g] as i32 * (sc[g] >> 4) as i32;
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")))]
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"),
+        target_arch = "aarch64"
+    )))]
     for g in 0..16 {
         let (chunk, half, shift) = (32 * (g / 8), 16 * (g % 2), 2 * ((g % 8) / 2));
         let mut isuml = 0i32;

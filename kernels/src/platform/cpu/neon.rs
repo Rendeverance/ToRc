@@ -642,6 +642,74 @@ unsafe fn q4x4_pass<const NV: usize>(w: &[u8], rows: usize, x: &[Groups32], nb: 
 
 pub use crate::lay::{Q8_LAY_GROUP, q8_0_lay4};
 
+/// Sixteen int8 weights against sixteen int8 activations, exactly: each product fits int16 (|w a| <= 128 x 128), the
+/// pairs are widened into int32 and summed, so any order gives the same integer. Baseline NEON (no DotProd), so every
+/// aarch64 core takes it. quant::iq1_m calls it, having measured faster through it, and quant::dots::dot_w32 takes
+/// dot_w32 on aarch64; the 16-wide shared loop stays the compiler's, which measured faster for IQ2_S and IQ2_XS.
+///
+/// # Safety
+/// w and a must each point at 16 readable bytes.
+#[inline(always)]
+pub(crate) unsafe fn dot_w16(w: *const i8, a: *const i8) -> i32 {
+    unsafe {
+        let (wv, av) = (vld1q_s8(w), vld1q_s8(a));
+        let s = vpaddlq_s16(vmull_s8(vget_low_s8(wv), vget_low_s8(av)));
+        vaddvq_s32(vpadalq_s16(s, vmull_high_s8(wv, av)))
+    }
+}
+
+/// dot_w16 over 32 weights.
+///
+/// # Safety
+/// w and a must each point at 32 readable bytes.
+#[inline(always)]
+pub(crate) unsafe fn dot_w32(w: *const i8, a: *const i8) -> i32 {
+    unsafe {
+        let (w0, a0, w1, a1) = (vld1q_s8(w), vld1q_s8(a), vld1q_s8(w.add(16)), vld1q_s8(a.add(16)));
+        let mut s = vpaddlq_s16(vmull_s8(vget_low_s8(w0), vget_low_s8(a0)));
+        s = vpadalq_s16(s, vmull_high_s8(w0, a0));
+        s = vpadalq_s16(s, vmull_s8(vget_low_s8(w1), vget_low_s8(a1)));
+        vaddvq_s32(vpadalq_s16(s, vmull_high_s8(w1, a1)))
+    }
+}
+
+/// Q2_0's 64 codes (four to a byte, low bits first, after the block's 2-byte scale) as the integers -1..2 they stand
+/// for: one shift and mask per field, and vst4q writes the four fields interleaved, which is the weights' own order
+/// (weight 4i + k is field k of byte i). The same bytes as the scalar unpack in quant::q2_0.
+///
+/// # Safety
+/// blk must point at an 18-byte Q2_0 block and out at 64 writable bytes.
+#[inline(always)]
+pub(crate) unsafe fn unpack_q2_0(blk: *const u8, out: *mut i8) {
+    unsafe {
+        let (src, m3, one) = (vld1q_u8(blk.add(2)), vdupq_n_u8(3), vdupq_n_s8(1));
+        let f = |v: uint8x16_t| vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m3)), one);
+        let fields = int8x16x4_t(f(src), f(vshrq_n_u8::<2>(src)), f(vshrq_n_u8::<4>(src)), f(vshrq_n_u8::<6>(src)));
+        vst4q_s8(out, fields);
+    }
+}
+
+/// Q2_K's 256 codes (0..3, no offset) in the order the activations are in: each 16-byte quarter of the code area
+/// (after the 16 bytes of scales) holds four groups, field j of quarter h being group (h / 2) * 8 + 2j + h % 2, as
+/// quant::q2_k reads it. The same bytes as that scalar unpack.
+///
+/// # Safety
+/// blk must point at an 84-byte Q2_K block and out at 256 writable bytes.
+#[inline(always)]
+pub(crate) unsafe fn unpack_q2_k(blk: *const u8, out: *mut i8) {
+    unsafe {
+        let m3 = vdupq_n_u8(3);
+        for h in 0..4usize {
+            let src = vld1q_u8(blk.add(16 + 16 * h));
+            let v = [src, vshrq_n_u8::<2>(src), vshrq_n_u8::<4>(src), vshrq_n_u8::<6>(src)];
+            for (j, f) in v.into_iter().enumerate() {
+                let g = (h / 2) * 8 + 2 * j + h % 2;
+                vst1q_s8(out.add(16 * g), vreinterpretq_s8_u8(vandq_u8(f, m3)));
+            }
+        }
+    }
+}
+
 /// A 4-row layout for gemm_x4 / x4_matmul. Each block position (32 weights of 4 rows) takes GROUP bytes, the 4 fp16
 /// scales first. ops gives tile t's (rows 2t and 2t + 1) four SMMLA A operands as signed bytes ([row i w0-7, row j
 /// w0-7], [w8-15, w8-15], [w16-23, w16-23], [w24-31, w24-31]); BIAS means they are nibbles, so 8 x the activations' sum

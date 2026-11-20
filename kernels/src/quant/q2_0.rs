@@ -21,33 +21,46 @@ fn dot_group(w: &[i8], a: &[i8]) -> i32 {
 
 /// One block's 64 weights, unpacked to integers in -1..2: the codes offset by -1 as they are read, so the dots below
 /// need no separate offset term. Weights 0-31 of a block belong to the vector's first activation group of the pair,
-/// weights 32-63 to the second. On x86-64 the whole run comes out of one shift and mask per four codes
-/// (x86mm::unpack_q2_0); elsewhere it is read one code at a time, as the format is packed.
+/// weights 32-63 to the second. On x86-64 and aarch64 the whole run comes out of one shift and mask per four codes
+/// (x86mm::unpack_q2_0, neon::unpack_q2_0); elsewhere it is read one code at a time, as the format is packed.
 #[inline(always)]
 fn unpack(blk: &[u8], qv: &mut [i8; 64]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
     unsafe {
         crate::x86mm::unpack_q2_0(blk.as_ptr(), qv.as_mut_ptr())
     };
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")))]
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        crate::neon::unpack_q2_0(blk.as_ptr(), qv.as_mut_ptr())
+    };
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"),
+        target_arch = "aarch64"
+    )))]
     for j in 0..64 {
         qv[j] = ((blk[2 + j / 4] >> (2 * (j % 4))) & 3) as i8 - 1;
     }
 }
 
 /// The two integer dots of one block (64 weights) against one vector's two activation groups. Where there is only one
-/// vector to serve there is no block shared between vectors, so this is the whole of reading it: on x86-64 that is the
-/// vector unpack and the shared dots, and elsewhere the codes are taken straight from the block, which needs no buffer
-/// for a block only one vector sees.
+/// vector to serve there is no block shared between vectors, so this is the whole of reading it: on x86-64 and
+/// aarch64 that is the vector unpack and the shared dots, and elsewhere the codes are taken straight from the block,
+/// which needs no buffer for a block only one vector sees.
 #[inline(always)]
 fn ints_from_block(blk: &[u8], xa: &Groups32, h: usize) -> (i32, i32) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"),
+        target_arch = "aarch64"
+    ))]
     {
         let mut qv = [0i8; 64];
         unpack(blk, &mut qv);
         (dot_group(&qv[..32], &xa.qs[64 * h..]), dot_group(&qv[32..], &xa.qs[64 * h + 32..]))
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c")))]
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma", target_feature = "f16c"),
+        target_arch = "aarch64"
+    )))]
     {
         let (mut s0, mut s1) = (0i32, 0i32);
         for j in 0..32 {

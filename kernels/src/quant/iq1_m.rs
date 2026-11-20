@@ -17,9 +17,15 @@ const IQ1M_DELTA: f32 = 0.125;
 /// and applied to all of them.
 const VECTORS: usize = 16;
 
-/// Sixteen values against the same sixteen activations - the width one of the group's two scales covers.
+/// Sixteen values against the same sixteen activations - the width one of the group's two scales covers. On aarch64
+/// through neon::dot_w16, measured on a Snapdragon X (bench_portable_quants, three rounds each): +5 to +12 % at 2-64
+/// vectors, level at one. (IQ2_S and IQ2_XS keep the shared loop there: through neon::dot_w16 they were 3 to 7 %
+/// slower, the compiler's own vectorising of that loop being the better one for them.)
 #[inline(always)]
 fn dot_half(w: &[i8], a: &[i8]) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { crate::neon::dot_w16(w.as_ptr(), a.as_ptr()) };
+    #[cfg(not(target_arch = "aarch64"))]
     super::dots::dot_w16(w, a)
 }
 
