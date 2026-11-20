@@ -126,9 +126,13 @@ bits are pinned by `kernels/tests/parity.rs`: every path for a type gives the sa
 and vector, and every product is within rounding of an f64 product of the weights dequantised by ggml's definitions.
 
 **Portable:** Q2_K / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ1_M, ported from ggml's generic `ggml_vec_dot_*_q8_K`
-kernels and their tables (`kernels::quant::{q2k, iq2xxs, iq2xs, iq2s, iq3xxs, iq1m}_matmul_scalar`). No vector kernel
-covers them yet on either CPU, so `model/src/layers/moe.rs::native_multi` runs these for every target - which is what
-lets a model whose tensors are mixed quants of this family (GSQ-RCO and the like) run without requantising it. Their
+kernels and their tables (`kernels::quant::{q2k, iq2xxs, iq2xs, iq2s, iq3xxs, iq1m}_matmul_scalar`), and Q2_0 from
+`ggml_vec_dot_q2_0_q8_0` (`q2_0_matmul_scalar`, over the 32-wide groups). `model/src/layers/moe.rs::native_multi` runs
+these for every target - which is what lets a model whose tensors are mixed quants of this family (GSQ-RCO and the
+like) run without requantising it. Inside them, the int8 dots are vector code where it measured faster
+(`kernels::quant::dots`: x86 AVX2 for all, NEON's dot_w32 for Q2_0 and IQ3_XXS and dot_w16 for IQ1_M), and Q2_0 and
+Q2_K blocks are unpacked by the run (x86mm / neon `unpack_q2_0`, `unpack_q2_k`); the integers are the same, so the bits
+are (parity tests, `torc-golden`). Their
 grids and sign tables are copied unchanged by `scripts/gen_ggml_tables.py`.
 
 **Activations (`kernels::Q8`: each 256 numbers quantised twice, into two arrays side by side. `k` is ggml's block_q8_K,

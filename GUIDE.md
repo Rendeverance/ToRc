@@ -15,7 +15,7 @@ I also wanted it to fit the machine rather than the other way round - measure wh
 ## What runs
 
 - **Models:** Qwen3.6-35B-A3B, Qwen3-30B-A3B, Qwen3.8 Flash Next (bigger than RAM, best on two machines), Qwen3-Next 80B, Qwen3.5 122B and the dense Qwen3.5 models, ERNIE-4.5-21B-A3B, GLM-4.7-Flash, Moonlight, LFM2.5-8B, Gemma 4 26B-A4B and gpt-oss. One server, `torc-server`, runs all of them.
-- **Quant types:** Q4_0, Q4_1, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4, plus Q2_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ1_M through portable kernels that run on any CPU.
+- **Quant types:** Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4, plus Q2_K, Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ1_M through portable kernels that run on any CPU (Q2_K and Q2_0 with vector code on x86 and ARM). `torc plan <model>` tells you whether a file will run before you convert it.
 - **Hardware:** ARM64 (NEON, dotprod, i8mm) and x86-64 (AVX2, and AVX-VNNI or AVX512-VNNI), on Windows and Linux. The Snapdragon X NPU for reading prompts. A second machine as a pipeline worker, over USB4 or a network.
 - **Clients:** anything that speaks OpenAI chat completions, the OpenAI Responses API or Anthropic messages. There is a desktop app too, ToRc (see The desktop app, below).
 
@@ -79,6 +79,7 @@ A few things it does for you:
 - **Prompts aren't read twice.** The next turn of a chat reads only the new messages, and a chat you come back to later picks up from a saved state on disk. The README has the details.
 - **Drafting.** On models with an MTP block (the Qwen ones; Gemma 4 drafts with its assistant model instead, `TORC_DRAFT`), the server drafts tokens with the model's own prediction block and checks them in one pass. It decides how many to draft on each pass from what a pass costs on your machine. At the default settings the reply is the same tokens either way, just quicker. Not every GGUF keeps the block, as some conversions leave it out: without it the model still runs, just without drafts, and `TORC_MTP_FILE` can add the block from a file of its own.
 - **Sampling.** Greedy by default. On every model `temperature`, `top_k` (40 unless you set it), `top_p`, `seed`, `presence_penalty` and `frequency_penalty` work as you'd expect, and a seeded reply is the same with drafting on or off. The desktop app sends each model maker's recommended settings unless you choose others (Load a model, Replies).
+- **Thinking and effort.** `"chat_template_kwargs": {"enable_thinking": false}` (or `"think": false`, or `"reasoning_effort": "none"`) turns thinking off on the models that allow it. On gpt-oss, `"reasoning_effort"` of `low`, `medium` or `high` sets how much it reasons, medium when it's left out. The app has a Thinking button beside the message box, and an Effort button for gpt-oss.
 - **Reply length.** A request that doesn't set `max_tokens` (or `max_output_tokens` on the Responses API) gets up to 4096 tokens, thinking included. A thinking model can use a couple of thousand of those before it answers, so if you set your own limit, leave it room.
 
 For a quick test of a Qwen model without a client, `torc-chat model.torc "Hello"` prints one reply (it writes the Qwen chat format only; for any other model, start the server).

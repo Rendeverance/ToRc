@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.7 (20 November 2026)
+
+Thank you to RainerSC for three pull requests: seven more weight types, so the smallest quants of the big models now
+load, and faster two-bit kernels. And thank you to Practical-Trick3332 on Reddit for detailed Snapdragon measurements
+and feedback which contributed to the commits in this release:
+
+- Seven more weight types (RainerSC): Q2_K, Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ1_M. Unsloth's smallest
+  quants, the GSQ-RCO releases and the 2-bit GSQ-hybrid 35B now load. IQ1_S isn't supported yet.
+- Faster two-bit weights (RainerSC on x86, ours on ARM), same results bit for bit: the GSQ-hybrid 35B writes at 29
+  tok/s instead of 12.7 on a 13900K, and 30.5 instead of 17 on a Snapdragon X.
+- `torc plan <file>` tells you in a second or two whether a model will run, and if not, why. Converting and the app
+  check it first.
+- The GPU attention tier switches itself off where it doesn't help (Gemma 4 on Snapdragon with the NPU), and
+  remembers that between starts.
+- ARM: Q3_K files read about 40% faster and write 20 to 50% faster on a Snapdragon X, same results bit for bit
+  (needs I8MM: Snapdragon X, Apple M2 and later).
+- gpt-oss gets an Effort button: low, medium or high.
+- The app tells you when it couldn't save your settings, and a narrow window no longer hides the speeds.
+- Docs: NPU memory on Windows, one machine against two, active parameters, the full list of quant types, and
+  thinking and effort for API clients.
+- CI: actions/checkout v5.
+
 ## 0.1.6 (19 November 2026)
 
 Mostly for Mac users (Mac changes have not been tested fully on a Mac yet), plus monitoring fixes and a Thinking
