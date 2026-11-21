@@ -149,10 +149,10 @@ fn argmax(l: &[f32]) -> u32 {
 
 impl Engine {
     /// The MTP block's keys and values over what this reply's prompt read (positions start..last, as logged by
-    /// prefill): the rows before the last, each with the token after it (token q + 1 with hidden row q). Returns the
-    /// last row, which mtp_start runs in full with the reply's first token, or None if the log does not cover those
-    /// positions.
-    fn mtp_fill(&mut self, ids: &[u32], start: usize) -> format::Result<Option<Vec<f32>>> {
+    /// prefill): the rows before the last, each with the token after it (token q + 1 with hidden row q), from row
+    /// `from` on (the rows before it are filled already, see mtp_fill_to). Returns the last row, which mtp_start runs
+    /// in full with the reply's first token, or None if the log does not cover those positions.
+    fn mtp_fill(&mut self, ids: &[u32], start: usize, from: usize) -> format::Result<Option<Vec<f32>>> {
         let last = ids.len() - 1;
         let dm = self.m.hidden_width();
         let Some((s0, log)) = self.m.take_hidden_log() else { return Ok(None) };
@@ -161,10 +161,17 @@ impl Engine {
             return Ok(None);
         }
         self.m.mtp_note(ids)?;
-        if rows > 1 {
-            self.m.mtp_fill(&ids[start + 1..=last], &log[..(rows - 1) * dm], start as u32)?;
+        if from < last {
+            self.m.mtp_fill(&ids[from + 1..=last], &log[(from - start) * dm..(rows - 1) * dm], from as u32)?;
         }
         Ok(Some(log[(rows - 1) * dm..].to_vec()))
+    }
+
+    /// The MTP block's keys and values over the prompt rows start..to, out of the log so far, for a state about to be
+    /// saved at `to`. The file carries the block's cache, and a server that loads it drafts over those rows without
+    /// having read them. Returns the row mtp_fill goes on from: `to`, or `start` if the log does not hold the rows.
+    fn mtp_fill_to(&mut self, ids: &[u32], start: usize, to: usize) -> format::Result<usize> {
+        Ok(if self.m.mtp_fill_logged(&ids[start + 1..=to], start as u32)? { to } else { start })
     }
 
     /// Makes the first draft from the prompt's last row (tail, from mtp_fill) with token t, the first token of the
@@ -634,6 +641,8 @@ impl Engine {
         let ck_min = crate::switches::num::<usize>("TORC_CHECKPOINT_MIN").unwrap_or(512);
         // the last checkpoint both machines took: (position, state)
         let mut good: Option<(usize, crate::Mark)> = None;
+        // the first prompt row whose MTP keys and values are still to fill
+        let mut mtp_from = start;
         for &(a, b) in segs {
             let ck = if ckn > 0 && self.m.piped() && b - a > ckn { ckn } else { b - a };
             let (mut p, mut tries) = (a, 0);
@@ -708,6 +717,7 @@ impl Engine {
                 self.sysmark = Some((ids[..sys].to_vec(), self.m.try_save_mark(1)?));
                 // already on disk (read again after its state was dropped from RAM), so it is not written again
                 if !self.saved.iter().any(|x| x[..] == ids[..sys]) {
+                    mtp_from = self.mtp_fill_to(&ids, start, sys)?;
                     let t = std::time::Instant::now();
                     match self.m.mark_save(&ids[..sys]) {
                         Ok(()) => {
@@ -741,7 +751,8 @@ impl Engine {
         self.seen.extend_from_slice(&ids[self.seen.len()..]);
         // the MTP block's keys and values over the prompt are part of reading it (pipelined speculation takes the
         // prompt's rows itself)
-        let mut mtp_tail = if drafting && !(pipespec && max > 0) { self.mtp_fill(&ids, start)? } else { None };
+        let mut mtp_tail =
+            if drafting && !(pipespec && max > 0) { self.mtp_fill(&ids, start, mtp_from)? } else { None };
         let prompt_s = t0.elapsed().as_secs_f64();
         self.metric(json!({"event": "first_token", "reply": rn, "prompt_seconds": prompt_s}));
         // TORC_PROF=1: this machine's share of the prompt, then of the reply, per row or token (the main machine's side

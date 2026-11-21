@@ -501,6 +501,20 @@ impl Model {
         }
     }
 
+    /// mtp_fill for prompt rows still in the hidden-row log (log_hidden), which goes on: the rows at pos0 + j with
+    /// tokens[j]. Ok(false), with nothing run, if there is no such block or the log does not hold those rows.
+    pub fn mtp_fill_logged(&mut self, tokens: &[u32], pos0: u32) -> Result<bool> {
+        let dm = self.hidden_width();
+        let Model { mtp, w, h, eng, hidden_log, .. } = self;
+        let (Some(b), Some((s, log))) = (mtp.as_mut(), hidden_log.as_ref()) else { return Ok(false) };
+        let (s, a, n) = (*s as usize, pos0 as usize, tokens.len());
+        if a < s || a + n > s + log.len() / dm {
+            return Ok(false);
+        }
+        b.fill(w, h, eng, tokens, &log[(a - s) * dm..(a - s + n) * dm], pos0)?;
+        Ok(true)
+    }
+
     /// The number of floats in a row of `hidden`: the streams (hc x d_model) with qwen4exp's MTP block, else d_model.
     pub fn hidden_width(&self) -> usize {
         if self.mtp_hc.is_some() { self.hc_width() } else { self.h.d_model as usize }
