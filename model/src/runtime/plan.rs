@@ -16,6 +16,12 @@
 ///   fewer than two such sizes seen, beta = 0.15 alpha. t(1), a pass with no drafts, runs the decode path, whose time
 ///   is not on that line, so it gets its own weighted mean, using the line's value until one is seen. Before any
 ///   pass, alpha = 1 (the units cancel in the ratio).
+/// - t(1) is never above t(2) once a block of 2 or more has been timed: a pass of one token does less work than a
+///   block of two. Without that, one slow plain pass (the first after a load can take a second) makes every plain
+///   pass look dear, the planner then drafts on every pass, and no new plain pass ever comes to correct it.
+/// - A pass slower than STALL times what the planner expects for its size is recorded at STALL times that: a pass
+///   held up by the system says nothing about the price of a block, and one such time among a few blocks would tilt
+///   the line for the next 64 passes.
 pub struct DraftPlan {
     /// (n, verify seconds) for the last passes, oldest first
     samples: std::collections::VecDeque<(usize, f64)>,
@@ -35,6 +41,8 @@ const FORGET: f64 = 0.97;
 /// After this many passes in a row without drafts, pick() verifies one anyway, so the price of drafting is measured
 /// again rather than trusted for good.
 const EXPLORE: u32 = 24;
+/// A pass this many times slower than expected counts as held up (see DraftPlan).
+const STALL: f64 = 3.0;
 
 fn logit(s: f64) -> f64 {
     let s = s.clamp(1e-6, 1.0 - 1e-6);
@@ -99,6 +107,7 @@ impl DraftPlan {
 
     /// The verify time of a block of n.
     pub fn cost(&self, n: usize) -> f64 {
+        let (a, b) = self.line();
         if n == 1 {
             let k = self.samples.len();
             let (mut sw, mut st) = (0.0, 0.0);
@@ -110,11 +119,16 @@ impl DraftPlan {
                 }
             }
             if sw > 0.0 {
-                return st / sw;
+                let t1 = st / sw;
+                return if self.has(|m| m >= 2) { t1.min(a + b) } else { t1 };
             }
         }
-        let (a, b) = self.line();
         a + b * (n - 1) as f64
+    }
+
+    /// Whether a pass of a size that passes f has been recorded.
+    fn has(&self, f: impl Fn(usize) -> bool) -> bool {
+        self.samples.iter().any(|&(m, _)| f(m))
     }
 
     /// How many of the drafts (raw survivals surv, in order) are worth verifying: 0..=surv.len(), the cheapest in
@@ -141,6 +155,8 @@ impl DraftPlan {
     /// Records a pass's outcome: the raw survivals of the drafts it verified, how many were accepted, its block size
     /// and the verify's seconds.
     pub fn record(&mut self, surv: &[f64], acc: usize, n: usize, secs: f64) {
+        // what the planner expects for a block of n, once it has timed one of that kind (plain, or 2 or more)
+        let secs = if self.has(|m| (m >= 2) == (n >= 2)) { secs.min(STALL * self.cost(n)) } else { secs };
         if self.samples.len() == SAMPLES {
             self.samples.pop_front();
         }
@@ -270,4 +286,51 @@ impl Plans for DraftPlan {
 /// The draft planner.
 pub fn planner() -> Box<dyn Plans> {
     Box::new(DraftPlan::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Passes as a laptop CPU times them: plain 40 ms, blocks 50 ms + 9 ms a row.
+    fn steady(p: &mut DraftPlan, rounds: usize) {
+        for _ in 0..rounds {
+            p.record(&[], 0, 1, 0.040);
+            p.record(&[0.9], 1, 2, 0.050);
+            p.record(&[0.9, 0.9], 2, 3, 0.059);
+        }
+    }
+
+    #[test]
+    fn slow_first_plain_pass_is_not_trusted() {
+        let mut p = DraftPlan::new();
+        p.record(&[], 0, 1, 1.03);
+        for _ in 0..8 {
+            p.record(&[0.9], 1, 2, 0.050);
+            p.record(&[0.9, 0.9], 2, 3, 0.059);
+        }
+        assert!(p.cost(1) <= p.cost(2) + 1e-12, "t(1) {} t(2) {}", p.cost(1), p.cost(2));
+    }
+
+    #[test]
+    fn a_held_up_block_does_not_tilt_the_line() {
+        let mut p = DraftPlan::new();
+        steady(&mut p, 10);
+        p.record(&[0.9, 0.9], 2, 3, 1.0);
+        let (a, b) = p.line();
+        // recorded as it came, the second's pass would make the slope about 0.14 s a row
+        assert!((a + b - 0.050).abs() < 1e-3 && b < 0.040, "line {a} + {b} (n - 1)");
+        // weak drafts still not worth a pass
+        assert_eq!(p.plan(&[0.05]), 0);
+    }
+
+    #[test]
+    fn steady_times_unchanged() {
+        let mut p = DraftPlan::new();
+        steady(&mut p, 10);
+        assert!((p.cost(1) - 0.040).abs() < 1e-9);
+        assert!((p.cost(2) - 0.050).abs() < 1e-6 && (p.cost(3) - 0.059).abs() < 1e-6);
+        assert_eq!(p.plan(&[0.05]), 0);
+        assert_eq!(p.plan(&[0.9, 0.9]), 2);
+    }
 }
