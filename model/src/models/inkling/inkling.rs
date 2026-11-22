@@ -28,8 +28,7 @@ use format::meta::{Meta, Value};
 use format::{BlockKind, Result, err};
 use kernels::{Q8, QK, ops as kops};
 
-/// The most tokens one call of forward takes: a sliding-window layer keeps this many positions past its window, so
-/// a block's keys are all in place before its first token looks back.
+/// The most tokens one call of forward takes.
 pub const BLOCK_MAX: usize = 256;
 
 #[derive(Clone, Debug)]
@@ -199,9 +198,9 @@ struct ILayer {
     looped: Option<Loop>,
 }
 
-/// One layer pass's state: its keys and values (a ring of `cap` positions a KV head; every position for a
-/// full-attention layer), and the last three inputs of its four convolutions (keys, values, attention output, the
-/// experts' output), oldest first.
+/// One layer pass's state: its keys and values at every position (so a prompt that extends an earlier one finds
+/// them), and the last three inputs of its four convolutions (keys, values, attention output, the experts' output),
+/// oldest first.
 struct Pass {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -471,9 +470,8 @@ impl Ink {
         }
         // a layer pass's state: the passes after the first come after the layers, a looped stretch at a time
         let pass = (0..h.n_pass)
-            .map(|s| {
-                let l = Self::layer_of(&h, s);
-                let cap = if h.swa[l] { (h.window + BLOCK_MAX).min(n_ctx as usize) } else { n_ctx as usize };
+            .map(|_| {
+                let cap = n_ctx as usize;
                 Pass { k: vec![0.0; cap * kvd], v: vec![0.0; cap * kvd], cap, hist: vec![0.0; 3 * (2 * kvd + 2 * dm)] }
             })
             .collect();
@@ -483,13 +481,28 @@ impl Ink {
         Ok(Ink { h, w, layers, pass, tok_norm, out_norm, out_query, n_ctx })
     }
 
-    /// The layer whose weights pass `s` runs on.
-    fn layer_of(h: &InkHp, s: usize) -> usize {
-        if s < h.n_layer { s } else { h.loop_start + (s - h.n_layer) % (h.loop_end - h.loop_start) }
-    }
-
     pub fn n_vocab(&self) -> usize {
         self.h.n_vocab
+    }
+
+    /// Every pass's convolution state, end to end: with the keys and values (kept by position), the model's whole
+    /// state after the tokens read so far. A prompt can go on from position p only with the state as it was at p.
+    pub fn conv_state(&self) -> Vec<f32> {
+        self.pass.iter().flat_map(|p| p.hist.iter().copied()).collect()
+    }
+
+    /// Puts conv_state back.
+    pub fn set_conv_state(&mut self, state: &[f32]) -> Result<()> {
+        if state.len() != self.pass.iter().map(|p| p.hist.len()).sum::<usize>() {
+            return err("a convolution state of another shape");
+        }
+        let mut at = 0;
+        for p in &mut self.pass {
+            let n = p.hist.len();
+            p.hist.copy_from_slice(&state[at..at + n]);
+            at += n;
+        }
+        Ok(())
     }
 
     /// Forgets the sequence: every pass's convolution state back to zeros (keys and values are overwritten as the
@@ -500,7 +513,8 @@ impl Ink {
         }
     }
 
-    /// n tokens at positions pos0.. (1 to BLOCK_MAX of them, the sequence read in order from position 0): writes the
+    /// n tokens at positions pos0.. (1 to BLOCK_MAX of them; the convolution state must be the one after position
+    /// pos0 - 1, as it is when the sequence is read in order, or put back by set_conv_state): writes the
     /// logits of the last one (or of all n when `all` is set, n x n_vocab) into logits.
     pub fn forward(&mut self, tokens: &[u32], pos0: u32, logits: &mut [f32], all: bool) -> Result<()> {
         let h = self.h.clone();
