@@ -124,6 +124,14 @@ fn main() {
             String::from_utf8_lossy(&text)
         );
     }
+    if model::switches::get("TORC_PROF").is_some_and(|v| v != "0") {
+        use model::models::inkling::inkling::{PHASES, PROF};
+        let ms = |i: usize| PROF[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let total: f64 = (0..PHASES.len()).map(ms).sum();
+        for (i, name) in PHASES.iter().enumerate() {
+            println!("  {:8.1} ms {:5.1}%  {name}", ms(i), 100.0 * ms(i) / total.max(1e-9));
+        }
+    }
     if !ok {
         std::process::exit(1);
     }

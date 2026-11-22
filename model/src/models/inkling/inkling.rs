@@ -209,6 +209,20 @@ struct Pass {
     hist: Vec<f32>,
 }
 
+/// The time spent in each phase of forward, summed over calls (TORC_PROF=1).
+pub static PROF: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+pub const PHASES: [&str; 9] = [
+    "embed, mixes and head",
+    "inputs",
+    "q, k, v products",
+    "convolutions and clips",
+    "attention",
+    "output",
+    "router",
+    "experts",
+    "expert sums",
+];
+
 pub struct Ink {
     pub h: InkHp,
     pub w: Weights,
@@ -248,12 +262,28 @@ fn rms(out: &mut [f32], x: &[f32], eps: f32) {
     }
 }
 
+/// The product of two rows, summed in 16 lanes in a fixed order (so the bits do not depend on the machine's vector
+/// width): lane i takes every 16th pair from i, then the lanes are added in pairs.
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut d = 0.0f32;
-    for (x, y) in a.iter().zip(b) {
-        d = x.mul_add(*y, d);
+    let mut acc = [0.0f32; 16];
+    let (ca, cb) = (a.chunks_exact(16), b.chunks_exact(16));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (x, y) in ca.zip(cb) {
+        for i in 0..16 {
+            acc[i] = x[i].mul_add(y[i], acc[i]);
+        }
     }
-    d
+    for (i, (x, y)) in ra.iter().zip(rb).enumerate() {
+        acc[i] = x.mul_add(*y, acc[i]);
+    }
+    let mut w = 16;
+    while w > 1 {
+        w /= 2;
+        for i in 0..w {
+            acc[i] += acc[i + w];
+        }
+    }
+    acc[0]
 }
 
 /// x scaled down to a length of at most `limit`, after an optional scale a number.
@@ -483,6 +513,7 @@ impl Ink {
         if pos0 == 0 {
             self.reset();
         }
+        let mut lap = crate::Laps::start(&PROF);
         // the embedding (padded rows in the file), normed
         let emb = self.w.need("token_embd.weight")?;
         let (rb, nv) = (emb.row_bytes(), emb.shape().1);
@@ -496,6 +527,7 @@ impl Ink {
             rms_norm(&mut x[t * dm..(t + 1) * dm], &row[..dm], &self.tok_norm, h.eps);
         }
         let mut blocks: Vec<Vec<f32>> = Vec::new();
+        lap.lap(0);
         for l in 0..h.loop_start {
             self.layer(l, l, &mut x, &mut blocks, None, pos0, n)?;
         }
@@ -522,6 +554,7 @@ impl Ink {
             self.layer(l, l, &mut x, &mut blocks, None, pos0, n)?;
         }
         // the output: the mix, the norm, the head, the soft cap
+        let mut lap = crate::Laps::start(&PROF);
         let first = if all { 0 } else { n - 1 };
         let m = n - first;
         let mixed = mix(&blocks, &x, &self.out_query, n, dm);
@@ -545,6 +578,7 @@ impl Ink {
                 *o = if h.softcap != 0.0 { (v / h.softcap).tanh() * h.softcap } else { v };
             }
         }
+        lap.lap(0);
         Ok(())
     }
 
@@ -568,6 +602,7 @@ impl Ink {
         let swa = h.swa[l];
         let ly = &self.layers[l];
         let st = &mut self.pass[s];
+        let mut lap = crate::Laps::start(&PROF);
         // message j of token t
         let part = |j: usize| -> Vec<f32> {
             let m = msg.unwrap();
@@ -614,6 +649,7 @@ impl Ink {
             });
         }
         let qs: Vec<Q8> = ins.iter().map(|v| quant(v, n, dm)).collect();
+        lap.lap(1);
         let (qi, ki, vi) = (0, (ins.len() - 1).min(1), ins.len() - 1);
         // 2. the products: queries, relative vectors, sinks and the output's gate from the query's input; keys and
         // values (and their taps on a full-attention layer) from their own
@@ -645,6 +681,7 @@ impl Ink {
                 apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..]), (Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
             }
         }
+        lap.lap(2);
         let (hk, rest) = st.hist.split_at_mut(3 * kvd);
         let (hv, rest) = rest.split_at_mut(3 * kvd);
         let (ha, hf) = rest.split_at_mut(3 * dm);
@@ -685,6 +722,7 @@ impl Ink {
                 }
             });
         }
+        lap.lap(3);
         // 3. attention: each head's scores over the keys it sees, plus the bias by distance less the query's sink
         // logit, softmaxed with the sink's zero beside them
         let mut att = vec![0.0f32; n * qd];
@@ -738,6 +776,7 @@ impl Ink {
                 }
             });
         }
+        lap.lap(4);
         let mut out = vec![0.0f32; n * dm];
         {
             let two = t_("attn_output.weight")?;
@@ -752,6 +791,7 @@ impl Ink {
                 *a += b;
             }
         }
+        lap.lap(5);
         // 4. the routed experts, on the mix of the blocks (with the pass before's message), normed
         let mut xn = mix(blocks, x, &ly.ffn_query, n, dm);
         if let (Some(_), Some(lp)) = (msg, &ly.looped) {
@@ -787,6 +827,7 @@ impl Ink {
                 unsafe { cp.slice(t, 1)[0] = lg.iter().map(|&(e, _, p)| (e, p / sum * h.w_scale)).collect() };
             });
         }
+        lap.lap(6);
         let mut users: Vec<Vec<usize>> = vec![Vec::new(); h.n_expert];
         for (t, c) in choice.iter().enumerate() {
             for &(e, _) in c {
@@ -795,8 +836,56 @@ impl Ink {
         }
         let mut ys: Vec<Vec<(usize, f32, Vec<f32>)>> = vec![Vec::new(); n];
         let (ff, ffp) = (h.d_ff, h.d_ff_pad);
+        if n == 1 {
+            // one token: its experts' gates and ups in one sweep over the same input, then each expert's SITU and
+            // down on a thread of its own (the same products as a block makes, so the same bits)
+            let ids: Vec<u32> = choice[0].iter().map(|c| c.0 as u32).collect();
+            let packs = self.w.experts_of(lw, ly.group, &ids)?;
+            let k = ids.len();
+            let piece = |pk: &'_ [u8], p: &format::Piece| Mat {
+                ty: p.ty,
+                rows: p.rows as usize,
+                cols: p.cols as usize,
+                data: unsafe { std::slice::from_raw_parts(pk.as_ptr().add(p.at as usize), p.bytes as usize) },
+            };
+            let xq = quant(&xn, 1, dm);
+            let mut gu = vec![0.0f32; 2 * k * ffp];
+            {
+                let mut jobs: Vec<(Mat, &mut [f32])> = Vec::with_capacity(2 * k);
+                for (i, part) in gu.chunks_mut(ffp).enumerate() {
+                    let (pk, pack) = packs[i / 2];
+                    jobs.push((piece(pk, if i % 2 == 0 { &pack.gate } else { &pack.up }), part));
+                }
+                crate::moe::apply_group(&mut jobs, xq.view());
+            }
+            let mut y = vec![0.0f32; k * dm];
+            {
+                let yp = SyncPtr::new(&mut y);
+                let (gu, packs) = (&gu, &packs);
+                let (beta, lb) = (h.situ_beta, h.situ_lb);
+                each(k, &|i| {
+                    let (g, u) = (&gu[2 * i * ffp..(2 * i + 1) * ffp], &gu[(2 * i + 1) * ffp..(2 * i + 2) * ffp]);
+                    let mut row = vec![0.0f32; ffp];
+                    for j in 0..ff {
+                        let act = beta * (g[j] / beta).tanh() * (1.0 / (1.0 + (-g[j]).exp()));
+                        row[j] = act * if lb > 0.0 { lb * (u[j] / lb).tanh() } else { u[j] };
+                    }
+                    let mut hq = Q8::new(ffp / QK);
+                    kops::q8k_quantize(&row, hq.view_mut());
+                    let (pk, pack) = packs[i];
+                    let d = piece(pk, &pack.down);
+                    // SAFETY: item i owns expert i's row of y
+                    crate::moe::dot_rows(d.ty, d.data, d.data.len() / d.rows, hq.view(), unsafe {
+                        yp.slice(i * dm, dm)
+                    });
+                });
+            }
+            for (i, c) in choice[0].iter().enumerate() {
+                ys[0].push((c.0, c.1, y[i * dm..(i + 1) * dm].to_vec()));
+            }
+        }
         for (e, toks) in users.iter().enumerate() {
-            if toks.is_empty() {
+            if toks.is_empty() || n == 1 {
                 continue;
             }
             let m = toks.len();
@@ -840,6 +929,7 @@ impl Ink {
                 ys[t].push((e, wgt, y[i * dm..(i + 1) * dm].to_vec()));
             }
         }
+        lap.lap(7);
         let mut moe = vec![0.0f32; n * dm];
         for (t, list) in ys.iter_mut().enumerate() {
             // in the order the router ranked them, so a token's sum does not depend on the block
@@ -855,6 +945,7 @@ impl Ink {
         for (a, b) in x.iter_mut().zip(&moe) {
             *a += b;
         }
+        lap.lap(8);
         Ok(())
     }
 }
