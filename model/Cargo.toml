@@ -51,6 +51,10 @@ name = "torc-oss"
 path = "src/bin/dev/torc-oss.rs"
 
 [[bin]]
+name = "torc-ink"
+path = "src/bin/dev/torc-ink.rs"
+
+[[bin]]
 name = "torc-golden"
 path = "src/bin/dev/torc-golden.rs"
 

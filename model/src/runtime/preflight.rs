@@ -70,6 +70,8 @@ pub fn check(f: &File) -> Result<Preflight> {
         models::qwen::hparams::Hparams::from_file(f)?.n_layer
     } else if arch == "gemma4" {
         models::gemma::gemma::GemmaHp::from_meta(&f.metadata)?.n_layer as u32
+    } else if arch == "inkling2_loop" {
+        models::inkling::inkling::InkHp::from_meta(&f.metadata)?.n_layer as u32
     } else {
         models::gptoss::gptoss::OssHp::from_meta(&f.metadata)?.n_layer as u32
     };
