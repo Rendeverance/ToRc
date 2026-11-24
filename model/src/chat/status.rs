@@ -32,9 +32,10 @@ pub const SNIPPET: usize = 220;
 /// wall clock, so a step across a daylight-saving change cannot make one negative.
 static CLOCK: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
-/// Nanoseconds since that, which is what the atomics below hold.
+/// Nanoseconds since that, which is what the atomics below hold. Never zero: every holder below reads 0 as "unset",
+/// and on a Windows clock tick the first reading after the clock starts can be zero nanoseconds old.
 fn nanos() -> u64 {
-    CLOCK.elapsed().as_nanos() as u64
+    CLOCK.elapsed().as_nanos().max(1) as u64
 }
 
 // A prompt being read: its tokens, how many of them are read, and the nanoseconds the reading has taken. Zero in all
