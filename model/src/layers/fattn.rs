@@ -101,6 +101,34 @@ fn fast_fits(kv: &KvCache, hd: usize) -> bool {
     kv.k16.is_empty() && hd <= fast::HD_MAX && hd.is_multiple_of(16)
 }
 
+/// The gate of the packed fast scores (fast::scores_packed, ARM): the fast scores apply, this is an i8mm
+/// processor, and TORC_ATTN_SMMLA is not 0. The sums — and so the bits — are the fast scores' bits.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn smmla_gate(kv: &KvCache, hd: usize) -> bool {
+    static OK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::switches::get("TORC_ATTN_SMMLA").is_none_or(|v| v != "0")
+                && std::arch::is_aarch64_feature_detected!("dotprod")
+                && std::arch::is_aarch64_feature_detected!("i8mm")
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    });
+    *OK && fast_on() && fast_fits(kv, hd)
+}
+
+/// The fewest slots an item needs for its page to be packed: the pack serves every batch of the item, so it
+/// pays at the same size the f32 copy does (TORC_ATTN_SMMLA_MIN, else 64).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn smmla_min() -> usize {
+    static MIN: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| crate::switches::num("TORC_ATTN_SMMLA_MIN").unwrap_or(64).max(2));
+    *MIN
+}
+
 /// The fast scores (TORC_ATTN_FAST=1). A query row is rounded to sixteen-bit integers with a step of its own (its
 /// largest magnitude goes to 32767), and its product with a row of int8 keys is then an exact integer sum, which the
 /// processor does sixteen numbers to an instruction where the float path does four (NEON) or eight (AVX2). The score
@@ -241,6 +269,121 @@ mod fast {
             }
         }
 
+        /// The matrix multiply of i8mm: acc.4s += A . B^T over two rows of eight bytes each (eight numbers to an
+        /// instruction where a dot does four), signed and unsigned-first. Both take the same integer sums the dots
+        /// above do, so a score built from them is the same bits.
+        #[inline]
+        #[target_feature(enable = "i8mm")]
+        unsafe fn mm8(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+            unsafe {
+                asm!("smmla {acc:v}.4s, {a:v}.16b, {b:v}.16b", acc = inout(vreg) acc, a = in(vreg) a,
+                    b = in(vreg) b, options(pure, nomem, nostack));
+            }
+            acc
+        }
+
+        #[inline]
+        #[target_feature(enable = "i8mm")]
+        unsafe fn mm8u(mut acc: int32x4_t, a: uint8x16_t, b: int8x16_t) -> int32x4_t {
+            unsafe {
+                asm!("usmmla {acc:v}.4s, {a:v}.16b, {b:v}.16b", acc = inout(vreg) acc, a = in(vreg) a,
+                    b = in(vreg) b, options(pure, nomem, nostack));
+            }
+            acc
+        }
+
+        /// i8mm's rows in matrix order: the pair of rows (2p, 2p + 1) lays its dims 8d..8d + 7 at
+        /// [(p (hd / 8) + d) 16..][..16], eight bytes of each row together (sixteen dims to an st2). Rows past the
+        /// last (the pairs that pad the count to a multiple of four, and an odd last row) repeat the final row; their
+        /// scores are dropped. The output wants n.div_ceil(2).next_multiple_of(4) pairs of hd x 2 bytes.
+        #[target_feature(enable = "dotprod,i8mm")]
+        pub(super) unsafe fn pack8(rows: *const i8, stride: usize, n: usize, hd: usize, out: &mut [i8]) {
+            unsafe {
+                let np = n.div_ceil(2).next_multiple_of(4);
+                for p in 0..np {
+                    let src0 = rows.add((2 * p).min(n - 1) * stride);
+                    let src1 = rows.add((2 * p + 1).min(n - 1) * stride);
+                    let mut d = 0;
+                    while d < hd {
+                        let a = vld1q_s8(src0.add(d));
+                        let b = vld1q_s8(src1.add(d));
+                        let mut p0 = out.as_mut_ptr().add((p * (hd / 8) + d / 8) * 16);
+                        // SAFETY: st2 with two 8-byte elements writes the registers interleaved two times
+                        // (v0[0..8], v1[0..8], v0[8..16], v1[8..16]) — the matrix order above — inside out
+                        asm!("st2 {{{v0:v}.2d, {v1:v}.2d}}, [{p}]", p = inlateout(reg) p0,
+                            v0 = in(vreg) a, v1 = in(vreg) b, options(nostack));
+                        d += 16;
+                    }
+                }
+            }
+        }
+
+        /// The packed queries against the packed keys: 256 x SMMLA(keys, hi) + USMMLA(lo, keys), eight slots x
+        /// eight positions x eight dims to the instruction. Every sum is the same whole-head integer sum the dot
+        /// kernels take of the same rows: lanes hold one (slot, position) each and only whole-hd accumulation
+        /// happens inside. `sums` holds one row per position (its first np x 2 are written).
+        #[target_feature(enable = "dotprod,i8mm")]
+        pub(super) unsafe fn dots_packed<const NS: usize>(
+            kp: &[i8],
+            hp: &[i8],
+            lp: &[i8],
+            np: usize,
+            hd: usize,
+            sums: &mut [[i32; NS]],
+        ) {
+            unsafe {
+                let d8 = hd / 8;
+                // slot pairs in use (NS <= 8); the registers are always the four the packs hold
+                let np2 = NS / 2;
+                for grp in (0..np).step_by(4) {
+                    // the high bytes first: four slot pairs x four position pairs held in registers over the head
+                    let mut ah = [[vdupq_n_s32(0); 4]; 4];
+                    let mut hh = [[[0i32; 4]; 4]; 4];
+                    for d in 0..d8 {
+                        let a: [int8x16_t; 4] = std::array::from_fn(|sp| vld1q_s8(hp.as_ptr().add((sp * d8 + d) * 16)));
+                        for j in 0..4 {
+                            let b = vld1q_s8(kp.as_ptr().add(((grp + j) * d8 + d) * 16));
+                            for sp in 0..np2 {
+                                ah[sp][j] = mm8(ah[sp][j], a[sp], b);
+                            }
+                        }
+                    }
+                    for sp in 0..np2 {
+                        for j in 0..4 {
+                            vst1q_s32(hh[sp][j].as_mut_ptr(), ah[sp][j]);
+                        }
+                    }
+                    // and the low bytes
+                    let mut al = [[vdupq_n_s32(0); 4]; 4];
+                    let mut ll = [[[0i32; 4]; 4]; 4];
+                    for d in 0..d8 {
+                        let a: [uint8x16_t; 4] =
+                            std::array::from_fn(|sp| vld1q_u8(lp.as_ptr().cast::<u8>().add((sp * d8 + d) * 16)));
+                        for j in 0..4 {
+                            let b = vld1q_s8(kp.as_ptr().add(((grp + j) * d8 + d) * 16));
+                            for sp in 0..np2 {
+                                al[sp][j] = mm8u(al[sp][j], a[sp], b);
+                            }
+                        }
+                    }
+                    for sp in 0..np2 {
+                        for j in 0..4 {
+                            vst1q_s32(ll[sp][j].as_mut_ptr(), al[sp][j]);
+                        }
+                    }
+                    // lanes: [s0 p0, s0 p0 + 1, s1 p0, s1 p0 + 1]
+                    for sp in 0..np2 {
+                        for j in 0..4 {
+                            for e in 0..4 {
+                                let (h, l) = (hh[sp][j][e] as i64, ll[sp][j][e] as i64);
+                                sums[2 * (grp + j) + e % 2][2 * sp + e / 2] = (256 * h + l) as i32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         #[target_feature(enable = "dotprod,i8mm")]
         pub(super) unsafe fn dots<const NS: usize>(
             k: *const i8,
@@ -339,6 +482,76 @@ mod fast {
         #[allow(unreachable_code)]
         for t in 0..nt {
             put(t, dots_portable::<NS>(&k[t * hd..], &qi, hd), sc);
+        }
+    }
+
+    /// The packed page's size: rows `n` of a head `hd` wide, in arm::pack8 order.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) const fn packed_len(n: usize, hd: usize) -> usize {
+        n.div_ceil(2).next_multiple_of(4) * hd * 2
+    }
+
+    /// Packs the cache's rows base..base + n into kp (packed_len of them). The caller has checked i8mm.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn pack_page(kv: &KvCache, base: usize, n: usize, hd: usize, kp: &mut [i8]) {
+        unsafe { arm::pack8(kv.k[base * hd..].as_ptr(), hd, n, hd, kp) };
+    }
+
+    /// The scores of `scores` by the i8mm matrices (arm::dots_packed): the same quantize, the same split
+    /// hi/lo, and the same integer sums — taken eight slots x eight positions x eight dims at a time off a
+    /// page packed by pack_page, instead of sixteen numbers to a dot. The bits are the same (the test
+    /// `packed_are_fast`), and so is every dependence a slot has: only its own query and keys.
+    ///
+    /// The odd last position of a page takes the dot rows. kp holds the packed `nt` rows.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn scores_packed<const NS: usize>(
+        kv: &KvCache,
+        kp: &[i8],
+        base: usize,
+        nt: usize,
+        hd: usize,
+        scale: f32,
+        qs: [&[f32]; NS],
+        sc: &mut [f32],
+    ) {
+        assert!(NS >= 2 && NS.is_multiple_of(2) && NS <= 8);
+        assert!(sc.len() >= NS * PAGE && nt <= PAGE && hd <= HD_MAX && hd.is_multiple_of(16));
+        assert!(kv.k16.is_empty() && kv.k.len() >= (base + nt) * hd && qs.iter().all(|q| q.len() >= hd));
+        let np = (nt / 2).next_multiple_of(4).max(4);
+        assert!(kp.len() >= np * hd * 2);
+        let mut qi = [[0i16; HD_MAX]; NS];
+        let step: [f32; NS] = std::array::from_fn(|s| quantize(&qs[s][..hd], &mut qi[s][..hd]));
+        let ks = &kv.k_scale[base..base + nt];
+        let k = &kv.k[base * hd..(base + nt) * hd];
+        let mut hi = [[0i8; HD_MAX]; NS];
+        let mut lo = [[0u8; HD_MAX]; NS];
+        for s in 0..NS {
+            arm::split(&qi[s], &mut hi[s], &mut lo[s]);
+        }
+        // the queries in matrix order too; the pad pairs repeat the last row and their scores are dropped
+        let mut hp = [0i8; 4 * HD_MAX * 2];
+        let mut lp = [0i8; 4 * HD_MAX * 2];
+        unsafe {
+            arm::pack8(hi.as_ptr().cast(), HD_MAX, NS, hd, &mut hp);
+            arm::pack8(lo.as_ptr().cast(), HD_MAX, NS, hd, &mut lp);
+        }
+        let mut sums: [[i32; NS]; PAGE + 6] = [[0; NS]; PAGE + 6];
+        // SAFETY: the packs hold np pairs of hd x 2 bytes and sums the positions they score (checked); i8mm
+        // was detected by the caller (it only reaches here behind i8mm_ok)
+        unsafe { arm::dots_packed::<NS>(kp, &hp, &lp, np, hd, &mut sums) };
+        let put = |t: usize, sums: [i32; NS], sc: &mut [f32]| {
+            for s in 0..NS {
+                sc[s * PAGE + t] = ((sums[s] as f32 * step[s]) * scale) * ks[t];
+            }
+        };
+        for t in 0..(nt / 2) * 2 {
+            put(t, sums[t], sc);
+        }
+        if nt % 2 == 1 {
+            let t = nt - 1;
+            // SAFETY: the row holds hd keys and the queries hd numbers (checked above); as in scores
+            let sums = unsafe { arm::dots::<NS>(k[t * hd..].as_ptr(), &hi, &lo, hd) };
+            put(t, sums, sc);
         }
     }
 
@@ -799,6 +1012,17 @@ impl Fattn {
         static MIN: std::sync::LazyLock<usize> =
             std::sync::LazyLock::new(|| crate::switches::num("TORC_ATTN_F32_MIN").unwrap_or(64));
         let f32c = slot_count >= (*MIN).max(9) && f32_on();
+        // ARM i8mm: with the fast scores and enough slots for the pack to pay (it serves every batch of this
+        // item), the page goes to matrix order once and the scores run through fast::scores_packed — the same
+        // integer sums, so the same bits, eight slots x eight positions x eight dims to the instruction
+        #[cfg(target_arch = "aarch64")]
+        let sm = smmla_gate(kv, hd) && slot_count >= smmla_min();
+        #[cfg(target_arch = "aarch64")]
+        let mut kp8 = crate::scratch::buf::<i8>("fattn.kp8", if sm { fast::packed_len(len, hd) } else { 0 });
+        #[cfg(target_arch = "aarch64")]
+        if sm {
+            fast::pack_page(kv, base, len, hd, &mut kp8);
+        }
         // TORC_ATTN_TILE=1 (ARM): from 16 slots up to where the whole-page copy takes over (an MTP
         // verify pass), the page is converted to f32 a tile of TP positions at a time (32 KB, held in L1). First every
         // slot's scores over the key tile; then each slot's weights over the page; then the value tiles into the
@@ -818,6 +1042,36 @@ impl Fattn {
                 let step = batch(slot_count - s0);
                 let sc = &mut st[s0 * PAGE..];
                 match step {
+                    8 if sm => fast::scores_packed::<8>(
+                        kv,
+                        &kp8,
+                        base,
+                        len,
+                        hd,
+                        self.scale,
+                        std::array::from_fn(|k| qrow(s0 + k)),
+                        sc,
+                    ),
+                    4 if sm => fast::scores_packed::<4>(
+                        kv,
+                        &kp8,
+                        base,
+                        len,
+                        hd,
+                        self.scale,
+                        std::array::from_fn(|k| qrow(s0 + k)),
+                        sc,
+                    ),
+                    2 if sm => fast::scores_packed::<2>(
+                        kv,
+                        &kp8,
+                        base,
+                        len,
+                        hd,
+                        self.scale,
+                        std::array::from_fn(|k| qrow(s0 + k)),
+                        sc,
+                    ),
                     8 => fast::scores::<8>(kv, base, len, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), sc),
                     4 => fast::scores::<4>(kv, base, len, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), sc),
                     2 => fast::scores::<2>(kv, base, len, hd, self.scale, std::array::from_fn(|k| qrow(s0 + k)), sc),
@@ -1012,42 +1266,84 @@ impl Fattn {
         let mut s0 = 0;
         while s0 < slot_count {
             let step = batch(slot_count - s0);
+            #[cfg(target_arch = "aarch64")]
+            let mut scored = false;
+            #[cfg(not(target_arch = "aarch64"))]
+            let scored = false;
             {
-                match step {
-                    8 => scores_c::<8>(
-                        f32c,
-                        &kf,
-                        kv,
-                        base,
-                        len,
-                        hd,
-                        self.scale,
-                        std::array::from_fn(|k| qrow(s0 + k)),
-                        &mut sc,
-                    ),
-                    4 => scores_c::<4>(
-                        f32c,
-                        &kf,
-                        kv,
-                        base,
-                        len,
-                        hd,
-                        self.scale,
-                        std::array::from_fn(|k| qrow(s0 + k)),
-                        &mut sc,
-                    ),
-                    2 => scores_c::<2>(
-                        f32c,
-                        &kf,
-                        kv,
-                        base,
-                        len,
-                        hd,
-                        self.scale,
-                        std::array::from_fn(|k| qrow(s0 + k)),
-                        &mut sc,
-                    ),
-                    _ => scores_c::<1>(f32c, &kf, kv, base, len, hd, self.scale, [qrow(s0)], &mut sc),
+                #[cfg(target_arch = "aarch64")]
+                if sm && step > 1 {
+                    match step {
+                        8 => fast::scores_packed::<8>(
+                            kv,
+                            &kp8,
+                            base,
+                            len,
+                            hd,
+                            self.scale,
+                            std::array::from_fn(|k| qrow(s0 + k)),
+                            &mut sc,
+                        ),
+                        4 => fast::scores_packed::<4>(
+                            kv,
+                            &kp8,
+                            base,
+                            len,
+                            hd,
+                            self.scale,
+                            std::array::from_fn(|k| qrow(s0 + k)),
+                            &mut sc,
+                        ),
+                        _ => fast::scores_packed::<2>(
+                            kv,
+                            &kp8,
+                            base,
+                            len,
+                            hd,
+                            self.scale,
+                            std::array::from_fn(|k| qrow(s0 + k)),
+                            &mut sc,
+                        ),
+                    }
+                    scored = true;
+                }
+                if !scored {
+                    match step {
+                        8 => scores_c::<8>(
+                            f32c,
+                            &kf,
+                            kv,
+                            base,
+                            len,
+                            hd,
+                            self.scale,
+                            std::array::from_fn(|k| qrow(s0 + k)),
+                            &mut sc,
+                        ),
+                        4 => scores_c::<4>(
+                            f32c,
+                            &kf,
+                            kv,
+                            base,
+                            len,
+                            hd,
+                            self.scale,
+                            std::array::from_fn(|k| qrow(s0 + k)),
+                            &mut sc,
+                        ),
+                        2 => scores_c::<2>(
+                            f32c,
+                            &kf,
+                            kv,
+                            base,
+                            len,
+                            hd,
+                            self.scale,
+                            std::array::from_fn(|k| qrow(s0 + k)),
+                            &mut sc,
+                        ),
+                        _ => scores_c::<1>(f32c, &kf, kv, base, len, hd, self.scale, [qrow(s0)], &mut sc),
+                    }
                 }
             }
             for k in 0..step {
@@ -2289,6 +2585,105 @@ mod tests {
         }
     }
 
+    /// Development probe (ignore): prints the packed kernel's scores against the dot ones for a small
+    /// deterministic shape, so a lane or packing mistake reads as a permutation of the matrix.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn dbg_packed_map() {
+        let (hd, nt) = (16usize, 8usize);
+        let mut kv = KvCache::with(1, hd, nt, false);
+        // key row t: dim 0 = t + 1, dim 8 = 1, rest 0
+        for t in 0..nt {
+            kv.k[t * hd] = (t + 1) as i8;
+            kv.k[t * hd + 8] = 1;
+        }
+        for x in kv.k_scale.iter_mut() {
+            *x = 1.0;
+        }
+        // query slot s: dim 0 = s + 1 over 64, dim 8 = 4 over 64, rest 0
+        let q: Vec<f32> = (0..8 * hd)
+            .map(|i| {
+                if i % hd == 0 {
+                    64.0 * ((i / hd) as f32 + 1.0)
+                } else if i % hd == 8 {
+                    256.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let rows: [&[f32]; 8] = std::array::from_fn(|i| &q[i * hd..(i + 1) * hd]);
+        let mut kp = vec![0i8; fast::packed_len(nt, hd)];
+        fast::pack_page(&kv, 0, nt, hd, &mut kp);
+        let (mut a, mut b) = (vec![0f32; 8 * PAGE], vec![0f32; 8 * PAGE]);
+        fast::scores::<8>(&kv, 0, nt, hd, 1.0, rows, &mut a);
+        fast::scores_packed::<8>(&kv, &kp, 0, nt, hd, 1.0, rows, &mut b);
+        for s in 0..8 {
+            let ta: Vec<i32> = (0..nt).map(|t| (a[s * PAGE + t]) as i32).collect();
+            let tb: Vec<i32> = (0..nt).map(|t| (b[s * PAGE + t]) as i32).collect();
+            println!("slot {s}: dot {ta:?} packed {tb:?}");
+        }
+    }
+
+    /// The packed i8mm scores take the same bits the dot fast scores do: every head width and page size
+    /// (the padding pairs and the odd last position among them), every batch size — a slot's bits do not
+    /// depend on the batch, here as everywhere. ARM only.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn packed_are_fast() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") || !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return;
+        }
+        let mut s = 0xbeef_2468_1357_0002u64;
+        for &(hd, nt) in &[
+            (256usize, 256usize),
+            (256, 255),
+            (256, 130),
+            (256, 129),
+            (256, 37),
+            (256, 9),
+            (256, 8),
+            (256, 6),
+            (256, 5),
+            (256, 2),
+            (256, 1),
+            (128, 200),
+            (64, 16),
+            (32, 3),
+            (16, 2),
+        ] {
+            let kv = cache(&mut s, 2, hd, 600, false);
+            let q: Vec<f32> = (0..8 * hd).map(|_| rnd(&mut s)).collect();
+            let rows: [&[f32]; 8] = std::array::from_fn(|i| &q[i * hd..(i + 1) * hd]);
+            let base = 300 + 5;
+            let mut kp = vec![0i8; fast::packed_len(nt, hd)];
+            fast::pack_page(&kv, base, nt, hd, &mut kp);
+            let (mut a, mut b) = (vec![0f32; 8 * PAGE], vec![0f32; 8 * PAGE]);
+            fast::scores::<8>(&kv, base, nt, hd, 0.05, rows, &mut a);
+            fast::scores_packed::<8>(&kv, &kp, base, nt, hd, 0.05, rows, &mut b);
+            for sl in 0..8 {
+                for t in 0..nt {
+                    let i = sl * PAGE + t;
+                    assert_eq!(a[i].to_bits(), b[i].to_bits(), "hd {hd} nt {nt}: slot {sl} position {t}");
+                }
+            }
+            // the smaller batches take the same slots' bits
+            let mut b4 = vec![0f32; 4 * PAGE];
+            fast::scores_packed::<4>(&kv, &kp, base, nt, hd, 0.05, std::array::from_fn(|i| rows[i]), &mut b4);
+            for sl in 0..4 {
+                for t in 0..nt {
+                    assert_eq!(b4[sl * PAGE + t].to_bits(), a[sl * PAGE + t].to_bits(), "batch 4, hd {hd} nt {nt}");
+                }
+            }
+            let mut b2 = vec![0f32; 2 * PAGE];
+            fast::scores_packed::<2>(&kv, &kp, base, nt, hd, 0.05, [rows[3], rows[6]], &mut b2);
+            for t in 0..nt {
+                assert_eq!(b2[t].to_bits(), a[3 * PAGE + t].to_bits(), "batch 2, hd {hd} nt {nt}");
+            }
+        }
+    }
+
     /// The score kernels alone on one thread: a page of 256 int8 keys of 256 against 8 queries, the exact kernel and
     /// TORC_ATTN_FAST's, over 40 pages (2.6 MB of keys, as an item meets them); and the values kernel for scale.
     #[test]
@@ -2327,6 +2722,56 @@ mod tests {
             "scores, 8 slots, one thread: exact {exact:.1} / {exact2:.1} GMAC/s, fast {fast:.1} GMAC/s ({:.2}x); values {vals:.1} GMAC/s",
             fast / exact.max(exact2)
         );
+    }
+
+    /// The packed i8mm scores alone on one thread, against the dot fast ones: the same 40 pages, each packed
+    /// once beforehand as an item packs its page once for every batch (the pack's own cost is timed apart).
+    /// ARM only.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn bench_packed_scores() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") || !std::arch::is_aarch64_feature_detected!("i8mm") {
+            println!("no i8mm on this cpu");
+            return;
+        }
+        let mut s = 0x0f0f_2468_9abc_def0u64;
+        let (hd, pages) = (256usize, 40usize);
+        let kv = cache(&mut s, 1, hd, pages * PAGE, false);
+        let q: Vec<f32> = (0..8 * hd).map(|_| rnd(&mut s)).collect();
+        let rows: [&[f32]; 8] = std::array::from_fn(|i| &q[i * hd..(i + 1) * hd]);
+        let mut sc = vec![0f32; 8 * PAGE];
+        let reps = 50;
+        let mac = (reps * pages * PAGE * hd * 8) as f64;
+        let t = std::time::Instant::now();
+        let kps: Vec<Vec<i8>> = (0..pages)
+            .map(|p| {
+                let mut kp = vec![0i8; fast::packed_len(PAGE, hd)];
+                fast::pack_page(&kv, p * PAGE, PAGE, hd, &mut kp);
+                kp
+            })
+            .collect();
+        let tpack = t.elapsed().as_secs_f64() / pages as f64 * 1e6;
+        let time = |f: &mut dyn FnMut(usize)| {
+            for p in 0..pages {
+                f(p);
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                for p in 0..pages {
+                    f(p);
+                }
+            }
+            mac / t.elapsed().as_secs_f64() / 1e9
+        };
+        let fast = time(&mut |p| fast::scores::<8>(&kv, p * PAGE, PAGE, hd, 0.05, rows, &mut sc));
+        let packed = time(&mut |p| fast::scores_packed::<8>(&kv, &kps[p], p * PAGE, PAGE, hd, 0.05, rows, &mut sc));
+        let packed2 = time(&mut |p| fast::scores_packed::<8>(&kv, &kps[p], p * PAGE, PAGE, hd, 0.05, rows, &mut sc));
+        println!(
+            "scores, 8 slots, one thread: fast {fast:.1}, packed {packed:.1} / {packed2:.1} GMAC/s ({:.2}x)",
+            packed.max(packed2) / fast
+        );
+        println!("packed scores: the page's own pack {tpack:.1} us (8 slots each a batch)");
     }
 
     #[test]
