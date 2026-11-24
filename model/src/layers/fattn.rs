@@ -307,11 +307,16 @@ mod fast {
                     while d < hd {
                         let a = vld1q_s8(src0.add(d));
                         let b = vld1q_s8(src1.add(d));
-                        let mut p0 = out.as_mut_ptr().add((p * (hd / 8) + d / 8) * 16);
-                        // SAFETY: st2 with two 8-byte elements writes the registers interleaved two times
-                        // (v0[0..8], v1[0..8], v0[8..16], v1[8..16]) — the matrix order above — inside out
-                        asm!("st2 {{{v0:v}.2d, {v1:v}.2d}}, [{p}]", p = inlateout(reg) p0,
-                            v0 = in(vreg) a, v1 = in(vreg) b, options(nostack));
+                        let p0 = out.as_mut_ptr().add((p * (hd / 8) + d / 8) * 16).cast::<i64>();
+                        let (a, b) = (
+                            std::mem::transmute::<int8x16_t, int64x2_t>(a),
+                            std::mem::transmute::<int8x16_t, int64x2_t>(b),
+                        );
+                        // SAFETY: vst2q_s64 is ST2 of two 8-byte elements: it writes the first register's two 64-bit
+                        // elements interleaved with the second's (v0[0..8], v1[0..8], v0[8..16], v1[8..16]) — the
+                        // matrix order above — and inside out. The intrinsic, not hand asm: ST2 needs its two source
+                        // registers consecutive, which the assembler is given no guarantee about for two free vregs.
+                        vst2q_s64(p0, int64x2x2_t(a, b));
                         d += 16;
                     }
                 }
@@ -2594,47 +2599,6 @@ mod tests {
             let mut two = vec![0f32; 2 * PAGE];
             fast::scores::<2>(&kv, base, nt, hd, 0.05, [rows[4], rows[5]], &mut two);
             assert!((0..nt).all(|t| two[PAGE + t].to_bits() == a[5 * PAGE + t].to_bits()), "hd {hd}: batch of 2");
-        }
-    }
-
-    /// Development probe (ignore): prints the packed kernel's scores against the dot ones for a small
-    /// deterministic shape, so a lane or packing mistake reads as a permutation of the matrix.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    #[ignore]
-    fn dbg_packed_map() {
-        let (hd, nt) = (16usize, 8usize);
-        let mut kv = KvCache::with(1, hd, nt, false);
-        // key row t: dim 0 = t + 1, dim 8 = 1, rest 0
-        for t in 0..nt {
-            kv.k[t * hd] = (t + 1) as i8;
-            kv.k[t * hd + 8] = 1;
-        }
-        for x in kv.k_scale.iter_mut() {
-            *x = 1.0;
-        }
-        // query slot s: dim 0 = s + 1 over 64, dim 8 = 4 over 64, rest 0
-        let q: Vec<f32> = (0..8 * hd)
-            .map(|i| {
-                if i % hd == 0 {
-                    64.0 * ((i / hd) as f32 + 1.0)
-                } else if i % hd == 8 {
-                    256.0
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let rows: [&[f32]; 8] = std::array::from_fn(|i| &q[i * hd..(i + 1) * hd]);
-        let mut kp = vec![0i8; fast::packed_len(nt, hd)];
-        fast::pack_page(&kv, 0, nt, hd, &mut kp);
-        let (mut a, mut b) = (vec![0f32; 8 * PAGE], vec![0f32; 8 * PAGE]);
-        fast::scores::<8>(&kv, 0, nt, hd, 1.0, rows, &mut a);
-        fast::scores_packed::<8>(&kv, &kp, 0, nt, hd, 1.0, rows, &mut b);
-        for s in 0..8 {
-            let ta: Vec<i32> = (0..nt).map(|t| (a[s * PAGE + t]) as i32).collect();
-            let tb: Vec<i32> = (0..nt).map(|t| (b[s * PAGE + t]) as i32).collect();
-            println!("slot {s}: dot {ta:?} packed {tb:?}");
         }
     }
 
