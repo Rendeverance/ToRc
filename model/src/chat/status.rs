@@ -560,6 +560,11 @@ mod tests {
     use super::*;
     use crate::switches;
 
+    // A Windows checkout renders its line endings as CRLF, and the page is compiled from the file as it stands,
+    // so what the assertions read has the stray carriage returns taken out. The server itself serves PAGE whole;
+    // nothing a browser draws turns on an end of line.
+    static PAGE_LF: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| PAGE.replace("\r\n", "\n"));
+
     // the read and write counters these tests move are the process's own, so the tests that move them take turns
     static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -619,11 +624,11 @@ mod tests {
             "the total is the part read and the part reused, nothing else"
         );
         assert!(
-            PAGE.contains("data-l=\"prompt tok\">${num(r.prompt_total)}"),
+            PAGE_LF.contains("data-l=\"prompt tok\">${num(r.prompt_total)}"),
             "the table's prompt column shows the whole prompt"
         );
         assert!(
-            PAGE.contains("rate(r.prompt, r.prompt_seconds)"),
+            PAGE_LF.contains("rate(r.prompt, r.prompt_seconds)"),
             "while the reading rate stays over the tokens that were read"
         );
     }
@@ -842,8 +847,8 @@ mod tests {
     #[test]
     fn the_page_reads_the_address_the_data_is_answered_at() {
         // the route is written in two places, and a rename that misses one shows as a blank page
-        assert!(PAGE.contains("/torc/status"), "the page must poll what the server answers");
-        assert!(!PAGE.contains("http://") && !PAGE.contains("https://"), "it loads nothing from anywhere else");
+        assert!(PAGE_LF.contains("/torc/status"), "the page must poll what the server answers");
+        assert!(!PAGE_LF.contains("http://") && !PAGE_LF.contains("https://"), "it loads nothing from anywhere else");
     }
 
     #[test]
@@ -868,151 +873,158 @@ mod tests {
             "reading_seconds",
             "prompt_total",
         ] {
-            assert!(PAGE.contains(field), "the page reads {field}, which status_json answers");
+            assert!(PAGE_LF.contains(field), "the page reads {field}, which status_json answers");
         }
         // the header is the desktop app's: its mark served by this server (not a copy of it in another folder, and not
         // a fetch to somewhere else), and the product named before the model, so a page on a LAN is recognisably ours
-        assert!(PAGE.contains("src=\"/torc/mark.png\""), "the app's mark is asked for from this server");
+        assert!(PAGE_LF.contains("src=\"/torc/mark.png\""), "the app's mark is asked for from this server");
         // the app's own file and crop, at the size a heading across a room is read at rather than the 28 px a
         // window draws it at - the file is not resized, only the box it is drawn into
-        assert!(PAGE.contains(".brand .mark { width: 50px"), "the mark is sized for the page, not for the app");
+        assert!(PAGE_LF.contains(".brand .mark { width: 50px"), "the mark is sized for the page, not for the app");
         // CSS has no line comment. A `//` in the stylesheet parses as the beginning of a selector and quietly takes the
         // rule after it with it: no error anywhere, and a mark that was meant to be 50 px is drawn at its file's 96
         let style = PAGE.split("<style>").nth(1).unwrap().split("</style>").next().unwrap();
         assert!(!style.lines().any(|l| l.trim_start().starts_with("//")), "no line comments in the stylesheet");
-        assert!(PAGE.contains("ToRc ${d.engine"), "the page leads with the product and its version");
+        assert!(PAGE_LF.contains("ToRc ${d.engine"), "the page leads with the product and its version");
         // the tuning answer belongs to the layout word as a hover, not to the page as a line above the rates: it is
         // looked up rather than watched, and it is the word it describes that should show when something is wrong
-        assert!(PAGE.contains("class=\"lay"), "the layout word is what carries the tuning answer");
-        assert!(PAGE.contains("title=\"${esc(note.text)}\""), "the answer is in a hover on that word");
-        assert!(!PAGE.contains("id=\"tuned\""), "and it is not a paragraph of its own over the numbers");
+        assert!(PAGE_LF.contains("class=\"lay"), "the layout word is what carries the tuning answer");
+        assert!(PAGE_LF.contains("title=\"${esc(note.text)}\""), "the answer is in a hover on that word");
+        assert!(!PAGE_LF.contains("id=\"tuned\""), "and it is not a paragraph of its own over the numbers");
         // the layers of a pass are the only thing that moves between two blocks, so the page shows that as a second
         // segment of the bar - and it must stay drawn apart from the measured part. It rests on the layers costing the
         // same each, which wide MoE layers do not, so a reader has to be able to see which part is which
-        assert!(PAGE.contains(".bar i.part { opacity"), "the measured and the in-flight segment are drawn apart");
+        assert!(PAGE_LF.contains(".bar i.part { opacity"), "the measured and the in-flight segment are drawn apart");
         // the two graphs are compared with each other by an eye reading across, so they are drawn at one height down
         // the page; that is a rule about the layout, so the assertion is about the layout too
-        assert!(PAGE.contains("#readspark, #writespark { margin-top: auto"), "both graphs sit at the same height");
+        assert!(PAGE_LF.contains("#readspark, #writespark { margin-top: auto"), "both graphs sit at the same height");
         // and what is drawn inside them: a rate of nothing keeps its line, at a zero that sits inside the frame and
         // not on its edge, because a plot that stopped and a machine that is idle must not look the same
-        assert!(PAGE.contains("y1=\"${y(0)}\""), "the graphs always draw where their zero is, idle included");
+        assert!(PAGE_LF.contains("y1=\"${y(0)}\""), "the graphs always draw where their zero is, idle included");
         // dashed, so that a baseline cannot be read as a rate that held, and painted before the first answer so
         // that an open page is never an empty box
         // the plot keeps its own air: a CSS padding on the svg would push the drawing down inside its own box and the
         // box would clip the bottom of it, which is the row the line at 0 lives on
         assert!(
-            !PAGE.contains("padding-top: 6px"),
+            !PAGE_LF.contains("padding-top: 6px"),
             "the gap above a graph is drawn, not padded - padding clips the line at 0 away"
         );
         assert!(
-            PAGE.contains("const stem = begun || pts.length < 2"),
+            PAGE_LF.contains("const stem = begun || pts.length < 2"),
             "the stem at the left end goes away once the window has scrolled past the point it belongs to"
         );
         assert!(
-            PAGE.contains("if (!H[which].length) BEGUN[which] = now;"),
+            PAGE_LF.contains("if (!H[which].length) BEGUN[which] = now;"),
             "the page remembers where each series began, past the point where its samples are trimmed"
         );
         assert!(
             // the frame's height is approached a step per poll: a ruler that snaps to what the window holds moves the
             // whole line sideways in scale while the machine holds one speed
-            PAGE.contains("cur + Math.sign(want - cur) * step") && PAGE.contains("TOP[which] = Math.max(hi, eased);"),
+            PAGE_LF.contains("cur + Math.sign(want - cur) * step")
+                && PAGE_LF.contains("TOP[which] = Math.max(hi, eased);"),
             "the top of the scale is approached, never jumped to, and never left below the window's own high",
         );
         assert!(
             // staleness in the engine's own cadence: a block measured only when it ends is not a stalled number
-            PAGE.contains("return Math.max(8, 2 * Math.max(0, ...c.gaps));"),
+            PAGE_LF.contains("return Math.max(8, 2 * Math.max(0, ...c.gaps));"),
             "a rate dims against the gap between the engine's reports, not against a fixed age"
         );
         assert!(
             // the bar over a graph is drawn at the graph's width, from one shared value
-            PAGE.contains(":root { --plot: 220px; }")
-                && PAGE.contains(".bar, #readspark, #writespark { width: var(--plot); max-width: 100%; }"),
+            PAGE_LF.contains(":root { --plot: 220px; }")
+                && PAGE_LF.contains(".bar, #readspark, #writespark { width: var(--plot); max-width: 100%; }"),
             "the progress bar and the plot under it share one width"
         );
         assert!(
-            PAGE.contains("const y = (v) => 6 + (1 - v / top) * (h - 8);"),
+            PAGE_LF.contains("const y = (v) => 6 + (1 - v / top) * (h - 8);"),
             "zero is drawn inside the box, with the air above it part of the drawing"
         );
         assert!(
-            PAGE.contains("stroke-opacity=\".6\"") && PAGE.contains("stroke-dasharray=\"3 3\""),
+            PAGE_LF.contains("stroke-opacity=\".6\"") && PAGE_LF.contains("stroke-dasharray=\"3 3\""),
             "the line at 0 is dashed, in the series colour, under any measured rate"
         );
         assert!(
-            PAGE.contains("spark(\"write\", \"writespark\", \"var(--write)\");\npoll();"),
+            PAGE_LF.contains("spark(\"write\", \"writespark\", \"var(--write)\");\npoll();"),
             "both graphs are drawn before the first answer arrives"
         );
         // the tint is the frame's, not the drawn history's: the history starts when the page was opened, and an empty
         // rest of the width reads as a plot that stopped rather than as a page that has not seen anything yet
         assert!(
-            PAGE.contains("width=\"${w}\" height=\"${h}\" fill=\""),
+            PAGE_LF.contains("width=\"${w}\" height=\"${h}\" fill=\""),
             "the plot area is tinted across its whole width, not only where history was drawn"
         );
-        assert!(PAGE.contains("fill-opacity=\".14\""), "and the line keeps a stronger tint down to its zero");
+        assert!(PAGE_LF.contains("fill-opacity=\".14\""), "and the line keeps a stronger tint down to its zero");
         // the history has a start, so it gets an edge: a stem from zero to the first value, and one sample alone is
         // still a measurement even though it cannot be a line. Once the window has scrolled past that first value the
         // stem is dropped, because the point it closes is no longer on the screen
         assert!(
-            PAGE.contains("y2=\"${y(pts[0][1])}\""),
+            PAGE_LF.contains("y2=\"${y(pts[0][1])}\""),
             "the drawn series is closed at its left end by a stem, only while its first value is on screen"
         );
         // the state line is a line of its own above the tiles. As a column of the row it took width from the two
         // tiles that are compared side by side, which is what separated them once a narrow window wrapped the row
         assert!(
-            PAGE.contains("<div class=\"state\"><div id=\"state\" class=\"badge\">"),
+            PAGE_LF.contains("<div class=\"state\"><div id=\"state\" class=\"badge\">"),
             "the state badge is not a column of the tile row"
         );
-        assert!(!PAGE.contains("<div class=\"k\">state</div>"), "and it needs no label to say what it is");
+        assert!(!PAGE_LF.contains("<div class=\"k\">state</div>"), "and it needs no label to say what it is");
         // one clock, 24-hour, whatever the browser's locale: the times are read against durations, and an hour that
         // might mean twelve hours either way is the ambiguity worth removing rather than leaving to the machine
-        assert!(PAGE.contains("{hour12: false}"), "the page keeps one clock, not the browser's");
+        assert!(PAGE_LF.contains("{hour12: false}"), "the page keeps one clock, not the browser's");
         // the cache column names the thing it counts, the way the phrase a reader searches for is "cache hit"
-        assert!(PAGE.contains("Cache Hit"), "the cache column is called what people call it");
+        assert!(PAGE_LF.contains("Cache Hit"), "the cache column is called what people call it");
         // one header wraps, so all of them keep to the top of the column rather than to its middle
         assert!(
-            PAGE.contains("th { color: var(--ink3); vertical-align: top"),
+            PAGE_LF.contains("th { color: var(--ink3); vertical-align: top"),
             "a wrapped header does not pull the others down"
         );
         // a named address is shown as the name with the address behind it on hover, and an unnamed one as its address
-        assert!(PAGE.contains("r.client_name || r.client"), "an unmapped address is still shown as itself");
+        assert!(PAGE_LF.contains("r.client_name || r.client"), "an unmapped address is still shown as itself");
         // the element, not just the script that fills it: a page that draws into an id the markup never created
         // throws in the browser and stops drawing everything after that line
-        assert!(PAGE.contains("id=\"readpart\""), "the measured and the in-flight segment both exist in the markup");
+        assert!(PAGE_LF.contains("id=\"readpart\""), "the measured and the in-flight segment both exist in the markup");
         // the percent under the bar and the address column both exist as elements, and the column is hidden rather than
         // left empty when the switch is off, so that a table never shows a heading over nothing
-        assert!(PAGE.contains("id=\"readpct\""), "the bar's own label exists in the markup");
-        assert!(PAGE.contains("id=\"thclient\" hidden"), "the address column starts hidden and is asked for by name");
+        assert!(PAGE_LF.contains("id=\"readpct\""), "the bar's own label exists in the markup");
+        assert!(
+            PAGE_LF.contains("id=\"thclient\" hidden"),
+            "the address column starts hidden and is asked for by name"
+        );
         // what a running prompt says in words grows and shrinks. The numbers and graphs are laid out above those words
         // and their height is held, so that the page does not breathe under a reader's eye while a prompt is read
-        assert!(PAGE.contains("#readsub, #writesub { min-height"), "the text lines hold their height");
+        assert!(PAGE_LF.contains("#readsub, #writesub { min-height"), "the text lines hold their height");
         // that a model was never measured on this machine is the one thing a reader must not have to infer from a
         // slow number, so the page has words for it
-        assert!(PAGE.contains("not measured on this machine"), "it says when a model runs on built-in rules");
+        assert!(PAGE_LF.contains("not measured on this machine"), "it says when a model runs on built-in rules");
         // a value somebody set with a switch is not the same fact as a value nobody chose: the page counts them
         // apart, because "not tuned" would make a deliberate choice look like an accident
-        assert!(PAGE.contains("set by switches"), "it names a switch-set value as such");
-        assert!(PAGE.contains("built-in rule"), "and names an unset one as that");
+        assert!(PAGE_LF.contains("set by switches"), "it names a switch-set value as such");
+        assert!(PAGE_LF.contains("built-in rule"), "and names an unset one as that");
         // the count is over the settings this engine reports running, not over every name in the tuning file: an x86
         // build has no NPU tier, and a fifth item in a sentence about four values would be a wrong sentence
-        assert!(PAGE.contains("k in u"), "it counts only the settings the engine reports running");
-        assert!(PAGE.contains("rate over the last tokens"), "and it says which interval a live rate is measured over");
+        assert!(PAGE_LF.contains("k in u"), "it counts only the settings the engine reports running");
+        assert!(
+            PAGE_LF.contains("rate over the last tokens"),
+            "and it says which interval a live rate is measured over"
+        );
         // a finished reply leaves no counters behind, so the tile would show a dash. The last reply's speed is a real
         // number about this server, so it is said in words instead
         assert!(
-            PAGE.contains("const lastWrite = last ? rate(last.output, last.output_seconds)"),
+            PAGE_LF.contains("const lastWrite = last ? rate(last.output, last.output_seconds)"),
             "the past write rate comes from the record of replies, not from a counter"
         );
-        assert!(PAGE.contains("the last reply:"), "and the page names where that speed came from");
-        assert!(PAGE.contains("last prompt read:"), "the same for the last prompt's read speed");
+        assert!(PAGE_LF.contains("the last reply:"), "and the page names where that speed came from");
+        assert!(PAGE_LF.contains("last prompt read:"), "the same for the last prompt's read speed");
         // a past speed stays words under the tile. The tile's own number means "this second", and a finished reply
         // has no this second, so it must not fill it in
         assert!(
-            PAGE.contains(".textContent = write ?"),
+            PAGE_LF.contains(".textContent = write ?"),
             "the write tile's number comes only from the reply being written"
         );
         // a request and its text are one entry: the line the shared cell border draws between them reads as another
         // row of the table, so the pair is marked and keeps a single line under it
-        assert!(PAGE.contains("tr.pair td { border-bottom: 0"), "a request and its text take one row's height");
-        assert!(PAGE.contains("class=\"pair\""), "and the row is marked when its text follows");
+        assert!(PAGE_LF.contains("tr.pair td { border-bottom: 0"), "a request and its text take one row's height");
+        assert!(PAGE_LF.contains("class=\"pair\""), "and the row is marked when its text follows");
     }
 
     #[test]
@@ -1034,21 +1046,21 @@ mod tests {
             "ended",
         ];
         for head in HEADS {
-            assert!(PAGE.contains(&format!("data-l=\"{head}\"")), "a narrow screen still says what {head} is");
+            assert!(PAGE_LF.contains(&format!("data-l=\"{head}\"")), "a narrow screen still says what {head} is");
         }
         assert!(
-            PAGE.contains("@media (max-width: 640px)"),
+            PAGE_LF.contains("@media (max-width: 640px)"),
             "the change is width-based, not device-based: a narrow window gets the same block"
         );
-        assert!(PAGE.contains("#replies thead { display: none; }"), "the header that does not fit goes away");
+        assert!(PAGE_LF.contains("#replies thead { display: none; }"), "the header that does not fit goes away");
         assert!(
-            PAGE.contains("#replies td[data-l]::before { content: attr(data-l); display: block;"),
+            PAGE_LF.contains("#replies td[data-l]::before { content: attr(data-l); display: block;"),
             "a caption sharing a line with its value splits a long number over two lines instead"
         );
         // a reply's end sits beside its start rather than at the end of the block, which is what makes the three
         // lines read as when, what and how fast
         assert!(
-            PAGE.contains("#replies td[data-l=\"ended\"] { grid-column: 3; grid-row: 1; }"),
+            PAGE_LF.contains("#replies td[data-l=\"ended\"] { grid-column: 3; grid-row: 1; }"),
             "and it is placed there, not left to fall out of the column order"
         );
     }
