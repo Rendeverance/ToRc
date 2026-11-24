@@ -1008,10 +1008,12 @@ impl Fattn {
             p[1] = l;
         };
         // from TORC_ATTN_F32_MIN slots (default 64): the copy pays for a page's conversion once, which is only worth
-        // it over many slots (a prompt block's, not an MTP verify pass's)
+        // it over many slots (a prompt block's, not an MTP verify pass's). With the fast scores on, the keys copy
+        // is never read (they go to the fast kernels straight from int8), so an empty kf skips it.
         static MIN: std::sync::LazyLock<usize> =
             std::sync::LazyLock::new(|| crate::switches::num("TORC_ATTN_F32_MIN").unwrap_or(64));
         let f32c = slot_count >= (*MIN).max(9) && f32_on();
+        let fast_scores_here = fast_on() && fast_fits(kv, hd);
         // ARM i8mm: with the fast scores and enough slots for the pack to pay (it serves every batch of this
         // item), the page goes to matrix order once and the scores run through fast::scores_packed — the same
         // integer sums, so the same bits, eight slots x eight positions x eight dims to the instruction
@@ -1253,7 +1255,7 @@ impl Fattn {
             return;
         }
         let mut sc = crate::scratch::buf::<f32>("fattn.sc", 8 * PAGE);
-        let mut kf = crate::scratch::buf::<f32>("fattn.kf", if f32c { len * hd } else { 0 });
+        let mut kf = crate::scratch::buf::<f32>("fattn.kf", if f32c && !fast_scores_here { len * hd } else { 0 });
         let mut vf = crate::scratch::buf::<f32>("fattn.vf", if f32c { len * hd } else { 0 });
         #[cfg(target_arch = "aarch64")]
         if f32c {
@@ -1533,6 +1535,7 @@ mod neon {
     }
 
     /// TORC_ATTN_F32: the cache rows base..base + nt as f32, exactly (K into kf and V into vf, nt x hd each).
+    /// An empty kf skips the keys: the fast scores never read them.
     pub(super) fn page_f32(kv: &KvCache, base: usize, nt: usize, hd: usize, kf: &mut [f32], vf: &mut [f32]) {
         unsafe fn conv<E: Row>(src: &[E], out: &mut [f32]) {
             assert!(out.len() >= src.len() && src.len().is_multiple_of(8));
@@ -1549,10 +1552,14 @@ mod neon {
         // SAFETY: conv does its own bounds checks
         unsafe {
             if kv.k16.is_empty() {
-                conv(&kv.k[at..at + n], kf);
+                if !kf.is_empty() {
+                    conv(&kv.k[at..at + n], kf);
+                }
                 conv(&kv.v[at..at + n], vf);
             } else {
-                conv(&kv.k16[at..at + n], kf);
+                if !kf.is_empty() {
+                    conv(&kv.k16[at..at + n], kf);
+                }
                 conv(&kv.v16[at..at + n], vf);
             }
         }
@@ -2089,6 +2096,7 @@ mod x86 {
     }
 
     /// TORC_ATTN_F32: the cache rows base..base + nt as f32, exactly (K into kf and V into vf, nt x hd each).
+    /// An empty kf skips the keys: the fast scores never read them.
     pub(super) fn page_f32(kv: &KvCache, base: usize, nt: usize, hd: usize, kf: &mut [f32], vf: &mut [f32]) {
         unsafe fn conv<E: Row>(src: &[E], out: &mut [f32]) {
             assert!(out.len() >= src.len() && src.len().is_multiple_of(8));
@@ -2103,10 +2111,14 @@ mod x86 {
         // SAFETY: conv does its own bounds checks
         unsafe {
             if kv.k16.is_empty() {
-                conv(&kv.k[at..at + n], kf);
+                if !kf.is_empty() {
+                    conv(&kv.k[at..at + n], kf);
+                }
                 conv(&kv.v[at..at + n], vf);
             } else {
-                conv(&kv.k16[at..at + n], kf);
+                if !kf.is_empty() {
+                    conv(&kv.k16[at..at + n], kf);
+                }
                 conv(&kv.v16[at..at + n], vf);
             }
         }
