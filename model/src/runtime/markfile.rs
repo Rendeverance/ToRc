@@ -17,7 +17,8 @@ const MAGIC: &[u8; 8] = b"TORCMRK1";
 /// TORC_REC_F32, and TORC_NGRAM_IDMAP and TORC_MTP_FILE with their files' size and time), folded into the identity a
 /// file is checked against. So a state saved by another build, with the NPU or a GPU tier switched, with another id map
 /// or with another MTP file is never read: a sequence resumed from it would not give the tokens of a fresh read (a
-/// GPU's products, for example, are not the CPU's bits).
+/// GPU's products, for example, are not the CPU's bits). TORC_MTP is in it too: a server without drafts saves a state
+/// without the MTP block's rows, and one with drafts that read it would draft over nothing.
 fn fingerprint() -> u64 {
     static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -37,6 +38,7 @@ fn fingerprint() -> u64 {
             "TORC_ROUTER_F32",
             "TORC_REC_F32",
             "TORC_KV16",
+            "TORC_MTP",
         ] {
             h.update(v.as_bytes());
             h.update(crate::switches::get(v).unwrap_or_default().as_bytes());
