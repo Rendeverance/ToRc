@@ -302,9 +302,7 @@ fn own_resident(file: &File, map: &Mmap, all: bool) -> Result<std::collections::
     let r0 = file.resident.offset as usize;
     let mut bytes = 0usize;
     // with all, only the n-gram table stays in the file (tens of GB; rows.rs reads its rows)
-    let skip = |t: &format::Tensor| {
-        t.name == "per_layer_token_embd.weight" || (!all && t.name == "token_embd.weight")
-    };
+    let skip = |t: &format::Tensor| t.name == "per_layer_token_embd.weight" || (!all && t.name == "token_embd.weight");
     // TORC_OWN_LARGE=1: the copies go in one block of large pages, each 64-aligned within it, and the
     // mapped pages are handed back (the copy is what the products read, so only one copy is held, as klay_group does).
     // Otherwise, or if the system refuses, each copy gets a buffer from the allocator. The bytes are the same either
@@ -497,7 +495,9 @@ impl Weights {
             eprintln!("shard: resident section hash not checked (torc check --layers verified this box's tensors)");
         }
         let check = |w: &Weights| -> Result<()> {
-            if !shard && w.file.resident.hash != [0; 32] && *blake3::hash(w.resident()).as_bytes() != w.file.resident.hash
+            if !shard
+                && w.file.resident.hash != [0; 32]
+                && *blake3::hash(w.resident()).as_bytes() != w.file.resident.hash
             {
                 return err("resident section hash mismatch");
             }
@@ -520,7 +520,9 @@ impl Weights {
                 w.tables.insert(i, r);
             }
             w.map = None;
-            eprintln!("mapless: resident tensors in own memory, the model file no longer mapped (TORC_MAPLESS=0 keeps it)");
+            eprintln!(
+                "mapless: resident tensors in own memory, the model file no longer mapped (TORC_MAPLESS=0 keeps it)"
+            );
         }
         // the expert cache: TORC_CACHE_MB, or by default, when the file does not fit, the free memory less the
         // resident weights and a margin

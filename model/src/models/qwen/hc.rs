@@ -846,7 +846,9 @@ impl Ngram {
             rows = rows.max(off[hh] + voc[hh]);
         }
         // the entry only: a mapless load reads this table's rows from the file (Weights::table_rows)
-        let t = w.entry("per_layer_token_embd.weight").ok_or_else(|| format::Error("missing per_layer_token_embd".into()))?;
+        let t = w
+            .entry("per_layer_token_embd.weight")
+            .ok_or_else(|| format::Error("missing per_layer_token_embd".into()))?;
         if t.n_dims != 2 || t.dims[0] as usize != dim || t.dims[1] < rows || ![20, 8, 2].contains(&t.ty) {
             return err("per_layer_token_embd.weight missing or unexpected");
         }
