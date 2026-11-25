@@ -36,6 +36,9 @@ pub struct Weights {
     /// TORC_EXPERTS_LARGE=1: for each MoE layer, its packs' copy on large pages and the file offset it starts at
     /// (None: read from the mapping; empty when off)
     exl: Vec<Option<(&'static [u8], usize)>>,
+    /// a mapless load: the tables read a row at a time that are not copied (Flash Next's n-gram table), by tensor
+    /// index, read from the file (rows.rs)
+    tables: std::collections::HashMap<usize, crate::runtime::rows::RowReader>,
 }
 
 /// Bytes in 64-byte aligned storage, as the file's tensors are (the kernels read them as u16, f32 or blocks).
@@ -298,8 +301,10 @@ fn own_resident(file: &File, map: &Mmap, all: bool) -> Result<std::collections::
     let t0 = std::time::Instant::now();
     let r0 = file.resident.offset as usize;
     let mut bytes = 0usize;
-    let skip =
-        |t: &format::Tensor| !all && (t.name == "token_embd.weight" || t.name == "per_layer_token_embd.weight");
+    // with all, only the n-gram table stays in the file (tens of GB; rows.rs reads its rows)
+    let skip = |t: &format::Tensor| {
+        t.name == "per_layer_token_embd.weight" || (!all && t.name == "token_embd.weight")
+    };
     // TORC_OWN_LARGE=1: the copies go in one block of large pages, each 64-aligned within it, and the
     // mapped pages are handed back (the copy is what the products read, so only one copy is held, as klay_group does).
     // Otherwise, or if the system refuses, each copy gets a buffer from the allocator. The bytes are the same either
@@ -415,8 +420,9 @@ impl Weights {
             }
         }
         // mapless: the expert cache will stream the experts from this file (the same test as the budget below), so the
-        // mapping is dropped once the resident tensors are copied out. Not yet for a file with Flash Next's n-gram table
-        // (tens of GB read a row at a time through the mapping; its row reader comes next). TORC_MAPLESS=0 keeps it.
+        // mapping is dropped once the resident tensors are copied out (Flash Next's n-gram table, tens of GB read a row
+        // a token, is not copied: rows.rs reads its rows from the file). TORC_MAPLESS=0 keeps the mapping. A build with
+        // the GPU tiers keeps it unless TORC_MAPLESS=1: their expert paths still read the mapping.
         let will_cache = cache
             && file.expert_region.bytes > 0
             && match crate::switches::num::<u64>("TORC_CACHE_MB") {
@@ -424,8 +430,11 @@ impl Weights {
                 None => !fits,
             };
         let mapless = will_cache
-            && crate::switches::get("TORC_MAPLESS").as_deref() != Some("0")
-            && !file.tensors.iter().any(|t| t.name == "per_layer_token_embd.weight");
+            && match crate::switches::get("TORC_MAPLESS").as_deref() {
+                Some("0") => false,
+                Some("1") => true,
+                _ => !cfg!(feature = "gpu"),
+            };
         let mode = crate::switches::get("TORC_WARM");
         let warm = match mode.as_deref() {
             // the warm-up touches the mapping, which a mapless load is about to drop
@@ -478,6 +487,7 @@ impl Weights {
             klay: Vec::new(),
             klay_all: std::sync::OnceLock::new(),
             exl: Vec::new(),
+            tables: std::collections::HashMap::new(),
         };
         // a region hash of zero is not checked. A shard (`<model>.layers`, written by torc check --layers once every
         // tensor and pack it holds has passed its CRC) has holes in the region, so its hash cannot match, and it is not
@@ -497,6 +507,18 @@ impl Weights {
         // mapping goes, before the expert cache opens and warms itself from the file at full speed
         if mapless {
             check(&w)?;
+            // the tables own_resident left in the file: their rows are read from it directly
+            for (i, t) in w.file.tensors.iter().enumerate() {
+                if w.own.contains_key(&i) {
+                    continue;
+                }
+                let rows = (t.dims[1..t.n_dims as usize].iter().product::<u64>()).max(1);
+                let rb = (t.bytes / rows) as usize;
+                let base = w.file.resident.offset + t.offset;
+                let r = crate::runtime::rows::RowReader::new(path, base, rb)
+                    .map_err(|e| format::Error(format!("{path}: {}: {e}", t.name)))?;
+                w.tables.insert(i, r);
+            }
             w.map = None;
             eprintln!("mapless: resident tensors in own memory, the model file no longer mapped (TORC_MAPLESS=0 keeps it)");
         }
@@ -691,8 +713,34 @@ impl Weights {
         if let Some(v) = self.own.get(&i) {
             return Some(TensorRef { t, data: v.bytes() });
         }
-        // a mapless load owns every resident tensor, so this needs the mapping
+        // a mapless load: the tables it left in the file have no bytes in memory (table_rows reads them)
+        self.map.as_ref()?;
         Some(TensorRef { t, data: &self.resident()[t.offset as usize..(t.offset + t.bytes) as usize] })
+    }
+
+    /// A tensor's directory entry (type, shape), whether or not its bytes are in memory.
+    pub fn entry(&self, name: &str) -> Option<&Tensor> {
+        self.index.get(name).map(|&i| &self.file.tensors[i])
+    }
+
+    /// Rows of a table looked up a row per token (the n-gram table), row_bytes each, in the order asked: from memory
+    /// when the tensor is there, else read from the file (a mapless load, rows.rs).
+    pub fn table_rows(&self, name: &str, rows: &[u32]) -> Result<Vec<u8>> {
+        let &i = self.index.get(name).ok_or_else(|| format::Error(format!("missing tensor {name}")))?;
+        if let Some(r) = self.tables.get(&i) {
+            return r.read(rows).map_err(|e| format::Error(format!("{name}: rows from the file: {e}")));
+        }
+        let t = self.need(name)?;
+        let rb = t.row_bytes();
+        let mut out = Vec::with_capacity(rows.len() * rb);
+        for &r in rows {
+            let r = r as usize;
+            if (r + 1) * rb > t.data.len() {
+                return err(format!("{name}: row {r} out of range"));
+            }
+            out.extend_from_slice(&t.data[r * rb..(r + 1) * rb]);
+        }
+        Ok(out)
     }
 
     pub fn need(&self, name: &str) -> Result<TensorRef<'_>> {
