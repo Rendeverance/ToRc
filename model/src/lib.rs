@@ -19,7 +19,7 @@ pub mod tiers;
 
 // every module stays reachable at the crate root by its own name (crate::attn, model::gemma, ...)
 pub(crate) use chat::uniflags;
-pub use chat::{api, serve, tok};
+pub use chat::{api, serve, status, tok};
 pub use kernels::switches;
 pub use layers::{act, attn, fattn, mla, moe, ops, rec};
 #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux")))]

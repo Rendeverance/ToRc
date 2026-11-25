@@ -1,0 +1,515 @@
+<!doctype html>
+<!-- What this server is doing: the model it runs, how far the prompt in progress has been read, and the replies that
+     went through it. Everything on the page is a number the server measured over a named interval - the seconds a
+     prompt has been reading, the seconds a reply has been writing - so the page does arithmetic with nothing but a
+     division, and holds no history of its own to drift out of step. -->
+<meta charset="utf-8">
+<!-- the page loads nothing but its own server: no fonts, no scripts, no analytics to trust with the model's name.
+     Everything below is inline, and the two connections it makes are both to this server - the numbers at
+     /torc/status and the app's own mark at /torc/mark.png -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src 'self'; img-src 'self'; style-src 'unsafe-inline';
+           script-src 'unsafe-inline'">
+<title>torc · status</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+/* The colours, fonts and shapes below are the desktop app's own: the values are copied from ui/renderer/styles.css,
+   same variable names, and the dark values come from the same prefers-color-scheme query the app answers. So this
+   page takes the theme the app is in - the system's - without a setting of its own, and keeps the app's one accent
+   with colour reserved for state. The series colours are those tokens: reading is the accent, writing is the good
+   colour, a stalled prompt is the warn colour. */
+:root {
+  --ground: #F4F5F7; --panel: #FFFFFF; --panel2: #F9FAFB; --line: #E2E5E9;
+  --ink: #1B1F24; --ink2: #5A646F; --ink3: #8A939D;
+  --accent: #2F5D8A; --accent-soft: #E7EEF5;
+  --good: #2E7D4F; --good-soft: #E6F2EB; --warn: #A86A12; --warn-soft: #FBF1E1; --bad: #B83227; --bad-soft: #FBE9E7;
+  --shadow: 0 1px 2px rgba(16, 24, 32, .06), 0 8px 24px rgba(16, 24, 32, .08);
+  --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  --read: var(--accent); --write: var(--good); --busy: var(--warn); --idle: var(--ink3);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #101317; --panel: #161A1F; --panel2: #1B2026; --line: #262C33;
+    --ink: #E5E8EC; --ink2: #9AA4AF; --ink3: #6C7681;
+    --accent: #79A9D8; --accent-soft: #1C2A38;
+    --good: #5FB585; --good-soft: #17271E; --warn: #D9A04A; --warn-soft: #2A2214; --bad: #E06A5F; --bad-soft: #2E1816;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 30px rgba(0, 0, 0, .35);
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+body {
+  margin: 0; padding: 18px 22px 28px; background: var(--ground); color: var(--ink);
+  font: 13.5px/1.5 var(--ui); animation: fadein .45s ease-out both;
+}
+@keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+.num, .v { font-variant-numeric: tabular-nums; }
+main { max-width: 1080px; }
+/* the model name and the two lines under it are the page's title block, in the app's own title sizes */
+h1 { font: 600 20px/1.25 var(--display); margin: 0 0 4px; overflow-wrap: anywhere; }
+.sub { color: var(--ink2); font-size: 12.5px; }
+/* the header is the desktop app's header: its mark, then two lines beside it. The values are the app's own from
+   ui/renderer/styles.css, including the round crop, so the page reads as the same product rather than a related one */
+.brand { display: flex; align-items: center; gap: 10px; }
+/* the app's mark and its round crop at the size a heading read from across a room works at - the app draws it inside
+   a window, the page draws the same bytes larger. The size is written here and not left to the file: the mark's own
+   pixels are 96, and a rule CSS cannot parse is not an error page, it is a logo at 96 */
+.brand .mark { width: 50px; height: 50px; display: block; border-radius: 50%; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
+  padding: 14px 16px 16px; margin-top: 14px; }
+/* panel labels: the app's h3 - small, uppercase, letter-spaced, in the third ink */
+h2, .k { font: 600 11px var(--ui); letter-spacing: .09em; text-transform: uppercase; color: var(--ink3);
+  margin: 0 0 8px; }
+/* the panels start at the same line: their labels are for the numbers under them, and centring them makes one long
+   heading push every other heading down the page */
+.row { display: flex; flex-wrap: wrap; gap: 24px; }
+/* what the engine is doing, on its own line above the tiles. It was a column of the row below: it carries a few words
+   and nothing else, and a column that wide is what separated the reading and writing tiles once the window got narrow
+   enough for the row to wrap */
+.state { margin-bottom: 12px; }
+/* a metric is a column, and its graph is pushed to the bottom of it: the two graphs are then drawn at the same height
+   on the page, which they were not while each card took its own height. What makes the reading card taller is its
+   progress bar, and the honest answer to that is for the other cards to leave the same space empty - a bar is not
+   something a prompt that is not being read has - rather than for their graphs to ride up beside it */
+.metric { flex: 1 1 14rem; min-width: 12rem; display: flex; flex-direction: column; }
+.v { font-size: 1.75rem; font-weight: 600; line-height: 1.15; }
+/* a rate the server measured minutes ago is the best guess at the current one, but it is not a moving number, and
+   showing it in the ink colour of a live one is how it gets read as one */
+.v.stale { color: var(--ink2); }
+.s { color: var(--ink3); font-size: 12px; margin-top: 3px; }
+/* what a prompt is doing in words grows and shrinks from second to second. Everything a reader watches - the number,
+   the bar, the curve - is laid out above those words, and their height is reserved, so that nothing below the number
+   moves while a prompt is being read */
+#readsub, #writesub { min-height: 3em; }
+.badge { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border-radius: 999px;
+  font-size: 11.5px; background: var(--panel2); color: var(--ink2); border: 1px solid var(--line); }
+.badge.busy { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.badge.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+/* how much of the prompt has been read, when its size is known: a bar is read at a glance, a token count is not. The
+   second segment is how far the block in flight has got. It is drawn apart from the first on purpose: the first counts
+   tokens the engine finished, the second is how far one forward pass has travelled, which is a different kind of
+   number and should not look like the same one. */
+/* the width a graph is drawn at, and the bar over it is drawn at the same width so the two read as two views of one
+   prompt. Said once, because a plot that gets wider and leaves its bar behind is the interesting failure */
+:root { --plot: 220px; }
+.prog { margin-top: 10px; }
+.bar, #readspark, #writespark { width: var(--plot); max-width: 100%; }
+.bar { height: 6px; background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
+  overflow: hidden; display: flex; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 999px;
+  transition: width .4s ease; }
+.bar i.part { opacity: .35; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+/* the percent belongs to the bar it measures, not to the sentence above it: centred under the track it is read as the
+   bar's own label, and the track is never removed - an empty one says "nothing is being read" without moving anything
+   on the page. Its height is its own line height whether or not there is a percent to show: a label that appears and
+   disappears moves the graph below it by a few pixels at the start and end of every prompt */
+.pct { text-align: center; color: var(--ink3); font-size: 11.5px; margin-top: 4px; min-height: 1.5em;
+  font-variant-numeric: tabular-nums; }
+/* whether this model was measured on this machine, said under its name: every speed further down the page depends on
+   it, so it belongs above them rather than in a table a reader has to open */
+.lay.bad { color: var(--warn); font-weight: 600; }
+svg { display: block; max-width: 100%; }
+/* the graph of a metric is pinned to the bottom of its card: the two graphs are then on one line down the page, and
+   the padding is the gap that stays when there is no room left to distribute */
+#readspark, #writespark { margin-top: auto; }
+/* the gap above a graph lives in the drawing, never as padding on the svg: padding moves the drawing down inside its
+   own box and the box then clips what it grew over, which is 34 units of plot losing its bottom 6 - exactly the row
+   the line at 0 is drawn on. A card that is narrower than the plot gets the same treatment horizontally, so the plot
+   is given a viewBox and scales instead of losing the samples at the right, which are the newest ones. */
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+th.n, td.n { text-align: right; }
+/* headers sit at the top of their column: one of them wraps to two lines and the others would otherwise sit level
+   with its second, which reads as a column of numbers starting in the middle of the table */
+th { color: var(--ink3); vertical-align: top; font: 600 11px var(--ui); letter-spacing: .09em;
+    text-transform: uppercase; }
+th .u { opacity: .6; }
+td.snip { padding-top: 0; color: var(--ink3); white-space: nowrap; overflow: hidden;
+          text-overflow: ellipsis; max-width: 34rem; }
+/* a request and its text are one entry: the line the shared cell border draws between them reads as another row of
+   numbers, so the pair keeps one line under it and none inside */
+tr.pair td { border-bottom: 0; padding-bottom: 2px; }
+/* an address in the same fixed-width face the numbers use: it is compared across rows by eye, and a proportional face
+   makes 192.0.2.1 and 192.0.2.7 look the same width apart */
+td.ip { font-family: var(--mono); font-size: 12px; color: var(--ink2); white-space: nowrap; }
+/* A phone is narrower than nine columns: measured at 390px the header row alone wants 744px, so the columns are
+   squeezed to 51-72px each, every header wraps to several lines and the last three columns leave the screen. Below that
+   width a reply becomes a small block instead, three lines of labelled values in the same order as the columns. The
+   labels are the column headers' own words, carried on each cell as data-l for exactly this case, so nothing gains or
+   loses a name between the two layouts and a renamed header has to be renamed in one place. */
+@media (max-width: 640px) {
+  #replies thead { display: none; }
+  #replies tbody tr { display: grid; grid-template-columns: repeat(3, minmax(0, auto)); gap: 2px 8px;
+    padding: 4px 0; border-bottom: 1px solid var(--line); }
+  #replies tbody tr.pair { border-bottom: 0; padding-bottom: 0; }
+  #replies td { border: 0; padding: 0; text-align: left; min-width: 0; overflow-wrap: anywhere; }
+  /* the column's own words ride on the cell, so the names stay the same in both layouts. The caption is its own line:
+     a long value ("453.9 s" under model time s) sharing the caption's line breaks the number across two instead. */
+  #replies td[data-l]::before { content: attr(data-l); display: block; color: var(--ink3);
+    font: 600 9.5px var(--ui); letter-spacing: .09em; text-transform: uppercase; }
+  /* a reply's end belongs next to the line that says when it started, not at the bottom of the block: together they
+     are the span being looked at. Pinning it leaves the other eight cells to fill the lines below in column order. */
+  #replies td[data-l="ended"] { grid-column: 3; grid-row: 1; }
+  #replies td[colspan] { grid-column: 1 / -1; }
+}
+.off { color: var(--ink3); font-size: 12px; margin-top: 8px; }
+</style>
+<main>
+<div class="brand">
+  <img class="mark" src="/torc/mark.png" alt="">
+  <div>
+    <h1 id="model">connecting</h1>
+    <div class="sub" id="engine"></div>
+  </div>
+</div>
+
+<section>
+  <div class="state"><div id="state" class="badge">idle</div></div>
+  <div class="row">
+    <div class="metric"><div class="k">reading prompt</div>
+      <div class="v" id="read">–</div>
+      <div class="prog"><div class="bar" id="readbar"><i id="readfill"></i><i id="readpart" class="part"></i></div>
+        <div class="pct" id="readpct"></div></div>
+      <svg id="readspark" width="220" height="38" viewBox="0 0 220 38" preserveAspectRatio="none"></svg>
+      <div class="s" id="readsub"></div></div>
+    <div class="metric"><div class="k">writing reply</div>
+      <div class="v" id="write">–</div>
+      <svg id="writespark" width="220" height="38" viewBox="0 0 220 38" preserveAspectRatio="none"></svg>
+      <div class="s" id="writesub"></div></div>
+    <div class="metric"><div class="k">this run</div>
+      <div class="s" id="run">context – · requests – · waiting –</div></div>
+  </div>
+</section>
+
+<section>
+  <div class="k">replies through this server</div>
+  <table id="replies"><thead><tr>
+    <th>time</th><th class="ip" id="thclient" hidden>from</th><th class="n">prompt <span class="u">tok</span></th>
+    <th class="n">Cache Hit <span class="u">tok</span></th>
+    <th class="n">reply <span class="u">tok</span></th>
+    <th class="n">read <span class="u">t/s</span></th><th class="n">write <span class="u">t/s</span></th>
+    <th class="n">model time <span class="u">s</span></th><th>ended</th>
+  </tr></thead><tbody></tbody></table>
+  <div class="off" id="notext"></div>
+</section>
+</main>
+<script>
+// The whole page is one poll of one address. Every rate on it is a number the server measured over a named interval:
+// the rate of the block being read, the span the reply's last tokens were written in, the seconds a prompt has been
+// reading. The page divides nothing that the server has not already timed, and where it does divide - the average over
+// a prompt so far - it says that is what it shows. The graphs are the last minute of those readings, newest at the
+// right, history flowing right to left.
+const AT = 60;                    // seconds of history in the graphs
+const H = {read: [], write: []};  // [epoch_seconds, value], trimmed to AT
+const TOP = {};                   // top of each graph's scale, held between polls because it is approached, not reset
+// When each series began, kept even after the window has moved past it: the edge drawn at the start of a series
+// belongs to that moment, and once it has scrolled out at the left there is nothing there to close.
+const BEGUN = {read: 0, write: 0};
+const $ = (id) => document.getElementById(id);
+const num = (n, d = 0) => (Number.isFinite(n) ? n.toLocaleString(undefined, {maximumFractionDigits: d}) : "–");
+// One clock on this page, 24-hour, whatever the browser's locale is set to. The times in that table are read next to
+// seconds-elapsed and prompt durations, so an hour that could be twelve hours either way is the one thing on here
+// worth pinning down. Grouping of numbers is left to the locale, because a separator that reads wrong is only ugly.
+const clock = (epoch) => new Date(epoch * 1000).toLocaleTimeString(undefined, {hour12: false});
+
+function spark(which, id, color) {
+  const now = Date.now() / 1000, pts = H[which].filter((p) => now - p[0] <= AT);
+  const svg = $(id), w = +svg.getAttribute("width"), h = +svg.getAttribute("height");
+  const vals = pts.map((p) => p[1]);
+  const hi = Math.max(...vals, 1), lo = Math.min(...vals, hi);
+  // a series that never moves has no height to scale against, and a line pinned to the top of the frame reads as
+  // "at maximum" when it only means "constant" - so a flat one is drawn through the middle instead
+  const flat = hi - lo < 0.02 * hi;
+  // The height of the frame is what the window holds, approached a twentieth of its own height per poll rather than
+  // jumped to. Recomputed and applied in one step, one block reporting a slightly different rate rescales every point
+  // already drawn: the line a reader was watching slid down half its frame and back up while the machine held one
+  // speed, and a plot whose ruler changes under the line cannot be read for a trend at all. A new measurement is meant
+  // to move the newest point, not the frame around the points before it.
+  // Two things follow. Only a series with samples may choose the scale, so the frame's first paint - which has none -
+  // cannot seed it at nothing and leave the first real rate climbing towards a frame it starts out above. And the scale
+  // is never below the highest value in the window: a scale on its way up must not push the line out of the frame.
+  if (pts.length) {
+    const want = flat ? hi * 2 : hi * 1.08, cur = TOP[which] || want, step = cur * 0.05;
+    const eased = Math.abs(want - cur) <= step ? want : cur + Math.sign(want - cur) * step;
+    TOP[which] = Math.max(hi, eased);
+  }
+  const top = TOP[which] || 1;
+  // x counts back from the right edge, so the line grows in from the right and what is already drawn walks left.
+  // The zero of the scale sits 2px inside the frame: a rate of nothing is a reading too, and a line laid on the
+  // bottom edge is cut in half by the frame, where it looks like a plot that stopped rather than a machine that is
+  // idle - which is the one thing a person watching it needs to be able to tell apart.
+  const x = (t) => w - ((now - t) / AT) * w;
+  // the box is 38 units for 30 of scale: 6 of air under the numbers above it and 2 inside its bottom edge. Both live
+  // in the drawing, because anything the box grows by in CSS takes the bottom of the plot away first.
+  const y = (v) => 6 + (1 - v / top) * (h - 8);
+  const xy = pts.map(([t, v]) => `${x(t)},${y(v)}`).join(" ");
+  // three things are drawn whatever the series holds, and the frame's own tint is one of them: the history only
+  // starts when the page is opened, so without it the plot is a line growing out of nowhere from the right, and it is
+  // not obvious whether nothing is happening or the page stopped drawing.
+  // the tint of the plot area (.06) and the tint between the line and its zero (.14) are different strengths of the
+  // same colour on purpose: the first says how wide the plot is, the second says how much was measured.
+  const bg = `<rect x="0" y="0" width="${w}" height="${h}" fill="${color}" fill-opacity=".06"/>`;
+  // the line at 0 is drawn in the series' own colour, below any measured rate, and dashed: a dashed baseline says
+  // "this is where nothing is", so it cannot be mistaken for a rate that held, and it stays visible in both tiles
+  // while the other one is busy - a writing line parked at 0 during a prefill is the answer to "is it only reading?"
+  const zero = `<line x1="0" y1="${y(0)}" x2="${w}" y2="${y(0)}" stroke="${color}" stroke-opacity=".6" `
+    + `stroke-dasharray="3 3" stroke-width="1"/>`;
+  if (pts.length < 1) {
+    svg.innerHTML = bg + zero;
+    return;
+  }
+  // the left end of the drawn series is closed by a stem from zero up to the first value. The history starts when the
+  // page is opened, and an open end there reads as a plot that was cut off rather than as a machine that started
+  // then. One sample is drawn as this stem alone: a line needs two points, a measurement does not.
+  // Once the window has moved past that first sample the stem is dropped: the samples before it were trimmed away, so
+  // a vertical line pinned to the left edge would keep claiming a start that is no longer on the screen, standing
+  // still while everything in the graph scrolls past it. A single sample keeps its stem however old the series is -
+  // it is the only mark that measurement has, and it scrolls out on its own within one window.
+  const begun = now - BEGUN[which] <= AT;
+  const stem = begun || pts.length < 2
+    ? `<line x1="${x(pts[0][0])}" y1="${y(0)}" x2="${x(pts[0][0])}" y2="${y(pts[0][1])}" `
+      + `stroke="${color}" stroke-width="1.5"/>`
+    : "";
+  if (pts.length < 2) {
+    svg.innerHTML = bg + zero + stem;
+    return;
+  }
+  const last = pts[pts.length - 1][0];
+  const area = `M${x(pts[0][0])},${y(0)} L${xy.replaceAll(" ", " L")} L${x(last)},${y(0)} Z`;
+  svg.innerHTML = bg + `<path d="${area}" fill="${color}" fill-opacity=".14"/>` + zero + stem
+    + `<polyline points="${xy}" fill="none" stroke="${color}" stroke-width="1.5"/>`;
+}
+
+// How old a rate has to be before it stops looking live. The engine measures a block when the block ends, so a rate's
+// age runs up to the length of a block before the next report resets it, and a fixed limit dimmed the number once per
+// block wherever a block took longer than the limit - the page watching its own threshold instead of the machine. The
+// limit is the cadence the engine is keeping now: twice the longest gap between its last reports, never under 8 s.
+const CADENCE = {};
+function cadenceLimit(which, age) {
+  const c = CADENCE[which] || (CADENCE[which] = {age: null, gaps: []});
+  // an age that fell means a report arrived, and the age it fell from was the gap between the two
+  if (c.age !== null && age < c.age) { c.gaps.push(c.age); if (c.gaps.length > 5) c.gaps.shift(); }
+  c.age = age;
+  return Math.max(8, 2 * Math.max(0, ...c.gaps));
+}
+
+function push(which, value) {
+  const now = Date.now() / 1000;
+  if (!H[which].length) BEGUN[which] = now;
+  H[which].push([now, value]);
+  while (H[which].length && now - H[which][0][0] > AT) H[which].shift();
+}
+
+function rate(done, seconds) {
+  return seconds > 0.05 && done > 0 ? done / seconds : 0;
+}
+
+// Whether this model was measured on this machine or the engine is running its built-in rules. The server answers the
+// provenance of every setting - the same words as /torc/settings - and it is the first thing to know about any speed
+// on this page: an untuned model is a different machine from a tuned one, and a rate read off the two is not
+// comparable. So it is here, and it is a hover on the layout word rather than a line above the numbers: it describes
+// that word, it is looked up now and then rather than watched, and three sentences of it push the rates a person came
+// for down the page. The one part worth seeing without asking is that nothing was measured, which is why an unmeasured
+// model makes the word the warn colour.
+function tuneNote(d) {
+  const c = d.chosen || {}, u = d.in_use || {};
+  const all = Object.keys(c);
+  // a setting this engine does not report is not one it is running. An x86 build has no NPU tier, so counting its
+  // `npu_hot` as "the built-in rule" would put a fifth item in a sentence about the four values below. Only when
+  // nothing at all is reported does the count fall back to the settings alone, with no values next to it.
+  const keys = Object.keys(u).length ? all.filter((k) => k in u) : all;
+  if (!keys.length) return null;
+  const kinds = keys.map((k) => c[k]);
+  const tuned = kinds.filter((v) => v === "tuned").length;
+  const bySwitch = kinds.filter((v) => v === "switch").length;
+  // "the rest" is not one thing: a value a person set with a switch and a value nobody chose are different
+  // facts about the speed on this page, so they are counted apart instead of lumped as unmeasured.
+  const byRule = kinds.length - tuned - bySwitch;
+  let label, bad;
+  if (!tuned && !bySwitch) {
+    label = "not measured on this machine — the numbers below run the engine's built-in rules"; bad = true;
+  } else if (tuned === keys.length) { label = "measured on this machine"; bad = false; }
+  else {
+    const parts = [];
+    if (tuned) parts.push(`measured here for ${tuned} of ${keys.length}`);
+    if (bySwitch) parts.push(`${bySwitch} set by switches`);
+    if (byRule) parts.push(`${byRule} on the built-in rule`);
+    label = parts.join(" · "); bad = !tuned;
+  }
+  const src = { tuned: "measured", switch: "switch" };
+  const what = keys.filter((k) => k in u)
+    .map((k) => `${k} ${k === "guided" || k === "pin" ? (u[k] ? "on" : "off") : num(u[k])}`
+      + ` (${src[c[k]] || "built-in rule"})`).join(" · ");
+  // a hover is read in lines, so the answer is built as three of them instead of one long sentence
+  return {text: [label, what, d.tune_file].filter(Boolean).join("\n"), bad};
+}
+
+function draw(d) {
+  const live = d.live || {};
+  // the header is the desktop app's: the product, its version, and the model it is running named the way the app
+  // names a loaded model - the file, without the folder it lives in or the extension it has. The path a switch was
+  // given is what /torc/status answers, and it stays there: it is the thing a person at a terminal needs, and not the
+  // thing a person glancing at this page recognises
+  $("model").textContent = `ToRc ${d.engine || "?"}${d.model_name ? ` - ${d.model_name}` : " - no model loaded"}`;
+  // the layout word carries the tuning answer as its hover and takes the warn colour when nothing was measured here
+  const note = tuneNote(d);
+  const lay = d.layout
+    ? `<span class="lay${note && note.bad ? " bad" : ""}"`
+      + (note ? ` title="${esc(note.text)}"` : "") + `>layout ${esc(d.layout)}</span>`
+    : "";
+  $("engine").innerHTML = [lay, d.n_ctx && `context ${num(d.n_ctx)}`].filter(Boolean).join(" &middot; ");
+  const running = !!live.busy;
+  const badge = $("state");
+  badge.className = "badge" + (running ? " busy" : "");
+  badge.textContent = running
+    ? (live.prompt_tokens
+        ? `reading ${num(live.prompt_done)}/${num(live.prompt_tokens)}`
+        : `writing ${num(live.decoded)} tokens`)
+    : "idle";
+  // a reply that has started writing has no prompt left to read, which is why the two are told apart by the
+  // prompt counter rather than by a state the server would have to keep for itself
+  const prefill = running && live.prompt_tokens > 0;
+  // the rate of the block being read is the server's own measurement, and it is the number that tells a reader
+  // whether this prefill is going well right now. Beside it the reading since this prompt's first block ended: both
+  // points of that span are measured, and it leaves out the block that begins a prompt, which pays for the machine
+  // coming back to the model and yields no tokens until it is over. The average over the whole prompt is not shown:
+  // on the 24,501-token prompt an agent sends for a two-letter message, that first block is most of what the number
+  // would be measuring, and a reader watching a run wants the speed of the run. The span runs between two of the
+  // engine's own reports, so this number moves once a block, like the one above it, and not once a second.
+  const now = prefill ? (live.prompt_rate || 0) : 0;
+  // the engine only measures a block once it has finished one, so at a long context this rate can be minutes old
+  const ageS = prefill ? live.prompt_rate_age_s : null;
+  const stale = now > 0 && ageS !== null && ageS > cadenceLimit("read", ageS);
+  const since = prefill ? (live.prompt_rate_sustained || 0) : 0;
+  const read = now || since;
+  // the reply's current speed is the span its last tokens were written in, which the server measured. The average over
+  // the whole reply is only shown when there are too few recent tokens to measure a span from - a reply one token into
+  // itself has no recent speed - and then the line says it is an average, because an average presented as a live rate
+  // is the number that seems to fade out as a reply goes on.
+  const avgWrite = running && !prefill ? rate(live.decoded, live.output_seconds) : 0;
+  const recent = running && !prefill ? live.output_rate : null;
+  const write = recent || avgWrite;
+  // once a reply is finished the server keeps no counters for it, and the write tile would show a dash. The last
+  // reply's rate is a past number: it is drawn dimmed like a stale rate, named as the last reply, and left out of the
+  // graph, where a flat line off a finished reply would read as a rate that held.
+  const last = (d.replies || [])[0] || null;
+  const lastWrite = last ? rate(last.output, last.output_seconds) : 0;
+  // a prompt's reading speed is its engine-measured span after the first block ended, not its whole seconds: the
+  // time before the first block ends is the machine coming back to the model, and it is a third of a long prompt.
+  // A prompt read in one block has no span between two readings - there the whole prompt is that block, and the
+  // pair over the whole prompt is the same reading.
+  const readRate = (r) => !r ? 0 : (r.reading_seconds > 0 ? rate(r.reading_tokens, r.reading_seconds)
+                                                          : rate(r.prompt, r.prompt_seconds));
+  const lastRead = readRate(last);
+  push("read", read); push("write", write);
+  $("read").textContent = read ? `${num(read, 1)} tok/s` : "–";
+  // a rate that has not moved for minutes is shown dimmed rather than dropped: it is the speed the last block of
+  // this prompt was read at, which is the best guess at the one being read, but it is not a number that is moving
+  $("read").className = "v" + (stale ? " stale" : "");
+  // how far through the prompt we are, as a bar and its percent: the token counts say the same thing but ask the
+  // reader to divide, and the question a prefill asks is how much longer. The second segment of the bar is how far the
+  // block in flight has got: a block is one pass over the model's layers, and between two of them nothing else moves,
+  // so without it a long prefill looks frozen for minutes. It assumes each layer costs the same, which wide MoE
+  // layers do not, so it is drawn apart from the measured part and named on the bar rather than merged into it.
+  const block = d.in_use ? (d.in_use.block || 0) : 0;
+  const passDone = prefill ? (live.prompt_layer || 0) : 0;
+  const passTotal = prefill ? (live.prompt_layers || 0) : 0;
+  // capped at what is left to read: at the last block of a prompt a pass can be further along than the tokens
+  // remaining, and a bar running past its own end would be arithmetic, not progress
+  const inside = passTotal > 0 && block > 0
+    ? Math.min(block * (passDone / passTotal), live.prompt_tokens - live.prompt_done) : 0;
+  const donePct = prefill && live.prompt_tokens > 0
+    ? Math.min(100, (live.prompt_done / live.prompt_tokens) * 100) : 0;
+  const pct = Math.min(100, donePct + (prefill && live.prompt_tokens > 0 ? (inside / live.prompt_tokens) * 100 : 0));
+  // the track is never taken off the page. An empty one says nothing is being read, and a bar that appears and
+  // disappears with each prompt moves the graph drawn under it
+  $("readfill").style.width = `${donePct.toFixed(1)}%`;
+  $("readpart").style.width = `${Math.max(0, pct - donePct).toFixed(1)}%`;
+  // the label names the measured part only: the second segment rests on layers costing the same each, and a number
+  // printed under the bar is one the engine measured rather than one it inferred
+  $("readpct").textContent = prefill && live.prompt_tokens > 0 ? `${donePct.toFixed(1)} % read` : "";
+  // two lines, because that is what a glance at a running prompt takes: where the reading is, and whether it is going
+  // at the rate the number above claims. Everything else the engine could say about this prompt - how long it has been
+  // reading, how far inside the block the pass has got, how long is left - is true and is left out: a line that changes
+  // length every second moves the numbers above it, and a reader watching a run does not read it anyway. Their
+  // height is
+  // reserved so that nothing under them shifts. Until a prompt has had a second block reported there is no span to
+  // name, and the dash says that better than a sentence about why not.
+  $("readsub").innerHTML = prefill
+    ? `${num(live.prompt_done)} of ${num(live.prompt_tokens)} tokens<br>`
+      + (since ? `avg ${num(since, 1)} tok/s whole prompt` : "–")
+    : running ? "reading nothing"
+      // once a prompt has been read there is a speed to name; before the first one there is nothing to say. The
+      // token count is the one the rate is taken over, so the two numbers name the same span.
+      : (lastRead ? `last prompt read: ${num(last.reading_seconds > 0 ? last.reading_tokens : last.prompt)}`
+        + ` tokens at avg ${num(lastRead, 1)} tok/s whole prompt` : "idle");
+  $("write").textContent = write ? `${num(write, 1)} tok/s` : "–";
+  $("writesub").textContent = running
+    ? (prefill
+        // "nothing yet" only stands until the server has answered something: after that the last reply's speed is a
+        // real number about this server, and the sentence that explains why there is none is the worse filler
+        ? (lastWrite ? `the last reply: ${num(last.output)} tokens at ${num(lastWrite, 1)} tok/s`
+                     : "nothing yet")
+        : `${num(live.decoded)} tokens · ${num(live.output_seconds, 1)} s · `
+          + (recent ? "rate over the last tokens"
+                    : "average over the reply so far, too few tokens yet for a current rate"))
+    : (lastWrite ? `the last reply: ${num(last.output)} tokens at ${num(lastWrite, 1)} tok/s` : "idle");
+  spark("read", "readspark", "var(--read)"); spark("write", "writespark", "var(--write)");
+  const t = d.totals || {};
+  $("run").textContent = `context ${num(d.n_ctx)} · replies ${num(t.replies)} · waiting ${num(live.waiting)}`
+    + (t.cached_tokens ? ` · ${num(t.cached_tokens)} tokens of a prompt came back from cache` : "");
+  // whose request each row was, when the server was told to keep that: an address says who had the conversation, which
+  // is a second person's business, so the column is either there or not there rather than there and empty
+  const who = !!d.client;
+  $("thclient").hidden = !who;
+  const cols = who ? 9 : 8;
+  const rows = (d.replies || []).map((r) => {
+    const snip = !!(r.asked || r.reply);
+    return `<tr${snip ? ' class="pair"' : ""}><td data-l="time">${clock(r.started)}</td>`
+    + (who ? `<td class="ip" data-l="from" title="${esc(r.client)}">`
+             + `${esc(r.client_name || r.client)}</td>` : "")
+    // the whole prompt the request arrived with, reused tokens included: the figure a conversation grows against, and
+    // the column the next one is a part of. The rate further along stays over the part that was read, not over this.
+    + `<td class="n" data-l="prompt tok">${num(r.prompt_total)}</td>`
+    + `<td class="n" data-l="Cache Hit tok">${num(r.cached)}</td>`
+    + `<td class="n" data-l="reply tok">${num(r.output)}</td>`
+    + `<td class="n" data-l="read t/s">${num(readRate(r), 1)}</td>`
+    + `<td class="n" data-l="write t/s">${num(rate(r.output, r.output_seconds), 1)}</td>`
+    + `<td class="n" data-l="model time s">${num(r.prompt_seconds + r.output_seconds, 1)} s</td>`
+    + `<td data-l="ended">${r.finish}</td></tr>`
+    + (snip ? `<tr><td class="snip" colspan="${cols}">← ${esc(r.asked)} → `
+        // a thinking model whose cap stopped it before it answered: what follows is what it thought, and the page
+        // says so instead of letting it read as the answer
+        + (r.thinking ? "<em>thinking:</em> " : "") + esc(r.reply) + "</td></tr>" : "");
+  }).join("");
+  $("replies").tBodies[0].innerHTML = rows || `<tr><td colspan="${cols}" class="off">nothing yet</td></tr>`;
+  $("notext").textContent = d.text ? "" : "the text of a request and its reply is not shown: TORC_STATUS_TEXT is off";
+}
+
+const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => (
+  {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+async function poll() {
+  try {
+    const r = await fetch("/torc/status", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    draw(await r.json());
+  } catch (e) {
+    // a server that has stopped answering keeps its page up and says so, rather than freezing on its last numbers
+    $("state").className = "badge bad";
+    $("state").textContent = "no answer";
+    $("engine").textContent = `the last poll of /torc/status failed (${e.message})`;
+  }
+}
+// both frames before the first answer: a page that opens on an empty box cannot tell an idle machine from a page
+// that has not drawn anything yet, and the two lines at 0 are what say that nothing has happened lately
+spark("read", "readspark", "var(--read)");
+spark("write", "writespark", "var(--write)");
+poll();
+setInterval(poll, 1000);
+</script>
