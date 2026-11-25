@@ -534,6 +534,62 @@ pub fn allowed(local: bool) -> bool {
     crate::switches::on("TORC_STATUS") && (local || crate::switches::on("TORC_STATUS_NET"))
 }
 
+/// Whether another machine must carry the API key to see the page (`TORC_STATUS_KEY`), as it must for the API. Off by
+/// default, so a page opened to the network with `TORC_STATUS_NET` behaves as it always has. This machine never needs
+/// the key, as it never does for the API; and with no `TORC_API_KEY` set there is no key to carry, so the server
+/// refuses the page to every other machine rather than show it to all of them.
+pub fn keyed() -> bool {
+    crate::switches::on("TORC_STATUS_KEY")
+}
+
+/// How far the page can be seen, which is what the start-up warning has to say.
+#[derive(Clone, Copy)]
+pub struct Reach {
+    /// `TORC_STATUS`: the page is served at all
+    pub page: bool,
+    /// `TORC_STATUS_NET`: other machines may ask for it
+    pub net: bool,
+    /// the server listens on more than this machine (`TORC_HOST`)
+    pub open: bool,
+    /// `TORC_STATUS_KEY`: other machines must carry the API key
+    pub keyed: bool,
+    /// `TORC_API_KEY` is set
+    pub key: bool,
+}
+
+impl Reach {
+    pub fn now(open: bool, key: bool) -> Reach {
+        let on = crate::switches::on;
+        Reach { page: on("TORC_STATUS"), net: on("TORC_STATUS_NET"), open, keyed: keyed(), key }
+    }
+}
+
+/// The line the server prints at start when its page shows what someone asked or where they asked it from, so whoever
+/// turned those on hears who else can read them. Nothing when neither is on, or when the page is off: the warning is
+/// about the two switches, and the counters alone are not someone's business.
+pub fn warning(text: bool, client: bool, r: Reach) -> Option<String> {
+    let what = match (text, client) {
+        (true, true) => "the text of each request and its reply, and the address it came from,",
+        (true, false) => "the text of each request and its reply",
+        (false, true) => "the address each request came from",
+        (false, false) => return None,
+    };
+    if !r.page {
+        return None;
+    }
+    let who = if !r.net || !r.open {
+        "anyone who can use this machine"
+    } else if r.keyed && r.key {
+        "this machine and any machine that has the API key"
+    } else if r.keyed {
+        "this machine only, since TORC_STATUS_KEY asks other machines for a key and TORC_API_KEY is not set"
+    } else {
+        "any machine that can reach this server, with no key asked for: set TORC_STATUS_KEY=1 and TORC_API_KEY to \
+         keep it to machines that have the key"
+    };
+    Some(format!("torc-server: warning: the status page shows {what} to {who}"))
+}
+
 /// The page itself, kept in the binary so that serving it needs no folder beside the executable: it reads two URLs,
 /// both below, and has no other files to load.
 pub const PAGE: &str = include_str!("status.html");
@@ -846,6 +902,40 @@ mod tests {
     }
 
     #[test]
+    fn the_warning_comes_only_with_the_two_switches_and_says_who_can_read_them() {
+        // the reach is passed in rather than read from the switches, which other tests here change as they run
+        let r = |page, net, open, keyed, key| Reach { page, net, open, keyed, key };
+        let all = r(true, true, true, false, false);
+        assert!(warning(false, false, all).is_none(), "the counters alone warn nobody");
+        assert!(warning(true, false, r(false, true, true, false, false)).is_none(), "an off page shows nothing");
+        let w = warning(true, false, all).unwrap();
+        assert!(w.contains("text") && !w.contains("address"), "{w}");
+        assert!(w.contains("any machine") && w.contains("TORC_STATUS_KEY=1"), "an open page says how to close it: {w}");
+        let w = warning(false, true, all).unwrap();
+        assert!(w.contains("address") && !w.contains("text"), "{w}");
+        let w = warning(true, true, all).unwrap();
+        assert!(w.contains("text") && w.contains("address"), "{w}");
+        // not opened to the network, either by the page's switch or by where the server listens
+        for local in [r(true, false, true, false, false), r(true, true, false, false, false)] {
+            let w = warning(true, false, local).unwrap();
+            assert!(w.contains("this machine") && !w.contains("any machine"), "{w}");
+        }
+        let w = warning(true, false, r(true, true, true, true, true)).unwrap();
+        assert!(w.contains("has the API key") && !w.contains("TORC_STATUS_KEY=1"), "{w}");
+        let w = warning(true, false, r(true, true, true, true, false)).unwrap();
+        assert!(w.contains("this machine only") && w.contains("TORC_API_KEY"), "{w}");
+    }
+
+    #[test]
+    fn the_page_passes_on_the_key_it_was_opened_with() {
+        // TORC_STATUS_KEY refuses another machine's request without the key, and the page reads two addresses after
+        // it loads: a key left off either is a page that opens and then goes blank
+        assert!(PAGE_LF.contains("get(\"key\")"), "the page must read ?key= from its own address");
+        assert!(PAGE_LF.contains("withKey(\"/torc/status\")"), "the data must be asked for with the key");
+        assert!(PAGE_LF.contains("withKey(\"/torc/mark.png\")"), "so must the mark");
+    }
+
+    #[test]
     fn the_page_reads_the_address_the_data_is_answered_at() {
         // the route is written in two places, and a rename that misses one shows as a blank page
         assert!(PAGE_LF.contains("/torc/status"), "the page must poll what the server answers");
@@ -878,7 +968,8 @@ mod tests {
         }
         // the header is the desktop app's: its mark served by this server (not a copy of it in another folder, and not
         // a fetch to somewhere else), and the product named before the model, so a page on a LAN is recognisably ours
-        assert!(PAGE_LF.contains("src=\"/torc/mark.png\""), "the app's mark is asked for from this server");
+        // (the address is set from the script, so that it can carry the key the page was opened with)
+        assert!(PAGE_LF.contains(".src = withKey(\"/torc/mark.png\")"), "the app's mark is asked for from this server");
         // the app's own file and crop, at the size a heading across a room is read at rather than the 28 px a
         // window draws it at - the file is not resized, only the box it is drawn into
         assert!(PAGE_LF.contains(".brand .mark { width: 50px"), "the mark is sized for the page, not for the app");

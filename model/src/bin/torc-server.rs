@@ -216,6 +216,30 @@ fn status_refused() -> String {
     json!({"error": {"message": text, "type": "permission_error"}}).to_string()
 }
 
+/// Why the status page was refused to another machine under TORC_STATUS_KEY: the key was missing or wrong, or the
+/// server has none to ask for. Either way the text says what would change the answer.
+fn status_key_refused(has_key: bool) -> String {
+    let text = if has_key {
+        "this server's status page needs its API key from other machines: open it as /?key=<key>, or send the key as \
+         \"Authorization: Bearer <key>\" or \"x-api-key: <key>\""
+    } else {
+        "this server's status page asks other machines for the API key (TORC_STATUS_KEY=1), and no TORC_API_KEY is \
+         set, so it answers only the machine it runs on"
+    };
+    json!({"error": {"message": text, "type": "authentication_error"}}).to_string()
+}
+
+/// The key a request carries in its address's query as key=<key>, with its %XX escapes undone. Only the status page
+/// reads it: the API takes its key in a header, as its clients send it.
+fn query_key(path: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix("key="))
+        .map(|k| unescape(&k.replace('+', " ")))
+        .filter(|k| !k.is_empty())
+}
+
 /// The loaded model as /v1/models lists it.
 fn model_entry(name: &str) -> Value {
     json!({"id": name, "object": "model", "created": CREATED.get().copied().unwrap_or(0), "owned_by": "torc"})
@@ -670,15 +694,23 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
         return;
     }
     // the status page and the numbers it draws. Answered here, on the connection's own thread, like the other
-    // endpoints a monitor uses, so that the page says something while a long prompt is being read. The API key is
-    // not asked for: the page is its own server's client and cannot carry one, and how far it may be seen is
-    // TORC_STATUS and TORC_STATUS_NET's to decide rather than the key's
+    // endpoints a monitor uses, so that the page says something while a long prompt is being read. How far it may be
+    // seen is TORC_STATUS and TORC_STATUS_NET's to decide; the API key is asked of other machines only when
+    // TORC_STATUS_KEY says so, and then it may come in the address as ?key=, since a browser opening the page has no
+    // other way to send it (the page passes it on to what it reads)
     if method == "GET" {
         let page = route(&raw);
         if page.is_empty() || page == "/torc/status" || page == "/torc/mark.png" {
             drain(&mut r, len);
             if !model::status::allowed(local) {
                 return refuse(&mut s, &mut r, "403 Forbidden", &status_refused());
+            }
+            if !local && model::status::keyed() {
+                given.extend(query_key(&raw));
+                // no key set is no key to carry: the page is refused rather than shown to every machine
+                if key.is_none() || !allowed(key, local, &given) {
+                    return refuse(&mut s, &mut r, "401 Unauthorized", &status_key_refused(key.is_some()));
+                }
             }
             match page.as_str() {
                 "" => respond(&mut s, "200 OK", "text/html", model::status::PAGE),
@@ -1110,6 +1142,18 @@ fn listen(e: &mut dyn Serve, port: u16, ctx: usize) {
     });
     let needs = if keyed { ", other machines need the API key" } else { "" };
     eprintln!("torc-server: {} on {host}:{port}{needs}", e.name());
+    // the status page's two switches that show what people asked and where from: when one is on, say who can read it
+    let open = !(host.eq_ignore_ascii_case("localhost") || host.parse().is_ok_and(local_peer));
+    let reach = model::status::Reach::now(open, keyed);
+    let on = model::switches::on;
+    // (the warning says it too when it is printed)
+    if let Some(w) = model::status::warning(on("TORC_STATUS_TEXT"), on("TORC_STATUS_CLIENT"), reach) {
+        eprintln!("{w}");
+    } else if reach.page && reach.net && reach.keyed && !keyed {
+        eprintln!(
+            "torc-server: TORC_STATUS_KEY is on and no TORC_API_KEY is set: other machines are refused the status page"
+        );
+    }
     let (jobs, queue) = std::sync::mpsc::channel::<Job>();
     let accepting = std::thread::Builder::new().name("accept".into()).spawn(move || {
         use std::sync::atomic::Ordering::SeqCst;
@@ -1252,6 +1296,17 @@ mod guards {
         assert!(!allowed(Some("s3cret"), false, &k("s3cret ")));
         assert!(allowed(Some("s3cret"), false, &k("s3cret")));
         assert!(allowed(Some("s3cret"), false, &["wrong".into(), "s3cret".into()]));
+    }
+
+    #[test]
+    fn the_status_page_reads_its_key_from_the_address() {
+        assert_eq!(query_key("/?key=s3cret").as_deref(), Some("s3cret"));
+        assert_eq!(query_key("/torc/status?x=1&key=a%2Bb%20c").as_deref(), Some("a+b c"), "escapes undone");
+        // as the page's own URLSearchParams reads it, so the page and the server agree on what was typed
+        assert_eq!(query_key("/?key=a+b").as_deref(), Some("a b"));
+        for none in ["/", "/?key=", "/?keys=s3cret", "/?mykey=s3cret", "/torc/status"] {
+            assert_eq!(query_key(none), None, "{none}");
+        }
     }
 
     #[test]

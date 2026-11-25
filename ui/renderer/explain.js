@@ -90,6 +90,24 @@ window.EXPLAIN = {
     'The key another machine’s requests must carry (as "Authorization: Bearer <key>" or "x-api-key: <key>"); ' +
     'requests from this machine never need it. For torc-server run by hand only: in the app, Share on my network ' +
     'in Settings makes one and sets this itself.',
+  TORC_STATUS:
+    'The server’s own status page: open the server’s address in a browser to see the model, how far the prompt ' +
+    'being read has got, and the replies that went through it. Off by default. It answers only this machine ' +
+    'unless TORC_STATUS_NET=1.',
+  TORC_STATUS_NET:
+    'Lets other machines open the status page. On its own, anyone who can reach the server can read it: set ' +
+    'TORC_STATUS_KEY=1 as well to ask them for the API key.',
+  TORC_STATUS_KEY:
+    'Other machines need the API key to open the status page, as they do for the API: open it as ' +
+    'http://<address>:<port>/?key=<key>. This machine never needs it. With no key set (TORC_API_KEY, or Share on ' +
+    'my network in Settings), other machines are refused the page. A key typed into an address stays in that ' +
+    'browser’s history.',
+  TORC_STATUS_TEXT:
+    'The status page shows the text of each request and the start of its reply. Anyone who can open the page can ' +
+    'read them: keep the page to this machine, or set TORC_STATUS_KEY=1 when it is open to the network.',
+  TORC_STATUS_CLIENT:
+    'The status page shows the address each request came from. Anyone who can open the page can see them: keep ' +
+    'the page to this machine, or set TORC_STATUS_KEY=1 when it is open to the network.',
   TORC_HOST:
     'The address the server listens on. This machine only by default. Set it to open the server to your ' +
     'network, and set TORC_API_KEY with it, or anyone there can use it. For torc-server run by hand only: in the ' +
