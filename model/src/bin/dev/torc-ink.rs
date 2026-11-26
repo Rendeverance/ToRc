@@ -1,4 +1,4 @@
-//! torc-ink <model> [text=PROMPT | toks=tokens.int32] [n=N] [gen=G] [block=B] [ref=logits.f32] [dump=logits.f32]
+//! torc-ink <model> [text=PROMPT | toks=tokens.int32] [n=N] [gen=G] [block=B] [first=B] [ref=logits.f32] [dump=logits.f32]
 //! [ctx=N]: runs Inkling 2 Mini (inkling.rs). The prompt's tokens (text= goes through the model's tokeniser as it
 //! stands, special tokens read; toks= is a file of token ids; n= takes the first N) are read one at a time, and the
 //! token each position would pick is printed. ref= compares the logits of every position against a float32 file of
@@ -132,13 +132,24 @@ fn main() {
     // one token at a time
     let mut all = vec![0.0f32; ids.len() * nv];
     let t1 = Instant::now();
-    for (p, &id) in ids.iter().enumerate() {
-        m.forward(&[id], p as u32, &mut all[p * nv..(p + 1) * nv], false).unwrap_or_else(|e| fail(e));
-        let top = argmax(&all[p * nv..(p + 1) * nv]) as u32;
-        println!("  {p:4}  {id:6} {:?} -> {top:6} {:?}  ({:.3})", show(id), show(top), all[p * nv + top as usize]);
+    // first=B: read the prompt in blocks of B only (no one-at-a-time pass, no check), for writing at depth
+    let first: usize = opt("first").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if first > 0 {
+        let mut p = 0;
+        for ch in ids.chunks(first) {
+            m.forward(ch, p as u32, &mut all[p * nv..(p + ch.len()) * nv], true).unwrap_or_else(|e| fail(e));
+            p += ch.len();
+        }
+    } else {
+        for (p, &id) in ids.iter().enumerate() {
+            m.forward(&[id], p as u32, &mut all[p * nv..(p + 1) * nv], false).unwrap_or_else(|e| fail(e));
+            let top = argmax(&all[p * nv..(p + 1) * nv]) as u32;
+            println!("  {p:4}  {id:6} {:?} -> {top:6} {:?}  ({:.3})", show(id), show(top), all[p * nv + top as usize]);
+        }
     }
     let s = t1.elapsed().as_secs_f64();
-    println!("read {} tokens one at a time in {s:.2} s ({:.2} tok/s)", ids.len(), ids.len() as f64 / s);
+    let how = if first > 0 { format!("in blocks of {first}") } else { "one at a time".to_string() };
+    println!("read {} tokens {how} in {s:.2} s ({:.2} tok/s)", ids.len(), ids.len() as f64 / s);
     if let Some(f) = opt("dump") {
         let b: Vec<u8> = all.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&f, b).unwrap();
@@ -164,6 +175,10 @@ fn main() {
     if gen_n > 0 && !ids.is_empty() {
         let mut next = argmax(&all[(ids.len() - 1) * nv..]) as u32;
         let mut lg = vec![0.0f32; nv];
+        // the profile counts the writing only
+        for c in model::models::inkling::inkling::PROF.iter() {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let t3 = Instant::now();
         let mut text = Vec::new();
         for g in 0..gen_n {
