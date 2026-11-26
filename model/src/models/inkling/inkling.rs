@@ -789,43 +789,60 @@ impl Ink {
             let hpi = if n > 1 { per } else { 1 };
             let groups = nh / hpi;
             if n == 1 {
-                // one token: a head an item, with nothing to tile (the tiled code below costs writing 3-5% on box1,
+                // one token: nothing to tile (the tiled code below cost writing 3-5% on box1,
                 // 26 Nov). The same steps as the tiled path for one query, so the same bits
                 let pos = pos0 as usize;
                 let lo = if swa { (pos + 1).saturating_sub(h.window) } else { 0 };
-                each(nh, &|hh| {
-                    let mut bias = vec![0.0f32; h.extent];
-                    let mut sc = vec![0.0f32; pos + 1 - lo];
-                    let (qh, rh) = (&q[hh * hd..(hh + 1) * hd], &rel[hh * nr..(hh + 1) * nr]);
-                    let g = hh / per;
-                    let sk = sink[hh];
-                    for (d, b) in bias.iter_mut().enumerate() {
-                        *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                // an item is one key head with its `per` query heads, so each key and value row is read from memory
+                // once for all of them (the cache is f32 by position: at depth it is most of a token's bytes). Each
+                // head's numbers are the same steps in the same order, so the same bits
+                let span = pos + 1 - lo;
+                each(nkv, &|g| {
+                    let h0 = g * per;
+                    let mut bias = vec![0.0f32; per * h.extent];
+                    let mut sc = vec![0.0f32; per * span];
+                    for j in 0..per {
+                        let rh = &rel[(h0 + j) * nr..(h0 + j + 1) * nr];
+                        for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
+                            *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                        }
                     }
-                    let mut mx = 0.0f32;
                     for (i, p) in (lo..=pos).enumerate() {
                         let d = pos - p;
                         let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                        let b = if d < h.extent { bias[d] } else { 0.0 };
-                        sc[i] = dot(qh, k) * scale + (b - sk);
-                        mx = mx.max(sc[i]);
-                    }
-                    let mut sum = (-mx).exp();
-                    for v in sc.iter_mut() {
-                        *v = (*v - mx).exp();
-                        sum += *v;
-                    }
-                    // SAFETY: item hh owns head hh of the token's row of att
-                    let oh = unsafe { ap.slice(hh * hd, hd) };
-                    for (i, p) in (lo..=pos).enumerate() {
-                        let wgt = sc[i] / sum;
-                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                        for (a, b) in oh.iter_mut().zip(v) {
-                            *a = wgt.mul_add(*b, *a);
+                        for j in 0..per {
+                            let hh = h0 + j;
+                            let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
+                            sc[j * span + i] = dot(&q[hh * hd..(hh + 1) * hd], k) * scale + (b - sink[hh]);
                         }
                     }
-                    for (a, g) in oh.iter_mut().zip(&gate[hh * hd..(hh + 1) * hd]) {
-                        *a *= 1.0 / (1.0 + (-g).exp());
+                    let mut sums = vec![0.0f32; per];
+                    for j in 0..per {
+                        let row = &mut sc[j * span..(j + 1) * span];
+                        let mut mx = 0.0f32;
+                        for &v in row.iter() {
+                            mx = mx.max(v);
+                        }
+                        let mut sum = (-mx).exp();
+                        for v in row.iter_mut() {
+                            *v = (*v - mx).exp();
+                            sum += *v;
+                        }
+                        sums[j] = sum;
+                    }
+                    // SAFETY: item g owns heads h0..h0 + per of the token's row of att
+                    let og = unsafe { ap.slice(h0 * hd, per * hd) };
+                    for (i, p) in (lo..=pos).enumerate() {
+                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        for j in 0..per {
+                            let wgt = sc[j * span + i] / sums[j];
+                            for (a, b) in og[j * hd..(j + 1) * hd].iter_mut().zip(v) {
+                                *a = wgt.mul_add(*b, *a);
+                            }
+                        }
+                    }
+                    for (a, gt) in og.iter_mut().zip(&gate[h0 * hd..(h0 + per) * hd]) {
+                        *a *= 1.0 / (1.0 + (-gt).exp());
                     }
                 });
             } else {
