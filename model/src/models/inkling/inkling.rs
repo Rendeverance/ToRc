@@ -1009,7 +1009,13 @@ impl Ink {
                 let mut jobs: Vec<(Mat, &mut [f32])> = Vec::with_capacity(2 * k);
                 for (i, part) in gu.chunks_mut(ffp).enumerate() {
                     let (pk, pack) = packs[i / 2];
-                    jobs.push((piece(pk, if i % 2 == 0 { &pack.gate } else { &pack.up }), part));
+                    let mut m = piece(pk, if i % 2 == 0 { &pack.gate } else { &pack.up });
+                    // only the expert's ff real rows: the converter pads gate and up to ffp rows of zeros, whose
+                    // outputs SITU never reads (each real row is the same dot product, so the same bits)
+                    let rb = m.data.len() / m.rows;
+                    m.data = &m.data[..ff * rb];
+                    m.rows = ff;
+                    jobs.push((m, part));
                 }
                 crate::moe::apply_group(&mut jobs, xq.view());
             }
