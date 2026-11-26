@@ -780,46 +780,84 @@ impl Ink {
             let (ck, cv) = (&st.k, &st.v);
             let scale = 1.0 / (hd as f32).sqrt();
             let per = nh / nkv;
-            // a (token, head) pair an item, so a single token's heads spread over the pool; each head's numbers are
-            // the same steps as before, so the bits do not depend on n or on how the items are dealt
-            each(n * nh, &|it| {
-                let (t, hh) = (it / nh, it % nh);
-                let pos = pos0 as usize + t;
-                let lo = if swa { (pos + 1).saturating_sub(h.window) } else { 0 };
-                let mut bias = vec![0.0f32; h.extent];
-                let mut sc = vec![0.0f32; pos + 1 - lo];
-                let (qh, rh) =
-                    (&q[t * qd + hh * hd..t * qd + (hh + 1) * hd], &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr]);
+            // an item is one head over a tile of up to ATT_QT tokens (so a single token's heads spread over the pool,
+            // and in a prompt block each key and value row is read once for the tile's queries while it is in the
+            // core's cache). Each query's numbers are the same steps in the same order as one query alone (its scores
+            // over its own keys in position order, the same maximum and sums, its value sums in position order), so
+            // the bits do not depend on n, the tile or how the items are dealt
+            const ATT_QT: usize = 8;
+            let tiles = n.div_ceil(ATT_QT);
+            each(tiles * nh, &|it| {
+                let (tile, hh) = (it / nh, it % nh);
+                let (t0, t1) = (tile * ATT_QT, ((tile + 1) * ATT_QT).min(n));
                 let g = hh / per;
-                let sk = sink[t * nh + hh];
-                for (d, b) in bias.iter_mut().enumerate() {
-                    *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                // each query's first key, and the tile's span of keys
+                let lo_of = |t: usize| {
+                    let pos = pos0 as usize + t;
+                    if swa { (pos + 1).saturating_sub(h.window) } else { 0 }
+                };
+                let (span_lo, span_hi) = (lo_of(t0), pos0 as usize + t1 - 1);
+                let width = span_hi + 1 - span_lo;
+                // the tile's scores, a row of width a query (query t's own keys lo_of(t)..=pos at their offsets)
+                let mut sc = vec![0.0f32; (t1 - t0) * width];
+                let mut bias = vec![0.0f32; (t1 - t0) * h.extent];
+                for t in t0..t1 {
+                    let rh = &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr];
+                    for (d, b) in bias[(t - t0) * h.extent..(t - t0 + 1) * h.extent].iter_mut().enumerate() {
+                        *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                    }
                 }
-                let mut mx = 0.0f32;
-                for (i, p) in (lo..=pos).enumerate() {
-                    let d = pos - p;
+                for p in span_lo..=span_hi {
                     let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                    let b = if d < h.extent { bias[d] } else { 0.0 };
-                    sc[i] = dot(qh, k) * scale + (b - sk);
-                    mx = mx.max(sc[i]);
+                    for t in t0..t1 {
+                        let pos = pos0 as usize + t;
+                        if p < lo_of(t) || p > pos {
+                            continue;
+                        }
+                        let d = pos - p;
+                        let b = if d < h.extent { bias[(t - t0) * h.extent + d] } else { 0.0 };
+                        let qh = &q[t * qd + hh * hd..t * qd + (hh + 1) * hd];
+                        sc[(t - t0) * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
+                    }
                 }
-                let mut sum = (-mx).exp();
-                for v in sc.iter_mut() {
-                    *v = (*v - mx).exp();
-                    sum += *v;
+                // each query's softmax over its own keys, in position order, with the sink's zero beside them
+                let mut sums = vec![0.0f32; t1 - t0];
+                for t in t0..t1 {
+                    let (lo, pos) = (lo_of(t), pos0 as usize + t);
+                    let row = &mut sc[(t - t0) * width + (lo - span_lo)..(t - t0) * width + (pos + 1 - span_lo)];
+                    let mut mx = 0.0f32;
+                    for &v in row.iter() {
+                        mx = mx.max(v);
+                    }
+                    let mut sum = (-mx).exp();
+                    for v in row.iter_mut() {
+                        *v = (*v - mx).exp();
+                        sum += *v;
+                    }
+                    sums[t - t0] = sum;
                 }
-                // SAFETY: item it owns head hh of token t's row of att
-                let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
-                for (i, p) in (lo..=pos).enumerate() {
-                    let wgt = sc[i] / sum;
+                // the values, each row read once for the tile; each query's sums stay in position order
+                for p in span_lo..=span_hi {
                     let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                    for (a, b) in oh.iter_mut().zip(v) {
-                        *a = wgt.mul_add(*b, *a);
+                    for t in t0..t1 {
+                        if p < lo_of(t) || p > pos0 as usize + t {
+                            continue;
+                        }
+                        let wgt = sc[(t - t0) * width + (p - span_lo)] / sums[t - t0];
+                        // SAFETY: item it owns head hh of tokens t0..t1's rows of att
+                        let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
+                        for (a, b) in oh.iter_mut().zip(v) {
+                            *a = wgt.mul_add(*b, *a);
+                        }
                     }
                 }
                 // the output's gate
-                for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
-                    *a *= 1.0 / (1.0 + (-g).exp());
+                for t in t0..t1 {
+                    // SAFETY: as above
+                    let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
+                    for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
+                        *a *= 1.0 / (1.0 + (-g).exp());
+                    }
                 }
             });
         }
