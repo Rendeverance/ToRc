@@ -25,7 +25,9 @@
 //! reply or as that API's stream of events. While a reply is being written, the requests that don't need the model
 //! (/health, /slots, /metrics, the model list) are answered at once, and the others wait their turn in the order
 //! their requests arrive in full. GET /torc/settings gives the settings it runs with as a profile, and POST
-//! /torc/settings reads one in for its next start (runtime/profile.rs, AUTOTUNE.md). This file is the HTTP side. The
+//! /torc/settings reads one in for its next start (runtime/profile.rs, AUTOTUNE.md). With TORC_STATUS=1 it also serves
+//! a page of its own at /, and the numbers that page draws at /torc/status: what the model is reading and writing at
+//! this moment, and the replies that went through it (chat/status.rs, SWITCHES.md). This file is the HTTP side. The
 //! model answers through chat/serve.rs, each family from its own folder under models/, picked by the file's
 //! architecture.
 
@@ -52,12 +54,28 @@ fn timings((pn, ps, ft, rn, rs): (usize, f64, f64, usize, f64)) -> Value {
 }
 
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &str) {
-    // the charset named: a client that guesses (Windows PowerShell 5.1 reads ISO-8859-1) shows UTF-8 text wrongly
-    let _ = write!(
-        s,
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    // the charset named: a client that guesses (Windows PowerShell 5.1 reads ISO-8859-1) shows UTF-8 text wrongly.
+    // `no-store` because every answer this server gives is a current one: a page or a picture kept in a browser cache
+    // is the previous run's page, and a status page that quietly shows yesterday is worse than no status page
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}; charset=utf-8\r\nCache-Control: no-store\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
+    let _ = s.write_all(head.as_bytes());
+    let _ = s.write_all(body.as_bytes());
+}
+
+/// As `respond`, for a body that is not text: no charset is named, because a charset would be a claim about bytes
+/// that are a picture.
+fn respond_bytes(s: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = s.write_all(head.as_bytes());
+    let _ = s.write_all(body);
 }
 
 /// The largest request body read (a chat with long attachments runs to a few MB).
@@ -184,6 +202,20 @@ fn route(path: &str) -> String {
     }
 }
 
+/// Why the status page was refused. Like this server's other refusals, the reason says what would change the answer,
+/// since a browser landing on the address has no way to guess which of the two it met: the page off, or the page on
+/// and not for that machine. The second is the only reason a request gets here when the first is not, which is why
+/// the switch decides between them and the address does not have to be looked at again.
+fn status_refused() -> String {
+    let text = if !model::switches::on("TORC_STATUS") {
+        "this server's status page is off: start it with TORC_STATUS=1 to see it"
+    } else {
+        "this server's status page answers only to the machine it runs on: start it with TORC_STATUS_NET=1 \
+         to answer other machines"
+    };
+    json!({"error": {"message": text, "type": "permission_error"}}).to_string()
+}
+
 /// The loaded model as /v1/models lists it.
 fn model_entry(name: &str) -> Value {
     json!({"id": name, "object": "model", "created": CREATED.get().copied().unwrap_or(0), "owned_by": "torc"})
@@ -300,6 +332,9 @@ struct Job {
     // whether another request was being answered or waiting when this one came: only then can its client have
     // given up waiting
     waited: bool,
+    // the address the request arrived on, carried with it so that the reply it produces can be attributed to it
+    // without a second lookup on the model's thread
+    client: String,
     _open: Open,
     _held: Held,
 }
@@ -319,6 +354,11 @@ struct Status {
     waiting: usize,
     /// the current reply's sampling settings, in llama-server's names
     params: Value,
+    /// the address the current request came from, filled in on the model's thread when its turn starts so that it
+    /// belongs to the reply actually running and not to one that queued behind it. Only the page's client column uses
+    /// it, and only with `TORC_STATUS_CLIENT` on: a connection's port is not kept, because it changes per request and
+    /// identifies nothing a reader would recognise.
+    client: String,
     /// the current reply's pieces of text sent so far (about one a token)
     decoded: u64,
     /// since the server started: the prompt tokens read, those kept from before, and the seconds reading; the reply
@@ -345,8 +385,91 @@ fn slots() -> Value {
     let ctx = SERVED.get().map_or(0, |s| s.1);
     let max = st.params["n_predict"].as_i64().unwrap_or(-1);
     let remain = if st.busy && max >= 0 { (max - st.decoded as i64).max(0) } else { -1 };
+    // how far the prompt being read has got, under the names llama-server uses for the same thing: a monitor that has
+    // watched a llama-server asks this server the same question. Until a model reports its progress the two are zero,
+    // which is also what a llama-server answers between tasks
+    let (reading, read, _) = model::status::reading();
     json!([{"id": 0, "id_task": st.task, "n_ctx": ctx, "is_processing": st.busy, "params": st.params,
+        "n_prompt_tokens": reading, "n_prompt_tokens_processed": read,
         "next_token": {"has_next_token": st.busy, "n_remain": remain, "n_decoded": st.decoded}}])
+}
+
+/// GET /torc/status: what the page at / draws. The model, what is being read and written at this moment, the totals
+/// of this run, and the replies the server still remembers.
+///
+/// Every rate on that page comes from two numbers measured over the same interval here (the tokens read and the
+/// seconds the model has been reading them), rather than from a page comparing two of its own polls. A page that
+/// differences counters of its own has to guess when a counter stopped moving because a run ended and when it stopped
+/// because the engine reports in blocks, and gets it wrong at exactly the moment a run changes state.
+fn status_json() -> Value {
+    let st = state();
+    let (name, ctx) = SERVED.get().map_or(("", 0), |s| (s.0.as_str(), s.1));
+    let (tokens, done, prompt_s) = model::status::reading();
+    let (pass, pass_total) = model::status::pass_progress();
+    json!({
+        "model": name,
+        // the name a person reads rather than the path a switch was given: the page's header is the app's, and the
+        // app calls a loaded model by its file without the folder or the extension
+        "model_name": model::status::model_name(name),
+        "n_ctx": ctx,
+        "engine": env!("CARGO_PKG_VERSION"),
+        "layout": model::tune::layout(),
+        // what is happening in the one slot, right now: all zeros and false between replies
+        "live": {
+            "busy": st.busy,
+            "task": st.task,
+            "waiting": st.waiting,
+            "decoded": st.decoded,
+            "prompt_tokens": tokens,
+            "prompt_done": done,
+            "prompt_seconds": prompt_s,
+            // the rate of the block being read, as the engine measured it
+            "prompt_rate": model::status::reading_rate(),
+            // and the rate since the first block of this prompt ended. prompt_done / prompt_seconds is the average of
+            // the whole prompt, and the first block of one pays for the machine coming back to the model, so that
+            // number describes a cold start as much as it describes reading: on a 24,501-token prompt that is a 221
+            // second run read at 113 t/s, where the reading after the first block runs far above it.
+            "prompt_rate_sustained": model::status::reading_sustained(),
+        // the age of that measurement, so that the rate beside it can be shown as current or as the last thing the
+        // engine could measure
+        "prompt_rate_age_s": model::status::reading_rate_age(),
+        // how far inside the block being read the model has got, in layers of its forward pass. A block is one pass
+        // over those layers and nothing else moves before it ends, so this is the difference between a long prefill
+        // that looks stalled and one that is visibly at layer 12 of 40. It is progress and never a rate: no speed is
+        // worked out from it anywhere, and a piped run reports 0,0 because half the pass is on another machine.
+        "prompt_layer": pass,
+        "prompt_layers": pass_total,
+            "output_seconds": model::status::writing(),
+            // the rate of the reply's last tokens, or null when too few were written in the recent window to measure a
+            // span from. `decoded / output_seconds` is what the engine prints at the end of a reply and holds its fast
+            // start for a minute afterwards: a live display that shows it as the current speed shows a number that
+            // fades toward an average instead of following the machine.
+            "output_rate": model::status::writing_rate(),
+        },
+        // where the running settings came from, in the same words as /torc/settings: "tuned" is a value this machine
+        // measured for this model, "default" is the engine's own rule. A model that has never been tuned here runs on
+        // rules, and a page that shows its speed has to say which of the two produced it - the first question about a
+        // number on this screen is whether the machine was ever asked what it is good at.
+        "in_use": model::profile::in_use(),
+        "chosen": model::profile::chosen(),
+        "tune_file": model::tune::file().map(|p| p.display().to_string()),
+        // everything this run has done, which is also what /metrics reports as its counters
+        "totals": {
+            // the replies this run finished, not the requests it was handed: a request it refused before generating
+            // never answered, and the table under this number shows only answers
+            "replies": model::status::finished(),
+            "prompt_tokens": st.prompt,
+            "cached_tokens": st.cached,
+            "prompt_seconds": st.prompt_s,
+            "tokens_predicted": st.written,
+            "predicted_seconds": st.written_s,
+        },
+        "text": model::switches::on("TORC_STATUS_TEXT"),
+        // whether the rows carry the address they came from. Named like `text` so that the page can leave the column
+        // out entirely rather than showing an empty one
+        "client": model::switches::on("TORC_STATUS_CLIENT"),
+        "replies": model::status::recent(),
+    })
 }
 
 /// GET /metrics: Prometheus' text, under llama-server's names, so that a monitor made for it reads this too. Its
@@ -397,7 +520,7 @@ impl Serve for Noted<'_> {
     }
 
     fn reply(&mut self, c: &api::Chat, emit: &mut dyn FnMut(bool, &str) -> bool) -> format::Result<Reply> {
-        {
+        let (task, asked, client) = {
             let mut st = state();
             st.busy = true;
             st.task += 1;
@@ -405,17 +528,40 @@ impl Serve for Noted<'_> {
             st.params = json!({"n_predict": c.max, "max_tokens": c.max, "seed": c.seed, "temperature": c.temperature,
                 "top_k": c.top_k.unwrap_or(40), "top_p": c.top_p, "presence_penalty": c.presence_penalty,
                 "frequency_penalty": c.frequency_penalty, "stream": c.stream});
-        }
+            // what was asked, for the page, which drops it again unless TORC_STATUS_TEXT is on, and who asked it,
+            // which TORC_STATUS_CLIENT decides in the same way
+            (st.task, model::status::asked(&c.msgs), st.client.clone())
+        };
+        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        // the start of the answer, for the same page and the same switch. Held only as long as a snippet is: a reply
+        // of four thousand tokens is not kept here for a page that shows the first two hundred characters of it
+        let mut opening = String::new();
+        let mut thinking = String::new();
         let r = self.0.reply(c, &mut |reasoning, t| {
             if !t.is_empty() {
                 state().decoded += 1;
+                if model::status::note_token() {
+                    // the first token of a reply: the prompt is read, and the interval that matters from here is the
+                    // writing of the answer
+                    model::status::read_end();
+                }
+                if opening.len() < 4 * model::status::SNIPPET && !reasoning {
+                    opening.push_str(t);
+                } else if reasoning && thinking.len() < 4 * model::status::SNIPPET {
+                    thinking.push_str(t);
+                }
             }
             emit(reasoning, t)
         });
-        let (pn, ps, _, wn, ws) = self.0.timed();
+        let (pn, ps, first, wn, ws) = self.0.timed();
         let kept = self.0.kept();
         let mut st = state();
         st.busy = false;
+        // whatever the reply was, nothing of it is "in progress" now: a monitor that watches for a counter to drop
+        // learns the run ended, and a model that reports no progress leaves nothing standing either
+        model::status::read_end();
+        model::status::write_end();
+        let (text, thinking) = model::status::snippet(&opening, &thinking);
         let r = r?;
         st.prompt += pn as u64;
         st.cached += kept as u64;
@@ -427,6 +573,27 @@ impl Serve for Noted<'_> {
         st.window.1 += ps;
         st.window.2 += wn as u64;
         st.window.3 += ws;
+        model::status::keep(model::status::Record {
+            task,
+            started,
+            prompt: pn,
+            cached: kept,
+            output: wn,
+            prompt_s: ps,
+            first_token_s: first,
+            output_s: ws,
+            // the prompt's own average the page will show: the engine's reading after its first block ended, from
+            // the first rate the prompt produced to the last one - none for a single-block prompt, where the whole
+            // prompt is that block
+            reading: model::status::last_reading_span().unwrap_or((0, 0.0)),
+            finish: r.finish,
+            asked,
+            // the answer if there is one, and the thinking if that is all there was: the page is told which, so it
+            // never passes thinking off as the reply
+            reply: text,
+            thinking,
+            client,
+        });
         Ok(r)
     }
 
@@ -459,7 +626,9 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
     // with TORC_API_KEY set, another machine's request needs the key, and gets only a few seconds to send its head;
     // this machine's never needs it (a failed address lookup counts as another machine)
     let key = KEY.get().and_then(|k| k.as_deref());
-    let local = s.peer_addr().map(|a| local_peer(a.ip())).unwrap_or(false);
+    // the address, looked up once: whether it is this machine's, which is what decides about the key, and the address
+    // itself for the status page's client column, which drops it again unless TORC_STATUS_CLIENT is on
+    let (local, client) = s.peer_addr().map_or((false, String::new()), |a| (local_peer(a.ip()), a.ip().to_string()));
     let start = std::time::Instant::now();
     let head_end = if key.is_some() && !local { KEYED_HEAD_DEADLINE } else { REQUEST_DEADLINE };
     let mut r = BufReader::new(Deadline { s: rs, end: start + head_end });
@@ -499,6 +668,27 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
         drain(&mut r, len);
         respond(&mut s, "200 OK", "application/json", r#"{"status":"ok"}"#);
         return;
+    }
+    // the status page and the numbers it draws. Answered here, on the connection's own thread, like the other
+    // endpoints a monitor uses, so that the page says something while a long prompt is being read. The API key is
+    // not asked for: the page is its own server's client and cannot carry one, and how far it may be seen is
+    // TORC_STATUS and TORC_STATUS_NET's to decide rather than the key's
+    if method == "GET" {
+        let page = route(&raw);
+        if page.is_empty() || page == "/torc/status" || page == "/torc/mark.png" {
+            drain(&mut r, len);
+            if !model::status::allowed(local) {
+                return refuse(&mut s, &mut r, "403 Forbidden", &status_refused());
+            }
+            match page.as_str() {
+                "" => respond(&mut s, "200 OK", "text/html", model::status::PAGE),
+                // the app's mark, so the page's header is the header of the app next to it. It is under the same
+                // switch as the page: a machine that may not read the page may not read the mark either
+                "/torc/mark.png" => respond_bytes(&mut s, "200 OK", "image/png", model::status::MARK),
+                _ => respond(&mut s, "200 OK", "application/json", &status_json().to_string()),
+            }
+            return;
+        }
     }
     if !allowed(key, local, &given) {
         return refuse(&mut s, &mut r, "401 Unauthorized", &key_refused(&raw));
@@ -565,7 +755,7 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
                 st.waiting += 1;
                 st.busy || st.waiting > 1
             };
-            if jobs.send(Job { method, path, body, s, waited, _open: open, _held: held }).is_err() {
+            if jobs.send(Job { method, path, body, s, waited, client, _open: open, _held: held }).is_err() {
                 state().waiting -= 1;
             }
         }
@@ -594,8 +784,11 @@ fn gone(s: &TcpStream) -> bool {
 
 /// A request on the model's thread: the routes that need the model, or that change what it starts with next.
 fn run(e: &mut dyn Serve, j: Job) {
-    let Job { method, path, body, mut s, waited, .. } = j;
+    let Job { method, path, body, mut s, waited, client, .. } = j;
     let s = &mut s;
+    // whose request this is, for the status page: set here rather than where it was read, because the model's thread
+    // takes one request at a time and the address has to belong to the one actually running
+    state().client = client;
     match (method.as_str(), path.as_str()) {
         ("GET", "/torc/settings") => {
             respond(s, "200 OK", "application/json", &model::profile::export(e.name()).to_string());

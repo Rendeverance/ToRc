@@ -687,6 +687,9 @@ impl Model {
         // two machines as a layer pipeline (pipe.rs): this machine's layers, then the worker's and its head
         if let Some(cl) = self.pipe() {
             let s = self.split();
+            // not counted: here this machine runs layers 0..s and the worker the rest, so a count of this call would
+            // reach its end while the block is still being read somewhere else. On a piped run the page's inside-a-
+            // block line stays at zero, which is honest, rather than showing a share that is not the whole pass.
             self.std_layers(pos0, n, 0, s)?;
             // with logits, the hidden rows come back too (the MTP block drafts from them on this machine)
             // a prompt read under log_hidden (without logits): the worker's out-normed rows come back for the log, so
@@ -713,7 +716,7 @@ impl Model {
             }
             return Ok(());
         }
-        self.std_layers(pos0, n, 0, nl)?;
+        self.std_layers_counted(pos0, n, 0, nl)?;
         if logits.is_empty() && self.hidden_log.is_some() {
             self.std_hidden(n);
         } else {
@@ -765,6 +768,19 @@ impl Model {
     /// as the token paths).
     fn std_layers(&mut self, pos0: u32, n: usize, l0: usize, l1: usize) -> Result<()> {
         self.std_layers_then(pos0, n, l0, l1, &mut |_| Ok(()))
+    }
+
+    /// std_layers, counting each finished layer into [status](crate::status) as it goes. A block of a prompt is one
+    /// pass over these layers, so between one block's `TORC_BLOCK` tokens and the next there is nothing else that
+    /// moves, and a page watching a long prefill would otherwise wait minutes to see anything change. The count is
+    /// this call's own share of the layers, which is the honest denominator on a two-machine split. It costs one
+    /// relaxed store per layer of a pass that takes seconds, and no part of the pass reads it back.
+    fn std_layers_counted(&mut self, pos0: u32, n: usize, l0: usize, l1: usize) -> Result<()> {
+        crate::status::pass_begin(l1 - l0);
+        self.std_layers_then(pos0, n, l0, l1, &mut |_| {
+            crate::status::pass_layer();
+            Ok(())
+        })
     }
 
     /// std_layers, with `after` called on each layer once it is done.

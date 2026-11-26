@@ -612,6 +612,9 @@ impl Engine {
         self.kept = start;
         let total = ids.len() - start;
         self.metric(json!({"event": "prompt", "reply": rn, "input_tokens": total, "kept": start}));
+        // the same numbers go to two places: TORC_METRICS writes them for the run after it ended, and status.rs keeps
+        // the reading of this prompt where a page and /slots can see it while it goes on
+        crate::status::read_begin(total);
         let t0 = std::time::Instant::now();
         let (prof_a, attn_a) = (self.m.prof, attn_ns());
         let mut tb = t0;
@@ -671,7 +674,13 @@ impl Engine {
                     self.m.prefill_blocks_at(&ids[p..q], p as u32, bs, false, &mut |bi, _| {
                         let p1 = (p + (bi + 1) * bs).min(q);
                         let (done, el) = (p1 - start, t0.elapsed().as_secs_f64());
-                        let (now, avg) = ((p1 - (p + bi * bs)) as f64 / tb.elapsed().as_secs_f64(), done as f64 / el);
+                        crate::status::read_done(done);
+                        let rows = p1 - (p + bi * bs);
+                        let (now, avg) = (rows as f64 / tb.elapsed().as_secs_f64(), done as f64 / el);
+                        // a segment's last pass reads fewer rows than a block: it belongs to the progress line, but
+                        // it is not a block ended and must not become the point the after-the-first-block average
+                        // starts from
+                        crate::status::read_rate(now, rows == bs);
                         tb = std::time::Instant::now();
                         put(
                             mf,
