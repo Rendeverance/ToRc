@@ -635,8 +635,8 @@ mod tests {
         assert_eq!(client_name(""), None, "a record that keeps no address gets no name either");
     }
 
-    /// The name on the page is the one a person recognises: the file's name, without folder or extension. Neither separator nor
-    /// either kind of name is allowed to produce a path or an empty heading.
+    /// The name on the page is the one a person recognises: the file's name, without folder or extension. Neither
+    /// separator nor either kind of name is allowed to produce a path or an empty heading.
     #[test]
     fn a_model_is_called_by_its_file_and_not_by_the_folder_it_lives_in() {
         assert_eq!(model_name(r"C:\llm\models\Qwen_Qwen3.6-35B-A3B-Q4_0.gguf"), "Qwen_Qwen3.6-35B-A3B-Q4_0");
