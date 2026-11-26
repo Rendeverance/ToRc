@@ -29,7 +29,7 @@ use format::{BlockKind, Result, err};
 use kernels::{Q8, QK, ops as kops};
 
 /// The most tokens one call of forward takes.
-pub const BLOCK_MAX: usize = 256;
+pub const BLOCK_MAX: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct InkHp {
@@ -554,7 +554,7 @@ impl Ink {
         let _w = (n <= 16).then(crate::pool::Width::decode);
         let dm = h.d_model;
         if n == 0 || n > BLOCK_MAX || pos0 as usize + n > self.n_ctx as usize {
-            return err("a block of 1 to 256 tokens inside the context");
+            return err("a block of 1 to BLOCK_MAX tokens inside the context");
         }
         if pos0 == 0 {
             self.reset();
