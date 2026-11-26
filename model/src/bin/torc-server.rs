@@ -168,6 +168,45 @@ fn carried_key(line: &str) -> Option<&str> {
     .filter(|k| !k.is_empty())
 }
 
+/// The key a browser's login box sends: "Authorization: Basic <base64 of user:password>", the key as the password and
+/// any user name. Only the status page reads it: a person opens that in a browser, and the API's clients send a header.
+fn basic_key(line: &str) -> Option<String> {
+    let (name, value) = line.split_once(':')?;
+    if !name.trim().eq_ignore_ascii_case("authorization") {
+        return None;
+    }
+    let (scheme, coded) = value.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let pair = String::from_utf8(base64(coded.trim())?).ok()?;
+    let key = pair.split_once(':')?.1;
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// Standard base64, padding optional. None for anything that isn't.
+fn base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Whether two keys are the same, in a time that doesn't depend on where they first differ.
 fn same_key(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
@@ -231,24 +270,13 @@ fn status_refused() -> String {
 /// server has none to ask for. Either way the text says what would change the answer.
 fn status_key_refused(has_key: bool) -> String {
     let text = if has_key {
-        "this server's status page needs its API key from other machines: open it as /?key=<key>, or send the key as \
-         \"Authorization: Bearer <key>\" or \"x-api-key: <key>\""
+        "this server's status page needs its API key from other machines: a browser asks for it (any user name, the \
+         key as the password), and a client sends it as \"Authorization: Bearer <key>\" or \"x-api-key: <key>\""
     } else {
         "this server's status page asks other machines for the API key (TORC_STATUS_KEY=1), and no TORC_API_KEY is \
          set, so it answers only the machine it runs on"
     };
     json!({"error": {"message": text, "type": "authentication_error"}}).to_string()
-}
-
-/// The key a request carries in its address's query as key=<key>, with its %XX escapes undone. Only the status page
-/// reads it: the API takes its key in a header, as its clients send it.
-fn query_key(path: &str) -> Option<String> {
-    let query = path.split_once('?')?.1;
-    query
-        .split('&')
-        .find_map(|p| p.strip_prefix("key="))
-        .map(|k| unescape(&k.replace('+', " ")))
-        .filter(|k| !k.is_empty())
 }
 
 /// The loaded model as /v1/models lists it.
@@ -291,6 +319,26 @@ const LINGER: std::time::Duration = std::time::Duration::from_secs(5);
 /// can reach the client before the reply does, which then reports "connection reset" instead of the reason.
 fn refuse(s: &mut TcpStream, r: &mut BufReader<Deadline>, status: &str, body: &str) {
     respond(s, status, "application/json", body);
+    linger(s, r);
+}
+
+/// The status page's refusal of another machine without the key: a 401 that asks for it, so a browser shows its own
+/// login box and sends the key with everything the page reads after that.
+fn ask_for_key(s: &mut TcpStream, r: &mut BufReader<Deadline>, body: &str) {
+    let head = format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"ToRc status\", charset=\"UTF-8\"\r\n\
+         Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = s.write_all(head.as_bytes());
+    let _ = s.write_all(body.as_bytes());
+    linger(s, r);
+}
+
+/// After a refusal: the answer goes out, and what the client is still sending is read for a moment and dropped, so
+/// that it gets the answer rather than a reset.
+fn linger(s: &mut TcpStream, r: &mut BufReader<Deadline>) {
     let _ = s.flush();
     let _ = s.shutdown(std::net::Shutdown::Write);
     r.get_mut().end = std::time::Instant::now() + LINGER;
@@ -307,6 +355,11 @@ const MAX_REFUSING: usize = 32;
 
 /// The connections open now, and the busy refusals being sent.
 static OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most connections open at once on the status page's own port, counted apart from the API's: that port can be
+/// open to the network while the API is not, and connections held open there must not leave the API busy.
+const MAX_OPEN_STATUS: usize = 16;
+static OPEN_STATUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static REFUSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One of the refusals REFUSING counts, given back when it is dropped (also when its thread could not be started).
@@ -320,11 +373,11 @@ impl Drop for Refusing {
 
 /// One of the connections OPEN counts, given back when it is dropped: when its request has been answered, whichever
 /// thread answered it.
-struct Open;
+struct Open(&'static std::sync::atomic::AtomicUsize);
 
 impl Drop for Open {
     fn drop(&mut self) {
-        OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -650,10 +703,17 @@ impl Serve for Noted<'_> {
     }
 }
 
+/// The port a connection came in on: the API's, or the status page's own when TORC_STATUS_PORT gives it one.
+#[derive(Clone, Copy, PartialEq)]
+enum Port {
+    Api,
+    Status,
+}
+
 /// A connection, on a thread of its own: reads the request and answers it there when it doesn't need the model
 /// (/health, /slots, /metrics, the model list), so those are answered even while a reply is being written. A request
 /// that needs the model goes to the model's thread (jobs) and waits its turn, in the order requests arrive in full.
-fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
+fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open, port: Port) {
     // a client that stalls before finishing its request must not hold its thread for long (the whole request has
     // REQUEST_DEADLINE, see Deadline), and nor must one that stops reading the reply without closing (a write that
     // can't go out in a minute ends it)
@@ -676,6 +736,7 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
     };
     let (mut len, mut foreign, mut named) = (0usize, false, true);
     let mut given = Vec::new();
+    let mut basic = Vec::new();
     loop {
         let Some(h) = head_line(&mut r, &mut left) else { return };
         if h == "\r\n" || h.is_empty() {
@@ -694,6 +755,9 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
         if let Some(k) = carried_key(&h) {
             given.push(k.to_string());
         }
+        if let Some(k) = basic_key(&h) {
+            basic.push(k);
+        }
     }
     // a browser names the page a request comes from, and another site's page is refused, whatever address the server
     // listens on: it could otherwise run the model from any open tab. Clients that aren't web pages send no Origin
@@ -711,9 +775,10 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
     // the status page and the numbers it draws. Answered here, on the connection's own thread, like the other
     // endpoints a monitor uses, so that the page says something while a long prompt is being read. How far it may be
     // seen is TORC_STATUS and TORC_STATUS_NET's to decide; the API key is asked of other machines only when
-    // TORC_STATUS_KEY says so, and then it may come in the address as ?key=, since a browser opening the page has no
-    // other way to send it (the page passes it on to what it reads)
-    if method == "GET" {
+    // TORC_STATUS_KEY says so, and then a browser sends it from its own login box. With TORC_STATUS_PORT the page is
+    // on that port and not on the API's
+    let status_here = port == Port::Status || model::status::port().is_none() || !model::switches::on("TORC_STATUS");
+    if method == "GET" && status_here {
         let page = route(&raw);
         if page.is_empty() || page == "/torc/status" || page == "/torc/mark.png" {
             drain(&mut r, len);
@@ -728,10 +793,13 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
                 return refuse(&mut s, &mut r, "403 Forbidden", &why);
             }
             if !local && model::status::keyed() {
-                given.extend(query_key(&raw));
                 // no key set is no key to carry: the page is refused rather than shown to every machine
-                if key.is_none() || !allowed(key, local, &given) {
-                    return refuse(&mut s, &mut r, "401 Unauthorized", &status_key_refused(key.is_some()));
+                if key.is_none() {
+                    return refuse(&mut s, &mut r, "403 Forbidden", &status_key_refused(false));
+                }
+                given.extend(basic);
+                if !allowed(key, local, &given) {
+                    return ask_for_key(&mut s, &mut r, &status_key_refused(true));
                 }
             }
             match page.as_str() {
@@ -743,6 +811,11 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
             }
             return;
         }
+    }
+    // the status page's own port answers nothing else but /health
+    if port == Port::Status {
+        let why = json!({"error": {"message": "this port serves the status page only", "type": "not_found_error"}});
+        return refuse(&mut s, &mut r, "404 Not Found", &why.to_string());
     }
     if !allowed(key, local, &given) {
         return refuse(&mut s, &mut r, "401 Unauthorized", &key_refused(&raw));
@@ -1165,10 +1238,34 @@ fn listen(e: &mut dyn Serve, port: u16, ctx: usize) {
         eprintln!("torc-server: cannot listen on {host}:{port}: {err}");
         std::process::exit(1)
     });
-    let needs = if keyed { ", other machines need the API key" } else { "" };
+    let mut open = !(host.eq_ignore_ascii_case("localhost") || host.parse().is_ok_and(local_peer));
+    // the key is only news when other machines can reach the API: a key set for the status page alone is said with it
+    let needs = if keyed && open { ", other machines need the API key" } else { "" };
     eprintln!("torc-server: {} on {host}:{port}{needs}", e.name());
+    if model::switches::get("TORC_STATUS_PORT").is_some() && model::status::port().is_none() {
+        eprintln!("torc-server: TORC_STATUS_PORT is not a port (1 to 65535): the status page stays on the API's port");
+    }
+    // the status page on a port of its own: every network when other machines may see it, this machine otherwise,
+    // whatever the API listens on
+    let page = match model::status::port().filter(|_| model::switches::on("TORC_STATUS")) {
+        Some(p) if p == port => {
+            eprintln!("torc-server: TORC_STATUS_PORT is the API's port ({port}): give the status page another one");
+            std::process::exit(1)
+        }
+        Some(p) => {
+            open = model::switches::on("TORC_STATUS_NET");
+            let at = if open { "0.0.0.0" } else { "127.0.0.1" };
+            let l = TcpListener::bind((at, p)).unwrap_or_else(|err| {
+                eprintln!("torc-server: cannot open the status page on {at}:{p}: {err}");
+                std::process::exit(1)
+            });
+            let needs = if open && keyed && model::status::keyed() { ", other machines need the API key" } else { "" };
+            eprintln!("torc-server: status page on {at}:{p}{needs}");
+            Some(l)
+        }
+        None => None,
+    };
     // the status page's two switches that show what people asked and where from: when one is on, say who can read it
-    let open = !(host.eq_ignore_ascii_case("localhost") || host.parse().is_ok_and(local_peer));
     let reach = model::status::Reach::now(open, keyed);
     let on = model::switches::on;
     // (the warning says it too when it is printed)
@@ -1180,37 +1277,16 @@ fn listen(e: &mut dyn Serve, port: u16, ctx: usize) {
         );
     }
     let (jobs, queue) = std::sync::mpsc::channel::<Job>();
-    let accepting = std::thread::Builder::new().name("accept".into()).spawn(move || {
-        use std::sync::atomic::Ordering::SeqCst;
-        for c in l.incoming() {
-            let c = match c {
-                Ok(c) => c,
-                Err(err) => {
-                    eprintln!("torc-server: accept: {err}");
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    continue;
-                }
-            };
-            // too many open: this one is told the server is busy, on a thread of its own so that the refusal's wait
-            // for the rest of the request holds nothing up; past that many refusals it is closed unanswered
-            if OPEN.fetch_add(1, SeqCst) >= MAX_OPEN {
-                OPEN.fetch_sub(1, SeqCst);
-                if REFUSING.fetch_add(1, SeqCst) < MAX_REFUSING {
-                    let refusing = Refusing;
-                    let _ = std::thread::Builder::new().name("busy".into()).spawn(move || {
-                        let _refusing = refusing;
-                        busy(c);
-                    });
-                } else {
-                    REFUSING.fetch_sub(1, SeqCst);
-                }
-                continue;
-            }
-            let open = Open;
-            let jobs = jobs.clone();
-            let _ = std::thread::Builder::new().name("conn".into()).spawn(move || handle(c, &jobs, open));
+    if let Some(l) = page {
+        let jobs = jobs.clone();
+        let accepting =
+            std::thread::Builder::new().name("accept status".into()).spawn(move || accept(l, jobs, Port::Status));
+        if let Err(err) = accepting {
+            eprintln!("torc-server: cannot start taking connections for the status page: {err}");
+            std::process::exit(1)
         }
-    });
+    }
+    let accepting = std::thread::Builder::new().name("accept".into()).spawn(move || accept(l, jobs, Port::Api));
     if let Err(err) = accepting {
         eprintln!("torc-server: cannot start taking connections: {err}");
         std::process::exit(1)
@@ -1245,6 +1321,43 @@ fn listen(e: &mut dyn Serve, port: u16, ctx: usize) {
                 std::process::exit(1)
             }
         }
+    }
+}
+
+/// Takes connections on one listener, each on a thread of its own (handle).
+fn accept(l: TcpListener, jobs: std::sync::mpsc::Sender<Job>, port: Port) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (count, most) = match port {
+        Port::Api => (&OPEN, MAX_OPEN),
+        Port::Status => (&OPEN_STATUS, MAX_OPEN_STATUS),
+    };
+    for c in l.incoming() {
+        let c = match c {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("torc-server: accept: {err}");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+        };
+        // too many open: this one is told the server is busy, on a thread of its own so that the refusal's wait
+        // for the rest of the request holds nothing up; past that many refusals it is closed unanswered
+        if count.fetch_add(1, SeqCst) >= most {
+            count.fetch_sub(1, SeqCst);
+            if REFUSING.fetch_add(1, SeqCst) < MAX_REFUSING {
+                let refusing = Refusing;
+                let _ = std::thread::Builder::new().name("busy".into()).spawn(move || {
+                    let _refusing = refusing;
+                    busy(c);
+                });
+            } else {
+                REFUSING.fetch_sub(1, SeqCst);
+            }
+            continue;
+        }
+        let open = Open(count);
+        let jobs = jobs.clone();
+        let _ = std::thread::Builder::new().name("conn".into()).spawn(move || handle(c, &jobs, open, port));
     }
 }
 
@@ -1334,13 +1447,23 @@ mod guards {
     }
 
     #[test]
-    fn the_status_page_reads_its_key_from_the_address() {
-        assert_eq!(query_key("/?key=s3cret").as_deref(), Some("s3cret"));
-        assert_eq!(query_key("/torc/status?x=1&key=a%2Bb%20c").as_deref(), Some("a+b c"), "escapes undone");
-        // as the page's own URLSearchParams reads it, so the page and the server agree on what was typed
-        assert_eq!(query_key("/?key=a+b").as_deref(), Some("a b"));
-        for none in ["/", "/?key=", "/?keys=s3cret", "/?mykey=s3cret", "/torc/status"] {
-            assert_eq!(query_key(none), None, "{none}");
+    fn the_status_page_takes_its_key_from_a_browsers_login_box() {
+        // "anyone:s3cret" and ":a:b" as a browser sends them
+        assert_eq!(basic_key("Authorization: Basic YW55b25lOnMzY3JldA==\r\n").as_deref(), Some("s3cret"));
+        assert_eq!(basic_key("authorization: basic YW55b25lOnMzY3JldA").as_deref(), Some("s3cret"), "unpadded");
+        assert_eq!(basic_key("Authorization: Basic OmE6Yg==").as_deref(), Some("a:b"), "the key after the first colon");
+        assert_eq!(base64("YQ"), Some(b"a".to_vec()), "unpadded");
+        assert_eq!(base64("YQ=="), Some(b"a".to_vec()));
+        assert_eq!(base64("YQ==YQ"), None, "padding only at the end");
+        // no password, no colon, not base64, another scheme, another header
+        for h in [
+            "Authorization: Basic YW55b25lOg==",
+            "Authorization: Basic YW55b25l",
+            "Authorization: Basic !!",
+            "Authorization: Bearer s3cret",
+            "x-api-key: s3cret",
+        ] {
+            assert_eq!(basic_key(h), None, "{h}");
         }
     }
 

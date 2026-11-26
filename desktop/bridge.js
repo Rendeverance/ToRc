@@ -5,7 +5,7 @@
     'info', 'settings', 'settingsSet', 'switches', 'pick', 'readText', 'load', 'unload', 'chat', 'answer', 'job',
     'chats', 'chatGet', 'chatPut', 'chatDel', 'primers', 'primerPut', 'primerDel', 'tools', 'mcp', 'tfHave',
     'tfLatest', 'tfInstall', 'tfUninstall', 'tfManage', 'addresses', 'mcpDiscover', 'tfPlace', 'ggufCheck',
-    'modelArch', 'saveText', 'engineSettings', 'engineSettingsSet',
+    'modelArch', 'saveText', 'engineSettings', 'engineSettingsSet', 'openStatus',
   ];
   const EVENTS = ['delta', 'tooluse', 'log', 'state', 'joblog', 'ask'];
   const tauri = () => window.__TAURI__;

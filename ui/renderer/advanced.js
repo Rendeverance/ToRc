@@ -31,12 +31,16 @@ const KIND_BADGE = { setting: 'badge accent', diagnostic: 'badge warn', developm
 const APP_OWNED = ['TORC_HOST', 'TORC_API_KEY'];
 // the two status page switches that show what people asked and where from: each says so while it is on
 const PRIVATE = {
-  TORC_STATUS_TEXT: 'the text of each request and the start of its reply',
+  TORC_STATUS_TEXT: 'the end of each request and the start of its reply',
   TORC_STATUS_CLIENT: 'the address each request came from',
 };
-const privacyWarning = (name) =>
-  `With this on, the status page shows ${PRIVATE[name]} to anyone who can open it. If the page is open to your ` +
-  'network (TORC_STATUS_NET=1), set TORC_STATUS_KEY=1 so other machines need the API key.';
+// `settings`: said in the words of the Settings section rather than the switches' names
+const privacyWarning = (name, settings) =>
+  `With this on, the status page shows ${PRIVATE[name]} to anyone who can open it. ` +
+  (settings
+    ? 'If Other machines is on, turn on Ask for the API key so they need it.'
+    : 'If the page is open to your network (TORC_STATUS_NET=1), set TORC_STATUS_KEY=1 so other machines need the ' +
+      'API key.');
 
 // `openName`: a switch to show with its explanation already open.
 function openAdvanced(openName) {

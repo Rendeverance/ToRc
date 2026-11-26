@@ -349,9 +349,9 @@ pub struct Record {
     pub prompt_s: f64,
     pub first_token_s: f64,
     pub output_s: f64,
-    /// the tokens read after this prompt's first block ended, and the seconds the engine spent on them: the pair
-    /// the page divides to get the prompt's reading speed. `(0, 0.0)` when the prompt was a single block - then the
-    /// whole prompt is that block, and the page reads the pair above
+    /// the tokens read after this prompt's first block ended, and the seconds the engine spent on them: the reading
+    /// without the first block's start, for a monitor that wants it. `(0, 0.0)` when the prompt was a single block.
+    /// The page shows the whole prompt's speed, from the pair above
     pub reading: (usize, f64),
     /// why it ended: "stop", "length" or "tool_calls"
     pub finish: &'static str,
@@ -421,8 +421,9 @@ fn client_kept() -> bool {
     crate::switches::on("TORC_STATUS_CLIENT")
 }
 
-/// A request's text, with the control tokens a chat template leaves in it taken out, and cut to the window. The last
-/// user message is what a person typed; a system prompt is the same on every request and says nothing about this one.
+/// The end of a request's last user message, cut to the window. The last user message is what a person typed; a
+/// system prompt is the same on every request and says nothing about this one. Its end, because a pasted document
+/// comes first and the question after it.
 pub fn asked(msgs: &[Value]) -> String {
     let text = |m: &Value| match m.get("content") {
         Some(Value::String(s)) => s.clone(),
@@ -438,7 +439,17 @@ pub fn asked(msgs: &[Value]) -> String {
         .map(text)
         .next_back()
         .unwrap_or_default();
-    cut(&last)
+    tail(&last)
+}
+
+/// The last characters of a text, on a character boundary.
+pub fn tail(text: &str) -> String {
+    let text = text.trim_end();
+    let n = text.chars().count();
+    if n <= SNIPPET {
+        return text.to_string();
+    }
+    "…".to_string() + &text.chars().skip(n - SNIPPET).collect::<String>()
 }
 
 /// The first characters of a reply, on a character boundary.
@@ -540,6 +551,12 @@ pub fn keyed() -> bool {
     crate::switches::on("TORC_STATUS_KEY")
 }
 
+/// The status page's own port (`TORC_STATUS_PORT`), when it has one: there it can be open to the network while the API
+/// stays on this machine. None: the page is on the API's port.
+pub fn port() -> Option<u16> {
+    crate::switches::get("TORC_STATUS_PORT").and_then(|v| v.trim().parse::<u16>().ok()).filter(|p| *p > 0)
+}
+
 /// How far the page can be seen, which is what the start-up warning has to say.
 #[derive(Clone, Copy)]
 pub struct Reach {
@@ -547,7 +564,8 @@ pub struct Reach {
     pub page: bool,
     /// `TORC_STATUS_NET`: other machines may ask for it
     pub net: bool,
-    /// the server listens on more than this machine (`TORC_HOST`)
+    /// the page can be reached from more than this machine: its own port with `TORC_STATUS_NET`, or the API's port
+    /// when `TORC_HOST` opens it
     pub open: bool,
     /// `TORC_STATUS_KEY`: other machines must carry the API key
     pub keyed: bool,
@@ -567,8 +585,8 @@ impl Reach {
 /// about the two switches: the counters alone say nothing about anyone's requests.
 pub fn warning(text: bool, client: bool, r: Reach) -> Option<String> {
     let what = match (text, client) {
-        (true, true) => "the text of each request and its reply, and the address it came from,",
-        (true, false) => "the text of each request and its reply",
+        (true, true) => "the end of each request and the start of its reply, and the address it came from,",
+        (true, false) => "the end of each request and the start of its reply",
         (false, true) => "the address each request came from",
         (false, false) => return None,
     };
@@ -909,12 +927,12 @@ mod tests {
         assert!(warning(false, false, all).is_none(), "the counters alone warn nobody");
         assert!(warning(true, false, r(false, true, true, false, false)).is_none(), "an off page shows nothing");
         let w = warning(true, false, all).unwrap();
-        assert!(w.contains("text") && !w.contains("address"), "{w}");
+        assert!(w.contains("reply") && !w.contains("address"), "{w}");
         assert!(w.contains("any machine") && w.contains("TORC_STATUS_KEY=1"), "an open page says how to close it: {w}");
         let w = warning(false, true, all).unwrap();
-        assert!(w.contains("address") && !w.contains("text"), "{w}");
+        assert!(w.contains("address") && !w.contains("reply"), "{w}");
         let w = warning(true, true, all).unwrap();
-        assert!(w.contains("text") && w.contains("address"), "{w}");
+        assert!(w.contains("reply") && w.contains("address"), "{w}");
         // not opened to the network, either by the page's switch or by where the server listens
         for local in [r(true, false, true, false, false), r(true, true, false, false, false)] {
             let w = warning(true, false, local).unwrap();
@@ -927,12 +945,11 @@ mod tests {
     }
 
     #[test]
-    fn the_page_passes_on_the_key_it_was_opened_with() {
-        // TORC_STATUS_KEY refuses another machine's request without the key, and the page reads two addresses after
-        // it loads: a key left off either is a page that opens and then goes blank
-        assert!(PAGE_LF.contains("get(\"key\")"), "the page must read ?key= from its own address");
-        assert!(PAGE_LF.contains("withKey(\"/torc/status\")"), "the data must be asked for with the key");
-        assert!(PAGE_LF.contains("withKey(\"/torc/mark.png\")"), "so must the mark");
+    fn the_page_never_puts_the_key_in_an_address() {
+        // the key comes from the browser's own login box, which sends it with every request the page makes. A key in
+        // an address stays in the browser's history
+        assert!(!PAGE_LF.contains("key="), "no key in any address the page reads");
+        assert!(PAGE_LF.contains("fetch(\"/torc/status\""), "the data from this server, as the page was opened");
     }
 
     #[test]
@@ -960,16 +977,13 @@ mod tests {
             "client",
             "client_name",
             "model_name",
-            "reading_tokens",
-            "reading_seconds",
             "prompt_total",
         ] {
             assert!(PAGE_LF.contains(field), "the page reads {field}, which status_json answers");
         }
         // the header is the desktop app's: its mark served by this server (not a copy of it in another folder, and not
         // a fetch to somewhere else), and the product named before the model, so a page on a LAN is recognisably ours
-        // (the address is set from the script, so that it can carry the key the page was opened with)
-        assert!(PAGE_LF.contains(".src = withKey(\"/torc/mark.png\")"), "the app's mark is asked for from this server");
+        assert!(PAGE_LF.contains(".src = \"/torc/mark.png\""), "the app's mark is asked for from this server");
         // the app's own file and crop, at the size a heading across a room is read at rather than the 28 px a
         // window draws it at - the file is not resized, only the box it is drawn into
         assert!(PAGE_LF.contains(".brand .mark { width: 50px"), "the mark is sized for the page, not for the app");
@@ -1023,7 +1037,7 @@ mod tests {
         );
         assert!(
             // the bar over a graph is drawn at the graph's width, from one shared value
-            PAGE_LF.contains(":root { --plot: 220px; }")
+            PAGE_LF.contains(":root { --plot: 100%; }")
                 && PAGE_LF.contains(".bar, #readspark, #writespark { width: var(--plot); max-width: 100%; }"),
             "the progress bar and the plot under it share one width"
         );
@@ -1034,6 +1048,17 @@ mod tests {
         assert!(
             PAGE_LF.contains("stroke-opacity=\".6\"") && PAGE_LF.contains("stroke-dasharray=\"3 3\""),
             "the line at 0 is dashed, in the series colour, under any measured rate"
+        );
+        assert!(
+            // the graphs' clock runs only while the server is busy, so a finished reply stays drawn until the next one
+            PAGE_LF.contains("if (lastPoll !== null && (busy || wasBusy)) V += t - lastPoll;")
+                && PAGE_LF.contains("if (running || was) { push("),
+            "idle time is left out of the graphs"
+        );
+        assert!(
+            PAGE_LF.contains("const readRate = (r) => (r ? rate(r.prompt, r.prompt_seconds) : 0);")
+                && PAGE_LF.contains("live.prompt_rate_sustained"),
+            "a finished prompt's speed is the API's own; the live average is the engine's, since the first block"
         );
         assert!(
             PAGE_LF.contains("spark(\"write\", \"writespark\", \"var(--write)\");\npoll();"),
@@ -1106,7 +1131,7 @@ mod tests {
             "the past write rate comes from the record of replies, not from a counter"
         );
         assert!(PAGE_LF.contains("the last reply:"), "and the page names where that speed came from");
-        assert!(PAGE_LF.contains("last prompt read:"), "the same for the last prompt's read speed");
+        assert!(PAGE_LF.contains("last prompt: "), "the same for the last prompt's read speed");
         // a past speed stays words under the tile. The tile's own number means "this second", and a finished reply
         // has no this second, so it must not fill it in
         assert!(
@@ -1174,5 +1199,14 @@ mod tests {
         assert!(c.chars().count() <= SNIPPET + 1, "cut to the window");
         assert!(c.is_char_boundary(c.len()), "and on a boundary");
         assert!(c.ends_with("…"), "and says so");
+    }
+
+    #[test]
+    fn a_request_shows_its_end_where_the_question_is() {
+        let doc = format!("{}\n\nSum this up in two sentences.\n", "<p>markup</p> ".repeat(100));
+        let a = asked(&[json!({"role": "system", "content": "Be brief."}), json!({"role": "user", "content": doc})]);
+        assert!(a.ends_with("Sum this up in two sentences."), "the question, not the markup");
+        assert!(a.starts_with('…') && a.chars().count() == SNIPPET + 1, "cut to the window and says so");
+        assert_eq!(asked(&[json!({"role": "user", "content": "Hello"})]), "Hello", "short text whole");
     }
 }

@@ -70,9 +70,10 @@ never do. The traffic is plain HTTP, so warn the user before exposing it beyond 
 `TORC_HOST` itself and ignores it in the switch list). `TORC_WARM=wait` loads the model before the port opens. For a quick check of a Qwen
 model without a client: `torc-chat model.torc "Hello"` (ChatML only; for other families, start the server). A web page
 from another site is refused whatever `TORC_HOST` says; non-browser clients send no Origin and are not affected.
-`TORC_STATUS=1` adds a status page at `/` (this machine only unless `TORC_STATUS_NET=1`; `TORC_STATUS_KEY=1` asks other
-machines for the API key). Its `TORC_STATUS_TEXT` and `TORC_STATUS_CLIENT` show what users asked and from where: tell
-the user before turning either on.
+`TORC_STATUS=1` adds a status page at `/`, or on a port of its own with `TORC_STATUS_PORT` (this machine only unless
+`TORC_STATUS_NET=1`; `TORC_STATUS_KEY=1` asks other machines for the API key, which a browser sends from its own login
+box). Its `TORC_STATUS_TEXT` and `TORC_STATUS_CLIENT` show what users asked and from where: tell the user before turning
+either on.
 
 The server writes one reply at a time; other chat requests queue in order, while /health, /slots, /metrics and the
 model list answer at once. Greedy decoding by default; `temperature`, `top_k`, `top_p`, `seed`,

@@ -93,18 +93,23 @@ window.EXPLAIN = {
   TORC_STATUS:
     'The server’s own status page: open the server’s address in a browser to see the model, how far the prompt ' +
     'being read has got, and the replies that went through it. Off by default. It answers only this machine ' +
-    'unless TORC_STATUS_NET=1.',
+    'unless TORC_STATUS_NET=1. Once a model is loaded with it on, Status page in the side pane opens it.',
   TORC_STATUS_NET:
     'Lets other machines open the status page. On its own, anyone who can reach the server can read it: set ' +
-    'TORC_STATUS_KEY=1 as well to ask them for the API key.',
+    'TORC_STATUS_KEY=1 as well to ask them for the API key. On the API’s port the server also has to listen on the ' +
+    'network (Share on my network); on a port of its own (TORC_STATUS_PORT) this is all it takes.',
+  TORC_STATUS_PORT:
+    'The status page on a port of its own, and not on the API’s. It answers every network with TORC_STATUS_NET=1 ' +
+    'and this machine only otherwise, whatever the API does, so the page can be open to your network while the ' +
+    'API stays on this machine. Empty: the page is on the API’s port.',
   TORC_STATUS_KEY:
-    'Other machines need the API key to open the status page, as they do for the API: open it as ' +
-    'http://<address>:<port>/?key=<key>. This machine never needs it. With no key set (TORC_API_KEY, or Share on ' +
-    'my network in Settings), other machines are refused the page. A key typed into an address stays in that ' +
-    'browser’s history.',
+    'Other machines need the API key to open the status page. Their browser asks for it in its own login box: ' +
+    'any user name, and the key as the password. This machine never needs it. With no key set (the API key in ' +
+    'Settings), other machines are refused the page.',
   TORC_STATUS_TEXT:
-    'The status page shows the text of each request and the start of its reply. Anyone who can open the page can ' +
-    'read them: keep the page to this machine, or set TORC_STATUS_KEY=1 when it is open to the network.',
+    'The status page shows the end of each request, where the question usually is, and the start of its reply. ' +
+    'Anyone who can open the page can read them: keep the page to this machine, or set TORC_STATUS_KEY=1 when it ' +
+    'is open to the network.',
   TORC_STATUS_CLIENT:
     'The status page shows the address each request came from. Anyone who can open the page can see them: keep ' +
     'the page to this machine, or set TORC_STATUS_KEY=1 when it is open to the network.',
