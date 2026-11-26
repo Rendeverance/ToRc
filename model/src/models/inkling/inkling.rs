@@ -784,44 +784,55 @@ impl Ink {
             // the bits do not depend on n, the tile or how the items are dealt
             const ATT_QT: usize = 8;
             let tiles = n.div_ceil(ATT_QT);
-            each(tiles * nh, &|it| {
-                let (tile, hh) = (it / nh, it % nh);
+            // in a prompt block an item also takes every query head of one key head (GQA), so each key and value row
+            // is read once for all of them; a single token keeps a head an item, to spread over the pool
+            let hpi = if n > 1 { per } else { 1 };
+            let groups = nh / hpi;
+            each(tiles * groups, &|it| {
+                let (tile, h0) = (it / groups, (it % groups) * hpi);
                 let (t0, t1) = (tile * ATT_QT, ((tile + 1) * ATT_QT).min(n));
-                let g = hh / per;
-                // each query's first key, and the tile's span of keys
+                let g = h0 / per;
+                // the item's queries: (token, head) for t0..t1 and h0..h0 + hpi, query j = (t - t0) * hpi + (hh - h0)
+                let nq = (t1 - t0) * hpi;
+                let tok = |j: usize| t0 + j / hpi;
+                let head = |j: usize| h0 + j % hpi;
+                // each query's first key, and the item's span of keys
                 let lo_of = |t: usize| {
                     let pos = pos0 as usize + t;
                     if swa { (pos + 1).saturating_sub(h.window) } else { 0 }
                 };
                 let (span_lo, span_hi) = (lo_of(t0), pos0 as usize + t1 - 1);
                 let width = span_hi + 1 - span_lo;
-                // the tile's scores, a row of width a query (query t's own keys lo_of(t)..=pos at their offsets)
-                let mut sc = vec![0.0f32; (t1 - t0) * width];
-                let mut bias = vec![0.0f32; (t1 - t0) * h.extent];
-                for t in t0..t1 {
+                // the scores, a row of width a query (query j's own keys lo_of(t)..=pos at their offsets)
+                let mut sc = vec![0.0f32; nq * width];
+                let mut bias = vec![0.0f32; nq * h.extent];
+                for j in 0..nq {
+                    let (t, hh) = (tok(j), head(j));
                     let rh = &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr];
-                    for (d, b) in bias[(t - t0) * h.extent..(t - t0 + 1) * h.extent].iter_mut().enumerate() {
+                    for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
                         *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
                     }
                 }
                 for p in span_lo..=span_hi {
                     let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                    for t in t0..t1 {
+                    for j in 0..nq {
+                        let (t, hh) = (tok(j), head(j));
                         let pos = pos0 as usize + t;
                         if p < lo_of(t) || p > pos {
                             continue;
                         }
                         let d = pos - p;
-                        let b = if d < h.extent { bias[(t - t0) * h.extent + d] } else { 0.0 };
+                        let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
                         let qh = &q[t * qd + hh * hd..t * qd + (hh + 1) * hd];
-                        sc[(t - t0) * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
+                        sc[j * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
                     }
                 }
                 // each query's softmax over its own keys, in position order, with the sink's zero beside them
-                let mut sums = vec![0.0f32; t1 - t0];
-                for t in t0..t1 {
+                let mut sums = vec![0.0f32; nq];
+                for j in 0..nq {
+                    let t = tok(j);
                     let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                    let row = &mut sc[(t - t0) * width + (lo - span_lo)..(t - t0) * width + (pos + 1 - span_lo)];
+                    let row = &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
                     let mut mx = 0.0f32;
                     for &v in row.iter() {
                         mx = mx.max(v);
@@ -831,17 +842,18 @@ impl Ink {
                         *v = (*v - mx).exp();
                         sum += *v;
                     }
-                    sums[t - t0] = sum;
+                    sums[j] = sum;
                 }
-                // the values, each row read once for the tile; each query's sums stay in position order
+                // the values, each row read once for the item; each query's sums stay in position order
                 for p in span_lo..=span_hi {
                     let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                    for t in t0..t1 {
+                    for j in 0..nq {
+                        let (t, hh) = (tok(j), head(j));
                         if p < lo_of(t) || p > pos0 as usize + t {
                             continue;
                         }
-                        let wgt = sc[(t - t0) * width + (p - span_lo)] / sums[t - t0];
-                        // SAFETY: item it owns head hh of tokens t0..t1's rows of att
+                        let wgt = sc[j * width + (p - span_lo)] / sums[j];
+                        // SAFETY: item it owns heads h0..h0 + hpi of tokens t0..t1's rows of att
                         let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
                         for (a, b) in oh.iter_mut().zip(v) {
                             *a = wgt.mul_add(*b, *a);
@@ -849,7 +861,8 @@ impl Ink {
                     }
                 }
                 // the output's gate
-                for t in t0..t1 {
+                for j in 0..nq {
+                    let (t, hh) = (tok(j), head(j));
                     // SAFETY: as above
                     let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
                     for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
