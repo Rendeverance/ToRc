@@ -85,7 +85,7 @@ function switchGroups(wanted, openName) {
 
 function switchRow(w, open) {
   const env = S.settings.env;
-  // shown only while the switch is on, as the engine prints it only then
+  // shown only while the switch is on (the engine also needs TORC_STATUS=1 for the page to exist)
   const warn = PRIVATE[w.name] ? el('div', 'note warn', privacyWarning(w.name)) : null;
   if (warn) warn.hidden = env[w.name] !== '1';
   const box = field(

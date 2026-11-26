@@ -384,6 +384,8 @@ function consent(kind) {
   );
   const btns = el('div', 'row-actions');
   const answer = async (on) => {
+    // after any save still in flight, so two answers in a row both stay remembered
+    await S.saving;
     await setSettings({ [kind]: on, asked: { ...(S.settings.asked || {}), [kind]: true } });
     renderPane();
     const what = npu ? 'the NPU' : 'the GPU for long prompts';

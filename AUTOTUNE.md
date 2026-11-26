@@ -66,11 +66,11 @@ once.
 
 The NPU and the GPU's share of long prompts read faster, but they round differently from the CPU, so the results are
 not bit-exact: not with the CPU's, and not between platforms and vendors. The effect on quality is slight, and replies
-are always written on the CPU.
+are written on the CPU (except with Gemma's whole-NPU tier, `TORC_NPU=pure`).
 
-So the app asks before using either. When Auto-tune finishes on a Snapdragon X with the NPU off, it asks whether to use
-the NPU; once the GPU switch is on, it asks whether to keep using the GPU. Use it is the highlighted choice, CPU only
-the other, and each is asked once: the switches on the Load screen change it any time after.
+So when Auto-tune finishes, the app asks: on a Snapdragon X with the NPU off, whether to use the NPU, and once the GPU
+switch is on, whether to keep using the GPU. Using it is the highlighted choice, CPU only the other. Once answered, it
+isn't asked again; the switches on the Load screen change it any time.
 
 ## Sharing settings
 

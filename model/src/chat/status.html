@@ -10,7 +10,7 @@
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; connect-src 'self'; img-src 'self'; style-src 'unsafe-inline';
            script-src 'unsafe-inline'">
-<title>torc · status</title>
+<title>ToRc · status</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 /* The colours, fonts and shapes below are the desktop app's own: the values are copied from ui/renderer/styles.css,
@@ -58,7 +58,7 @@ h1 { font: 600 20px/1.25 var(--display); margin: 0 0 4px; overflow-wrap: anywher
 .brand { display: flex; align-items: center; gap: 10px; }
 /* the app's mark and its round crop at the size a heading read from across a room works at - the app draws it inside
    a window, the page draws the same bytes larger. The size is written here and not left to the file: the mark's own
-   pixels are 96, and a rule CSS cannot parse is not an error page, it is a logo at 96 */
+   pixels are 96, and a rule CSS cannot parse leaves the logo at 96 */
 .brand .mark { width: 50px; height: 50px; display: block; border-radius: 50%; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
   padding: 14px 16px 16px; margin-top: 14px; }
@@ -74,7 +74,7 @@ h2, .k { font: 600 11px var(--ui); letter-spacing: .09em; text-transform: upperc
 .state { margin-bottom: 12px; }
 /* a metric is a column, and its graph is pushed to the bottom of it: the two graphs are then drawn at the same height
    on the page, which they were not while each card took its own height. What makes the reading card taller is its
-   progress bar, and the honest answer to that is for the other cards to leave the same space empty - a bar is not
+   progress bar, and the answer to that is for the other cards to leave the same space empty - a bar is not
    something a prompt that is not being read has - rather than for their graphs to ride up beside it */
 .metric { flex: 1 1 14rem; min-width: 12rem; display: flex; flex-direction: column; }
 .v { font-size: 1.75rem; font-weight: 600; line-height: 1.15; }
@@ -497,6 +497,8 @@ const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => (
 // a page opened as /?key=<key> passes the key on to the two addresses it reads, since with TORC_STATUS_KEY on another
 // machine is refused both without it, and a browser opening a typed address has no other way to send one
 const KEY = new URLSearchParams(location.search).get("key");
+// and out of the address bar, so a screenshot or a shared screen doesn't show it
+if (KEY) history.replaceState(null, "", location.pathname);
 const withKey = (u) => (KEY ? `${u}?key=${encodeURIComponent(KEY)}` : u);
 document.querySelector("img.mark").src = withKey("/torc/mark.png");
 

@@ -56,7 +56,7 @@ fn timings((pn, ps, ft, rn, rs): (usize, f64, f64, usize, f64)) -> Value {
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     // the charset named: a client that guesses (Windows PowerShell 5.1 reads ISO-8859-1) shows UTF-8 text wrongly.
     // `no-store` because every answer this server gives is a current one: a page or a picture kept in a browser cache
-    // is the previous run's page, and a status page that quietly shows yesterday is worse than no status page
+    // is the previous run's page, and a status page that shows the previous run is wrong
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}; charset=utf-8\r\nCache-Control: no-store\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -443,7 +443,7 @@ fn status_json() -> Value {
     let (pass, pass_total) = model::status::pass_progress();
     json!({
         "model": name,
-        // the name a person reads rather than the path a switch was given: the page's header is the app's, and the
+        // the name a person reads, without folder or extension: the page's header is the app's, and the
         // app calls a loaded model by its file without the folder or the extension
         "model_name": model::status::model_name(name),
         "n_ctx": ctx,
@@ -719,8 +719,13 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
             drain(&mut r, len);
             // from this machine, a page is only answered under this machine's own name: a site that points its
             // name at 127.0.0.1 (DNS rebinding) would otherwise read the page from the user's browser as its own
-            if !model::status::allowed(local) || (local && !named) {
+            if !model::status::allowed(local) {
                 return refuse(&mut s, &mut r, "403 Forbidden", &status_refused());
+            }
+            if local && !named {
+                let why = "this server's status page answers this machine only as localhost or a loopback address";
+                let why = json!({"error": {"message": why, "type": "permission_error"}}).to_string();
+                return refuse(&mut s, &mut r, "403 Forbidden", &why);
             }
             if !local && model::status::keyed() {
                 given.extend(query_key(&raw));
@@ -1084,7 +1089,9 @@ fn main() {
         std::process::exit(2);
     }
     if a[1] == "--archs" {
-        println!("{}", model::models::ARCHS.join(" "));
+        // the list the app shows when it can't run a file: one family that runs is not announced yet
+        let shown: Vec<&str> = model::models::ARCHS.iter().copied().filter(|a| *a != "inkling2_loop").collect();
+        println!("{}", shown.join(" "));
         return;
     }
     // --tokenize: the ids of a text, special tokens matched, with the model's BOS when it has one (for checking the
