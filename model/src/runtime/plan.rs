@@ -17,7 +17,7 @@
 ///   is not on that line, so it gets its own weighted mean, using the line's value until one is seen. Before any
 ///   pass, alpha = 1 (the units cancel in the ratio).
 /// - t(1) is never above t(2) once a block of 2 or more has been timed: a pass of one token does less work than a
-///   block of two. Without that, one slow plain pass (the first after a load can take a second) makes every plain
+///   block of two. Without that, one slow plain pass (the first after a load can be very slow) makes every plain
 ///   pass look dear, the planner then drafts on every pass, and no new plain pass ever comes to correct it.
 /// - A pass slower than STALL times what the planner expects for its size is recorded at STALL times that: a pass
 ///   held up by the system says nothing about the price of a block, and one such time among a few blocks would tilt
@@ -292,7 +292,7 @@ pub fn planner() -> Box<dyn Plans> {
 mod tests {
     use super::*;
 
-    /// Passes as a laptop CPU times them: plain 40 ms, blocks 50 ms + 9 ms a row.
+    /// Passes timed as a CPU might time them: plain 40 ms, blocks 50 ms + 9 ms a row.
     fn steady(p: &mut DraftPlan, rounds: usize) {
         for _ in 0..rounds {
             p.record(&[], 0, 1, 0.040);

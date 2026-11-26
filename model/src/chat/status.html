@@ -137,8 +137,8 @@ tr.pair td { border-bottom: 0; padding-bottom: 2px; }
 /* an address in the same fixed-width face the numbers use: it is compared across rows by eye, and a proportional face
    makes 192.0.2.1 and 192.0.2.7 look the same width apart */
 td.ip { font-family: var(--mono); font-size: 12px; color: var(--ink2); white-space: nowrap; }
-/* A phone is narrower than nine columns: measured at 390px the header row alone wants 744px, so the columns are
-   squeezed to 51-72px each, every header wraps to several lines and the last three columns leave the screen. Below that
+/* A phone is narrower than nine columns: the header row alone is about twice a phone's width, so the columns are
+   squeezed, every header wraps to several lines and the last three columns leave the screen. Below that
    width a reply becomes a small block instead, three lines of labelled values in the same order as the columns. The
    labels are the column headers' own words, carried on each cell as data-l for exactly this case, so nothing gains or
    loses a name between the two layouts and a renamed header has to be renamed in one place. */
@@ -378,8 +378,8 @@ function draw(d) {
   // whether this prefill is going well right now. Beside it the reading since this prompt's first block ended: both
   // points of that span are measured, and it leaves out the block that begins a prompt, which pays for the machine
   // coming back to the model and yields no tokens until it is over. The average over the whole prompt is not shown:
-  // on the 24,501-token prompt an agent sends for a two-letter message, that first block is most of what the number
-  // would be measuring, and a reader watching a run wants the speed of the run. The span runs between two of the
+  // on the long prompt an agent sends for a two-letter message, that first block is most of what the number would be
+  // measuring, and a reader watching a run wants the speed of the run. The span runs between two of the
   // engine's own reports, so this number moves once a block, like the one above it, and not once a second.
   const now = prefill ? (live.prompt_rate || 0) : 0;
   // the engine only measures a block once it has finished one, so at a long context this rate can be minutes old

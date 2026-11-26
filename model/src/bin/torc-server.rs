@@ -122,6 +122,17 @@ fn head_line(r: &mut BufReader<Deadline>, left: &mut usize) -> Option<String> {
     Some(h)
 }
 
+/// Whether a Host header's value names this machine: localhost, a loopback address, or ::1, with or without a port.
+fn local_host(v: &str) -> bool {
+    let host = v.trim();
+    let name = if host.starts_with('[') {
+        host.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Whether an Origin header's value names this machine (a page served from it), as against another site's page.
 fn local_origin(v: &str) -> bool {
     let host = v.trim().split("://").nth(1).unwrap_or("");
@@ -451,8 +462,8 @@ fn status_json() -> Value {
             "prompt_rate": model::status::reading_rate(),
             // and the rate since the first block of this prompt ended. prompt_done / prompt_seconds is the average of
             // the whole prompt, and the first block of one pays for the machine coming back to the model, so that
-            // number describes a cold start as much as it describes reading: on a 24,501-token prompt that is a 221
-            // second run read at 113 t/s, where the reading after the first block runs far above it.
+            // number describes a cold start as much as it describes reading: on a long prompt the reading after the
+            // first block runs far above it.
             "prompt_rate_sustained": model::status::reading_sustained(),
         // the age of that measurement, so that the rate beside it can be shown as current or as the last thing the
         // engine could measure
@@ -476,7 +487,8 @@ fn status_json() -> Value {
         // number on this screen is whether the machine was ever asked what it is good at.
         "in_use": model::profile::in_use(),
         "chosen": model::profile::chosen(),
-        "tune_file": model::tune::file().map(|p| p.display().to_string()),
+        // the tune file's name only: its folder names the user and the machine, and the page may be read from elsewhere
+        "tune_file": model::tune::file().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
         // everything this run has done, which is also what /metrics reports as its counters
         "totals": {
             // the replies this run finished, not the requests it was handed: a request it refused before generating
@@ -662,7 +674,7 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
         let mut it = line.split_whitespace();
         (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
     };
-    let (mut len, mut foreign) = (0usize, false);
+    let (mut len, mut foreign, mut named) = (0usize, false, true);
     let mut given = Vec::new();
     loop {
         let Some(h) = head_line(&mut r, &mut left) else { return };
@@ -675,6 +687,9 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
         }
         if let Some(v) = low.strip_prefix("origin:") {
             foreign = !local_origin(v);
+        }
+        if let Some(v) = low.strip_prefix("host:") {
+            named = local_host(v);
         }
         if let Some(k) = carried_key(&h) {
             given.push(k.to_string());
@@ -702,7 +717,9 @@ fn handle(mut s: TcpStream, jobs: &std::sync::mpsc::Sender<Job>, open: Open) {
         let page = route(&raw);
         if page.is_empty() || page == "/torc/status" || page == "/torc/mark.png" {
             drain(&mut r, len);
-            if !model::status::allowed(local) {
+            // from this machine, a page is only answered under this machine's own name: a site that points its
+            // name at 127.0.0.1 (DNS rebinding) would otherwise read the page from the user's browser as its own
+            if !model::status::allowed(local) || (local && !named) {
                 return refuse(&mut s, &mut r, "403 Forbidden", &status_refused());
             }
             if !local && model::status::keyed() {
@@ -1297,6 +1314,16 @@ mod guards {
         assert!(!allowed(Some("s3cret"), false, &k("s3cret ")));
         assert!(allowed(Some("s3cret"), false, &k("s3cret")));
         assert!(allowed(Some("s3cret"), false, &["wrong".into(), "s3cret".into()]));
+    }
+
+    #[test]
+    fn only_this_machines_own_names_count_as_its_host() {
+        for h in [" localhost:8080", "LOCALHOST", "127.0.0.1:8080", "127.8.0.2", "[::1]:8080", "[::1]"] {
+            assert!(local_host(h), "{h}");
+        }
+        for h in [" evil.example:8080", "192.168.1.20:8080", "localhost.evil.example", "[fe80::1]:8080", ""] {
+            assert!(!local_host(h), "{h}");
+        }
     }
 
     #[test]

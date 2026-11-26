@@ -1,8 +1,8 @@
 //! rows.rs - a table read one row per token, straight from the model file: Flash Next's n-gram table (tens of GB,
 //! 16 rows a token) once a mapless load has dropped the file's mapping (weights.rs). Each row is an unbuffered read of
 //! the sectors that hold it, spread over the compute pool (each pool thread keeps its own handle), a chunk's repeated
-//! rows read once, and the rows read lately kept in a bounded cache (TORC_ROW_CACHE rows, default 1M: Strata keeps
-//! about as many). The bytes are the file's, so the products are the same as through the mapping.
+//! rows read once, and the rows read lately kept in a bounded cache (TORC_ROW_CACHE rows, default 1M). The bytes are
+//! the file's, so the products are the same as through the mapping.
 
 use crate::ecache_own::{ALIGN, open_unbuffered, read_at};
 use std::cell::RefCell;

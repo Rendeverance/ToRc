@@ -492,7 +492,7 @@ pub fn finished() -> usize {
     FINISHED.load(Ordering::Relaxed)
 }
 
-/// `TORC_STATUS_NAMES`, read once: `192.168.1.196=am08, 192.168.1.184=arm2`. Entries are separated by commas or
+/// `TORC_STATUS_NAMES`, read once: `192.168.1.196=desk, 192.168.1.184=laptop`. Entries are separated by commas or
 /// semicolons and a pair by its first `=`, so spaces around the sign are allowed; `:` is accepted as the sign when an
 /// entry has no `=`, because a list of pairs reads either way and nobody should have to remember which one the code
 /// picked. An address with colons in it (IPv6) has to be written with `=` for that reason, which the example in
@@ -629,10 +629,10 @@ mod tests {
     /// a malformed entry all have to leave the row showing the address rather than a blank or a guess.
     #[test]
     fn an_address_is_named_only_when_someone_named_it() {
-        let m = parse_names("192.168.1.196=am08, 192.168.1.184:arm2;10.0.0.1 = laptop-one ;=nope =x;fe80::1=router");
-        assert_eq!(m.get("192.168.1.196").map(String::as_str), Some("am08"));
-        assert_eq!(m.get("192.168.1.184").map(String::as_str), Some("arm2"));
-        assert_eq!(m.get("10.0.0.1").map(String::as_str), Some("laptop-one"), "spaces around the sign are allowed");
+        let m = parse_names("192.168.1.196=desk, 192.168.1.184:laptop;10.0.0.1 = box-two ;=nope =x;fe80::1=router");
+        assert_eq!(m.get("192.168.1.196").map(String::as_str), Some("desk"));
+        assert_eq!(m.get("192.168.1.184").map(String::as_str), Some("laptop"));
+        assert_eq!(m.get("10.0.0.1").map(String::as_str), Some("box-two"), "spaces around the sign are allowed");
         assert_eq!(m.get("fe80::1").map(String::as_str), Some("router"), "an address with colons needs the = sign");
         assert_eq!(m.len(), 4, "an entry without one side of the pair is not a name");
         assert_eq!(client_name(""), None, "a record that keeps no address gets no name either");
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[test]
     fn a_narrow_screen_keeps_naming_every_number() {
-        // measured at 390px: the header row alone wants 744px, so the columns get squeezed to about 51-72px, headers
+        // on a phone the header row alone is about twice the screen's width, so the columns get squeezed, headers
         // wrap over several lines and the last three leave the screen. Below that width the header goes away and a
         // reply becomes a block where each value carries the header's own words, so the two lists of names are one
         // list on purpose - a column renamed in the header but not in its label would print an unnumbered number on

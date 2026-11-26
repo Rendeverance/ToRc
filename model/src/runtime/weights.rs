@@ -3,8 +3,8 @@
 //! Resident tensors and expert slots are slices of the page cache, read without a copy. A token of the 35B touches
 //! about 360 expert slots, so copying them would mean hundreds of MB of memcpy a token.
 //!
-//! While any mapping of the file is alive, Windows slows every unbuffered read of that file, wherever it lands: expert
-//! reads run at about half speed. Dropping the mapping clears it at once. So when the expert cache streams the experts
+//! While any mapping of the file is alive, Windows slows every unbuffered read of that file, wherever it lands, the
+//! expert cache's included. Dropping the mapping clears it at once. So when the expert cache streams the experts
 //! from the file, the load copies every resident tensor into its own memory and then drops the mapping
 //! (TORC_MAPLESS=0 keeps it).
 
@@ -38,6 +38,10 @@ pub struct Weights {
     /// a mapless load: the tables read a row at a time that are not copied (Flash Next's n-gram table), by tensor
     /// index, read from the file (rows.rs)
     tables: std::collections::HashMap<usize, crate::runtime::rows::RowReader>,
+    /// a mapless load: the model file's path, and the experts asked for by name (`expert`: the NPU's hot experts),
+    /// each read from the file once and kept for the life of the weights
+    path: String,
+    direct: std::sync::Mutex<std::collections::HashMap<(u32, u32), Owned>>,
 }
 
 /// Bytes in 64-byte aligned storage, as the file's tensors are (the kernels read them as u16, f32 or blocks).
@@ -426,11 +430,7 @@ impl Weights {
                 Some(mb) => mb > 0,
                 None => !fits,
             };
-        let mapless = will_cache
-            && match crate::switches::get("TORC_MAPLESS").as_deref() {
-                Some("0") => false,
-                _ => true,
-            };
+        let mapless = will_cache && !crate::switches::is("TORC_MAPLESS", "0");
         let mode = crate::switches::get("TORC_WARM");
         let warm = match mode.as_deref() {
             // the warm-up touches the mapping, which a mapless load is about to drop
@@ -484,6 +484,8 @@ impl Weights {
             klay_all: std::sync::OnceLock::new(),
             exl: Vec::new(),
             tables: std::collections::HashMap::new(),
+            path: path.to_string(),
+            direct: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // a region hash of zero is not checked. A shard (`<model>.layers`, written by torc check --layers once every
         // tensor and pack it holds has passed its CRC) has holes in the region, so its hash cannot match, and it is not
@@ -538,12 +540,20 @@ impl Weights {
                 let span = crate::pipe::own_layers(nl as usize)
                     .map(|(a, b)| (b as u64).min(nl).saturating_sub(a as u64))
                     .filter(|&k| k > 0 && k < nl);
-                let (own, margin) = match span {
+                let (mut own, margin) = match span {
                     Some(k) => (res * k / nl + (1 << 30), 3u64 << 30),
                     None => (res, 6u64 << 30),
                 };
+                // a mapless load has already copied the resident tensors, all of them, pipeline or not: the free
+                // memory read now is short by that copy, which is what `own` stands for, so it is counted once
+                let mut avail = avail_phys().unwrap_or(0);
+                if mapless {
+                    let copied: u64 = w.own.values().map(|o| o.len as u64).sum();
+                    avail += copied;
+                    own = own.max(copied);
+                }
                 // at least 2 GB, and never more than the experts take (a small model can need less than that)
-                avail_phys().unwrap_or(0).saturating_sub(own + margin).max(2 << 30).min(w.file.expert_region.bytes)
+                avail.saturating_sub(own + margin).max(2 << 30).min(w.file.expert_region.bytes)
             }
             None => 0,
         };
@@ -939,6 +949,8 @@ impl Weights {
     }
 
     /// Expert e of MoE record g: its pack (a slice of the mapping, or of its large-page copy) and the pack's shape.
+    /// After a mapless load the routed experts go through the expert cache, and an expert asked for here by name (the
+    /// NPU's hot experts, read once at load) is read from the file into memory of its own, kept with the weights.
     pub fn expert(&self, g: u32, e: u32) -> Result<(&[u8], &Pack)> {
         let x = self.layer_experts(g);
         if e >= x.n_expert {
@@ -949,11 +961,30 @@ impl Weights {
         if let Some(Some((a, base))) = self.exl.get(g as usize) {
             return Ok((&a[at - base..at - base + n], &x.pack));
         }
-        match &self.map {
-            Some(m) => Ok((&m[at..at + n], &x.pack)),
-            // a mapless load: every expert read goes through the expert cache (experts_of / experts_ask)
-            None => err(format!("expert {e} of record {g} asked for directly, but a mapless load has no mapping")),
+        if let Some(m) = &self.map {
+            return Ok((&m[at..at + n], &x.pack));
         }
+        let mut direct = self.direct.lock().unwrap_or_else(|p| p.into_inner());
+        let o = match direct.entry((g, e)) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let read = || -> std::io::Result<Owned> {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut f = fs::File::open(&self.path)?;
+                    f.seek(SeekFrom::Start(at as u64))?;
+                    let mut bytes = vec![0u8; n];
+                    f.read_exact(&mut bytes)?;
+                    Ok(Owned::copy(&bytes))
+                };
+                let o =
+                    read().map_err(|err| format::Error(format!("{}: expert {e} of record {g}: {err}", self.path)))?;
+                v.insert(o)
+            }
+        };
+        let (p, len) = (o.buf.as_ptr() as *const u8, o.len);
+        // SAFETY: an entry is never removed or changed once in `direct`, and its bytes live in the entry's own heap
+        // block, which stays put when the map moves the entry; so they last as long as `self`
+        Ok((unsafe { std::slice::from_raw_parts(p, len) }, &x.pack))
     }
 }
 
