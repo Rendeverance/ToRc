@@ -336,22 +336,54 @@ fn mix(blocks: &[Vec<f32>], cur: &[f32], query: &[f32], n: usize, dm: usize) -> 
 /// A looped layer's input with the message of the pass before: (1 - forget) x + gain message, gain and forget each
 /// tanh of a rank-wide product of x and the message over their root mean squares. In place, n rows of dm.
 fn control(x: &mut [f32], msg: &[f32], c: &Ctrl, n: usize, dm: usize, rank: usize) {
+    // the rank-wide products first (each token's inputs over their root mean squares, then CTRL_SPLIT runs of the
+    // rank a token), then the gains and forgets in CTRL_SPLIT runs of the width a token: every number is the same dot
+    // as a token at a time, so the bits do not depend on n or on the split
+    let mut g = vec![0.0f32; n * 2 * dm];
+    {
+        let gp = SyncPtr::new(&mut g);
+        each(n, &|t| {
+            // SAFETY: item t owns token t's row of g
+            let gt = unsafe { gp.slice(t * 2 * dm, 2 * dm) };
+            rms(&mut gt[..dm], &x[t * dm..(t + 1) * dm], 1e-6);
+            rms(&mut gt[dm..], &msg[t * dm..(t + 1) * dm], 1e-6);
+        });
+    }
+    let mut low = vec![0.0f32; n * rank];
+    {
+        let lp = SyncPtr::new(&mut low);
+        let per = rank.div_ceil(CTRL_SPLIT);
+        each(n * CTRL_SPLIT, &|i| {
+            let (t, s) = (i / CTRL_SPLIT, i % CTRL_SPLIT);
+            let (r0, r1) = ((s * per).min(rank), ((s + 1) * per).min(rank));
+            let gt = &g[t * 2 * dm..(t + 1) * 2 * dm];
+            // SAFETY: item i owns ranks r0..r1 of token t
+            let lt = unsafe { lp.slice(t * rank + r0, r1 - r0) };
+            for (o, r) in lt.iter_mut().zip(r0..r1) {
+                *o = dot(&c.down[r * 2 * dm..(r + 1) * 2 * dm], gt);
+            }
+        });
+    }
     let xp = SyncPtr::new(x);
-    each(n, &|t| {
-        // SAFETY: item t owns token t's row of x
-        let xt = unsafe { xp.slice(t * dm, dm) };
-        let mt = &msg[t * dm..(t + 1) * dm];
-        let mut g = vec![0.0f32; 2 * dm];
-        rms(&mut g[..dm], xt, 1e-6);
-        rms(&mut g[dm..], mt, 1e-6);
-        let low: Vec<f32> = (0..rank).map(|r| dot(&c.down[r * 2 * dm..(r + 1) * 2 * dm], &g)).collect();
-        for i in 0..dm {
-            let gain = dot(&c.gain[i * rank..(i + 1) * rank], &low).tanh();
-            let forget = dot(&c.forget[i * rank..(i + 1) * rank], &low).tanh();
-            xt[i] = (xt[i] - forget * xt[i]) + gain * mt[i];
+    let per = dm.div_ceil(CTRL_SPLIT);
+    each(n * CTRL_SPLIT, &|i| {
+        let (t, s) = (i / CTRL_SPLIT, i % CTRL_SPLIT);
+        let (i0, i1) = ((s * per).min(dm), ((s + 1) * per).min(dm));
+        // SAFETY: item i owns numbers i0..i1 of token t's row of x
+        let xt = unsafe { xp.slice(t * dm + i0, i1 - i0) };
+        let mt = &msg[t * dm + i0..t * dm + i1];
+        let lt = &low[t * rank..(t + 1) * rank];
+        for (j, (xv, mv)) in xt.iter_mut().zip(mt).enumerate() {
+            let i = i0 + j;
+            let gain = dot(&c.gain[i * rank..(i + 1) * rank], lt).tanh();
+            let forget = dot(&c.forget[i * rank..(i + 1) * rank], lt).tanh();
+            *xv = (*xv - forget * *xv) + gain * mv;
         }
     });
 }
+
+/// How many runs a token's control is split into, so a single token's work spreads over the pool.
+const CTRL_SPLIT: usize = 16;
 
 /// A causal convolution of 4 taps with its residual, in place over n rows of c numbers, in token order: each
 /// number's last three inputs come from `hist` (3 x c, oldest first), which moves on. `taps` is c x 4, the last tap
@@ -745,47 +777,45 @@ impl Ink {
             let (ck, cv) = (&st.k, &st.v);
             let scale = 1.0 / (hd as f32).sqrt();
             let per = nh / nkv;
-            each(n, &|t| {
+            // a (token, head) pair an item, so a single token's heads spread over the pool; each head's numbers are
+            // the same steps as before, so the bits do not depend on n or on how the items are dealt
+            each(n * nh, &|it| {
+                let (t, hh) = (it / nh, it % nh);
                 let pos = pos0 as usize + t;
                 let lo = if swa { (pos + 1).saturating_sub(h.window) } else { 0 };
-                // SAFETY: item t owns token t's row of att
-                let at = unsafe { ap.slice(t * qd, qd) };
                 let mut bias = vec![0.0f32; h.extent];
                 let mut sc = vec![0.0f32; pos + 1 - lo];
-                for hh in 0..nh {
-                    let (qh, rh) = (
-                        &q[t * qd + hh * hd..t * qd + (hh + 1) * hd],
-                        &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr],
-                    );
-                    let g = hh / per;
-                    let sk = sink[t * nh + hh];
-                    for (d, b) in bias.iter_mut().enumerate() {
-                        *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
-                    }
-                    let mut mx = 0.0f32;
-                    for (i, p) in (lo..=pos).enumerate() {
-                        let d = pos - p;
-                        let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                        let b = if d < h.extent { bias[d] } else { 0.0 };
-                        sc[i] = dot(qh, k) * scale + (b - sk);
-                        mx = mx.max(sc[i]);
-                    }
-                    let mut sum = (-mx).exp();
-                    for v in sc.iter_mut() {
-                        *v = (*v - mx).exp();
-                        sum += *v;
-                    }
-                    let oh = &mut at[hh * hd..(hh + 1) * hd];
-                    for (i, p) in (lo..=pos).enumerate() {
-                        let wgt = sc[i] / sum;
-                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                        for (a, b) in oh.iter_mut().zip(v) {
-                            *a = wgt.mul_add(*b, *a);
-                        }
+                let (qh, rh) =
+                    (&q[t * qd + hh * hd..t * qd + (hh + 1) * hd], &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr]);
+                let g = hh / per;
+                let sk = sink[t * nh + hh];
+                for (d, b) in bias.iter_mut().enumerate() {
+                    *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                }
+                let mut mx = 0.0f32;
+                for (i, p) in (lo..=pos).enumerate() {
+                    let d = pos - p;
+                    let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                    let b = if d < h.extent { bias[d] } else { 0.0 };
+                    sc[i] = dot(qh, k) * scale + (b - sk);
+                    mx = mx.max(sc[i]);
+                }
+                let mut sum = (-mx).exp();
+                for v in sc.iter_mut() {
+                    *v = (*v - mx).exp();
+                    sum += *v;
+                }
+                // SAFETY: item it owns head hh of token t's row of att
+                let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
+                for (i, p) in (lo..=pos).enumerate() {
+                    let wgt = sc[i] / sum;
+                    let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                    for (a, b) in oh.iter_mut().zip(v) {
+                        *a = wgt.mul_add(*b, *a);
                     }
                 }
                 // the output's gate
-                for (a, g) in at.iter_mut().zip(&gate[t * qd..(t + 1) * qd]) {
+                for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
                     *a *= 1.0 / (1.0 + (-g).exp());
                 }
             });
@@ -824,13 +854,31 @@ impl Ink {
         // by the scores alone over their sum, times the scale
         let mut choice: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
         {
+            // every token's sigmoid scores, CTRL_SPLIT runs of the experts a token (the same dot per expert, so the
+            // same bits), then the picks a token
+            let ne = h.n_expert;
+            let mut score = vec![0.0f32; n * ne];
+            {
+                let sp = SyncPtr::new(&mut score);
+                let per = ne.div_ceil(CTRL_SPLIT);
+                let xn = &xn;
+                each(n * CTRL_SPLIT, &|i| {
+                    let (t, s) = (i / CTRL_SPLIT, i % CTRL_SPLIT);
+                    let (e0, e1) = ((s * per).min(ne), ((s + 1) * per).min(ne));
+                    let xt = &xn[t * dm..(t + 1) * dm];
+                    // SAFETY: item i owns experts e0..e1 of token t's scores
+                    let st = unsafe { sp.slice(t * ne + e0, e1 - e0) };
+                    for (o, e) in st.iter_mut().zip(e0..e1) {
+                        *o = 1.0 / (1.0 + (-dot(&ly.router[e * dm..(e + 1) * dm], xt)).exp());
+                    }
+                });
+            }
             let cp = SyncPtr::new(&mut choice);
-            let xn = &xn;
+            let score = &score;
             each(n, &|t| {
-                let xt = &xn[t * dm..(t + 1) * dm];
-                let mut lg: Vec<(usize, f32, f32)> = (0..h.n_expert)
+                let mut lg: Vec<(usize, f32, f32)> = (0..ne)
                     .map(|e| {
-                        let p = 1.0 / (1.0 + (-dot(&ly.router[e * dm..(e + 1) * dm], xt)).exp());
+                        let p = score[t * ne + e];
                         (e, p + ly.pick_bias[e], p)
                     })
                     .collect();
