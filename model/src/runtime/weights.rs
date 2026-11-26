@@ -3,11 +3,10 @@
 //! Resident tensors and expert slots are slices of the page cache, read without a copy. A token of the 35B touches
 //! about 360 expert slots, so copying them would mean hundreds of MB of memcpy a token.
 //!
-//! Mapless (25 Nov 2026): while any mapping of the file is alive, Windows throttles every unbuffered read of that file,
-//! wherever it lands (4 KiB reads 280k/s -> 12k/s; 1.75 MB expert reads 6.8 -> 3.0 GB/s on a FireCuda 530), and
-//! dropping the mapping clears it at once. So when the expert cache streams the experts from the file, the load copies
-//! every resident tensor into its own memory and then drops the mapping (TORC_MAPLESS=0 keeps it). Design:
-//! WORK/torc-gpu-plan/mapping-fix.md.
+//! While any mapping of the file is alive, Windows slows every unbuffered read of that file, wherever it lands: expert
+//! reads run at about half speed. Dropping the mapping clears it at once. So when the expert cache streams the experts
+//! from the file, the load copies every resident tensor into its own memory and then drops the mapping
+//! (TORC_MAPLESS=0 keeps it).
 
 use format::read::Model as File;
 use format::{Experts, Pack, Result, Tensor, err};
@@ -419,8 +418,8 @@ impl Weights {
         }
         // mapless: the expert cache will stream the experts from this file (the same test as the budget below), so the
         // mapping is dropped once the resident tensors are copied out (Flash Next's n-gram table, tens of GB read a row
-        // a token, is not copied: rows.rs reads its rows from the file). TORC_MAPLESS=0 keeps the mapping. A build with
-        // the GPU tiers keeps it unless TORC_MAPLESS=1: their expert paths still read the mapping.
+        // a token, is not copied: rows.rs reads its rows from the file). TORC_MAPLESS=0 keeps the mapping. The GPU's
+        // attention tier reads none of the file, so a build with it drops the mapping too
         let will_cache = cache
             && file.expert_region.bytes > 0
             && match crate::switches::num::<u64>("TORC_CACHE_MB") {
@@ -430,8 +429,7 @@ impl Weights {
         let mapless = will_cache
             && match crate::switches::get("TORC_MAPLESS").as_deref() {
                 Some("0") => false,
-                Some("1") => true,
-                _ => !cfg!(feature = "gpu"),
+                _ => true,
             };
         let mode = crate::switches::get("TORC_WARM");
         let warm = match mode.as_deref() {
