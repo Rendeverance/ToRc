@@ -200,7 +200,10 @@ struct ILayer {
 
 /// One layer pass's state: its keys and values at every position (so a prompt that extends an earlier one finds
 /// them), and the last three inputs of its four convolutions (keys, values, attention output, the experts' output),
-/// oldest first.
+/// oldest first. The keys and values are kept a key head at a time (head g's row for slot s at (g * cap + s) * hd),
+/// so one head's attention reads its rows one after another in memory: kept by position (all heads of a slot side by
+/// side), each head read 512 bytes every 4 KB, a new page a position, and attention waited on memory, not maths
+/// (box 1, 26 Nov: 13 ms a token at 590 positions, 43 ms at 8.6k).
 struct Pass {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -767,10 +770,12 @@ impl Ink {
                     let c = vh.to_vec();
                     rms(vh, &c, h.eps);
                 }
-                let slot = (pos % cap) * kvd;
-                unsafe {
-                    ck.slice(slot, kvd).copy_from_slice(kt);
-                    cv.slice(slot, kvd).copy_from_slice(vt);
+                for g in 0..nkv {
+                    let slot = (g * cap + pos % cap) * hd;
+                    unsafe {
+                        ck.slice(slot, hd).copy_from_slice(&kt[g * hd..(g + 1) * hd]);
+                        cv.slice(slot, hd).copy_from_slice(&vt[g * hd..(g + 1) * hd]);
+                    }
                 }
             });
         }
@@ -803,22 +808,24 @@ impl Ink {
                 // once for all of them (the cache is f32 by position: at depth it is most of a token's bytes). Each
                 // head's numbers are the same steps in the same order, so the same bits
                 let span = pos + 1 - lo;
+                // the distances this token sees are 0..span, so only those rows of the bias table (the same numbers)
+                let ext = h.extent.min(span);
                 each(nkv, &|g| {
                     let h0 = g * per;
-                    let mut bias = vec![0.0f32; per * h.extent];
+                    let mut bias = vec![0.0f32; per * ext];
                     let mut sc = vec![0.0f32; per * span];
                     for j in 0..per {
                         let rh = &rel[(h0 + j) * nr..(h0 + j + 1) * nr];
-                        for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
+                        for (d, b) in bias[j * ext..(j + 1) * ext].iter_mut().enumerate() {
                             *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
                         }
                     }
                     for (i, p) in (lo..=pos).enumerate() {
                         let d = pos - p;
-                        let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
                         for j in 0..per {
                             let hh = h0 + j;
-                            let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
+                            let b = if d < ext { bias[j * ext + d] } else { 0.0 };
                             sc[j * span + i] = dot(&q[hh * hd..(hh + 1) * hd], k) * scale + (b - sink[hh]);
                         }
                     }
@@ -839,7 +846,7 @@ impl Ink {
                     // SAFETY: item g owns heads h0..h0 + per of the token's row of att
                     let og = unsafe { ap.slice(h0 * hd, per * hd) };
                     for (i, p) in (lo..=pos).enumerate() {
-                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
                         for j in 0..per {
                             let wgt = sc[j * span + i] / sums[j];
                             for (a, b) in og[j * hd..(j + 1) * hd].iter_mut().zip(v) {
@@ -878,7 +885,7 @@ impl Ink {
                         }
                     }
                     for p in span_lo..=span_hi {
-                        let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
                         for j in 0..nq {
                             let (t, hh) = (tok(j), head(j));
                             let pos = pos0 as usize + t;
@@ -910,7 +917,7 @@ impl Ink {
                     }
                     // the values, each row read once for the item; each query's sums stay in position order
                     for p in span_lo..=span_hi {
-                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
                         for j in 0..nq {
                             let (t, hh) = (tok(j), head(j));
                             if p < lo_of(t) || p > pos0 as usize + t {

@@ -97,7 +97,14 @@ fn main() {
         std::process::exit(1)
     };
     let tok = model::tok::Tokenizer::open(path).unwrap_or_else(|e| fail(e));
-    let mut ids: Vec<u32> = match (opt("text"), opt("toks")) {
+    // textfile=F: the prompt's text from a file (an 8k prompt is too long for a command line)
+    let text = opt("text").or_else(|| opt("textfile").map(|f| {
+        std::fs::read_to_string(&f).unwrap_or_else(|e| {
+            eprintln!("{f}: {e}");
+            std::process::exit(2)
+        })
+    }));
+    let mut ids: Vec<u32> = match (text, opt("toks")) {
         (Some(t), _) => tok.encode(&t, true).unwrap_or_else(|e| fail(e)),
         (None, Some(f)) => std::fs::read(&f)
             .unwrap_or_else(|e| {
