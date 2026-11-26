@@ -423,14 +423,20 @@ impl Weights {
         // mapless: the expert cache will stream the experts from this file (the same test as the budget below), so the
         // mapping is dropped once the resident tensors are copied out (Flash Next's n-gram table, tens of GB read a row
         // a token, is not copied: rows.rs reads its rows from the file). TORC_MAPLESS=0 keeps the mapping. The GPU's
-        // attention tier reads none of the file, so a build with it drops the mapping too
+        // attention tier reads none of the file, so a build with it drops the mapping too. Two loads keep it: a shard
+        // (`<model>.layers`), whose resident section is mostly holes that a copy would fill at full size, and Gemma's
+        // whole-NPU tier (TORC_NPU=pure), which reads every expert once to upload it and would otherwise keep a copy
         let will_cache = cache
             && file.expert_region.bytes > 0
             && match crate::switches::num::<u64>("TORC_CACHE_MB") {
                 Some(mb) => mb > 0,
                 None => !fits,
             };
-        let mapless = will_cache && !crate::switches::is("TORC_MAPLESS", "0");
+        let shard_file = std::path::Path::new(&format!("{path}.layers")).exists();
+        let mapless = will_cache
+            && !crate::switches::is("TORC_MAPLESS", "0")
+            && !shard_file
+            && !crate::switches::is("TORC_NPU", "pure");
         let mode = crate::switches::get("TORC_WARM");
         let warm = match mode.as_deref() {
             // the warm-up touches the mapping, which a mapless load is about to drop
@@ -490,7 +496,7 @@ impl Weights {
         // a region hash of zero is not checked. A shard (`<model>.layers`, written by torc check --layers once every
         // tensor and pack it holds has passed its CRC) has holes in the region, so its hash cannot match, and it is not
         // checked here
-        let shard = std::path::Path::new(&format!("{path}.layers")).exists();
+        let shard = shard_file;
         if shard {
             eprintln!("shard: resident section hash not checked (torc check --layers verified this box's tensors)");
         }
