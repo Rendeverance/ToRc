@@ -788,88 +788,130 @@ impl Ink {
             // is read once for all of them; a single token keeps a head an item, to spread over the pool
             let hpi = if n > 1 { per } else { 1 };
             let groups = nh / hpi;
-            each(tiles * groups, &|it| {
-                let (tile, h0) = (it / groups, (it % groups) * hpi);
-                let (t0, t1) = (tile * ATT_QT, ((tile + 1) * ATT_QT).min(n));
-                let g = h0 / per;
-                // the item's queries: (token, head) for t0..t1 and h0..h0 + hpi, query j = (t - t0) * hpi + (hh - h0)
-                let nq = (t1 - t0) * hpi;
-                let tok = |j: usize| t0 + j / hpi;
-                let head = |j: usize| h0 + j % hpi;
-                // each query's first key, and the item's span of keys
-                let lo_of = |t: usize| {
-                    let pos = pos0 as usize + t;
-                    if swa { (pos + 1).saturating_sub(h.window) } else { 0 }
-                };
-                let (span_lo, span_hi) = (lo_of(t0), pos0 as usize + t1 - 1);
-                let width = span_hi + 1 - span_lo;
-                // the scores, a row of width a query (query j's own keys lo_of(t)..=pos at their offsets)
-                let mut sc = vec![0.0f32; nq * width];
-                let mut bias = vec![0.0f32; nq * h.extent];
-                for j in 0..nq {
-                    let (t, hh) = (tok(j), head(j));
-                    let rh = &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr];
-                    for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
+            if n == 1 {
+                // one token: a head an item, with nothing to tile (the tiled code below costs writing 3-5% on box1,
+                // 26 Nov). The same steps as the tiled path for one query, so the same bits
+                let pos = pos0 as usize;
+                let lo = if swa { (pos + 1).saturating_sub(h.window) } else { 0 };
+                each(nh, &|hh| {
+                    let mut bias = vec![0.0f32; h.extent];
+                    let mut sc = vec![0.0f32; pos + 1 - lo];
+                    let (qh, rh) = (&q[hh * hd..(hh + 1) * hd], &rel[hh * nr..(hh + 1) * nr]);
+                    let g = hh / per;
+                    let sk = sink[hh];
+                    for (d, b) in bias.iter_mut().enumerate() {
                         *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
                     }
-                }
-                for p in span_lo..=span_hi {
-                    let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                    for j in 0..nq {
-                        let (t, hh) = (tok(j), head(j));
-                        let pos = pos0 as usize + t;
-                        if p < lo_of(t) || p > pos {
-                            continue;
-                        }
-                        let d = pos - p;
-                        let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
-                        let qh = &q[t * qd + hh * hd..t * qd + (hh + 1) * hd];
-                        sc[j * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
-                    }
-                }
-                // each query's softmax over its own keys, in position order, with the sink's zero beside them
-                let mut sums = vec![0.0f32; nq];
-                for j in 0..nq {
-                    let t = tok(j);
-                    let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                    let row = &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
                     let mut mx = 0.0f32;
-                    for &v in row.iter() {
-                        mx = mx.max(v);
+                    for (i, p) in (lo..=pos).enumerate() {
+                        let d = pos - p;
+                        let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        let b = if d < h.extent { bias[d] } else { 0.0 };
+                        sc[i] = dot(qh, k) * scale + (b - sk);
+                        mx = mx.max(sc[i]);
                     }
                     let mut sum = (-mx).exp();
-                    for v in row.iter_mut() {
+                    for v in sc.iter_mut() {
                         *v = (*v - mx).exp();
                         sum += *v;
                     }
-                    sums[j] = sum;
-                }
-                // the values, each row read once for the item; each query's sums stay in position order
-                for p in span_lo..=span_hi {
-                    let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                    for j in 0..nq {
-                        let (t, hh) = (tok(j), head(j));
-                        if p < lo_of(t) || p > pos0 as usize + t {
-                            continue;
-                        }
-                        let wgt = sc[j * width + (p - span_lo)] / sums[j];
-                        // SAFETY: item it owns heads h0..h0 + hpi of tokens t0..t1's rows of att
-                        let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
+                    // SAFETY: item hh owns head hh of the token's row of att
+                    let oh = unsafe { ap.slice(hh * hd, hd) };
+                    for (i, p) in (lo..=pos).enumerate() {
+                        let wgt = sc[i] / sum;
+                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
                         for (a, b) in oh.iter_mut().zip(v) {
                             *a = wgt.mul_add(*b, *a);
                         }
                     }
-                }
-                // the output's gate
-                for j in 0..nq {
-                    let (t, hh) = (tok(j), head(j));
-                    // SAFETY: as above
-                    let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
-                    for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
+                    for (a, g) in oh.iter_mut().zip(&gate[hh * hd..(hh + 1) * hd]) {
                         *a *= 1.0 / (1.0 + (-g).exp());
                     }
-                }
-            });
+                });
+            } else {
+                each(tiles * groups, &|it| {
+                    let (tile, h0) = (it / groups, (it % groups) * hpi);
+                    let (t0, t1) = (tile * ATT_QT, ((tile + 1) * ATT_QT).min(n));
+                    let g = h0 / per;
+                    // the item's queries: (token, head) for t0..t1 and h0..h0 + hpi, query j = (t - t0) * hpi + (hh - h0)
+                    let nq = (t1 - t0) * hpi;
+                    let tok = |j: usize| t0 + j / hpi;
+                    let head = |j: usize| h0 + j % hpi;
+                    // each query's first key, and the item's span of keys
+                    let lo_of = |t: usize| {
+                        let pos = pos0 as usize + t;
+                        if swa { (pos + 1).saturating_sub(h.window) } else { 0 }
+                    };
+                    let (span_lo, span_hi) = (lo_of(t0), pos0 as usize + t1 - 1);
+                    let width = span_hi + 1 - span_lo;
+                    // the scores, a row of width a query (query j's own keys lo_of(t)..=pos at their offsets)
+                    let mut sc = vec![0.0f32; nq * width];
+                    let mut bias = vec![0.0f32; nq * h.extent];
+                    for j in 0..nq {
+                        let (t, hh) = (tok(j), head(j));
+                        let rh = &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr];
+                        for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
+                            *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                        }
+                    }
+                    for p in span_lo..=span_hi {
+                        let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        for j in 0..nq {
+                            let (t, hh) = (tok(j), head(j));
+                            let pos = pos0 as usize + t;
+                            if p < lo_of(t) || p > pos {
+                                continue;
+                            }
+                            let d = pos - p;
+                            let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
+                            let qh = &q[t * qd + hh * hd..t * qd + (hh + 1) * hd];
+                            sc[j * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
+                        }
+                    }
+                    // each query's softmax over its own keys, in position order, with the sink's zero beside them
+                    let mut sums = vec![0.0f32; nq];
+                    for j in 0..nq {
+                        let t = tok(j);
+                        let (lo, pos) = (lo_of(t), pos0 as usize + t);
+                        let row = &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
+                        let mut mx = 0.0f32;
+                        for &v in row.iter() {
+                            mx = mx.max(v);
+                        }
+                        let mut sum = (-mx).exp();
+                        for v in row.iter_mut() {
+                            *v = (*v - mx).exp();
+                            sum += *v;
+                        }
+                        sums[j] = sum;
+                    }
+                    // the values, each row read once for the item; each query's sums stay in position order
+                    for p in span_lo..=span_hi {
+                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
+                        for j in 0..nq {
+                            let (t, hh) = (tok(j), head(j));
+                            if p < lo_of(t) || p > pos0 as usize + t {
+                                continue;
+                            }
+                            let wgt = sc[j * width + (p - span_lo)] / sums[j];
+                            // SAFETY: item it owns heads h0..h0 + hpi of tokens t0..t1's rows of att
+                            let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
+                            for (a, b) in oh.iter_mut().zip(v) {
+                                *a = wgt.mul_add(*b, *a);
+                            }
+                        }
+                    }
+                    // the output's gate
+                    for j in 0..nq {
+                        let (t, hh) = (tok(j), head(j));
+                        // SAFETY: as above
+                        let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
+                        for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
+                            *a *= 1.0 / (1.0 + (-g).exp());
+                        }
+                    }
+                });
+            }
         }
         lap.lap(4);
         let mut out = vec![0.0f32; n * dm];
