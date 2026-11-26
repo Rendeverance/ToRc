@@ -417,6 +417,12 @@ fn convolve(x: &mut [f32], n: usize, c: usize, taps: &[f32], dynamic: Option<(&[
 
 impl Ink {
     pub fn load(path: &str, n_ctx: u32) -> Result<Ink> {
+        // ARM: the experts on large pages by default (TORC_EXPERTS_LARGE=0 turns it off). Box 1, 26 Nov: the cold first
+        // pass 5.4 -> 18.8 tok/s and the experts' products 30 -> 100 GB/s when each token asks for other experts; the
+        // mapped pages are handed back after the copy there (weights.rs), so only one copy is held
+        if cfg!(target_arch = "aarch64") && !crate::switches::given("TORC_EXPERTS_LARGE") {
+            crate::switches::set("TORC_EXPERTS_LARGE", "1");
+        }
         let w = Weights::load(path)?;
         let h = InkHp::from_meta(&w.file.metadata)?;
         crate::pipe::set_ident(

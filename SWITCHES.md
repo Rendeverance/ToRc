@@ -48,6 +48,7 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_DOT`, `TORC_DOTN` | development | dot-product kernel variant for router and dense rows |
+| `TORC_IQ4_ROWS` | development | IQ4_NL rows a pass for one vector on ARM (1, 2 the default, or 4; the same bits) |
 | `TORC_KMM`, `TORC_KMM_MIN`, `TORC_KMM8_MIN`, `TORC_KMM_PANEL`, `TORC_KMM_X86_MIN` | development | K-quant matrix kernels and their thresholds |
 | `TORC_MMLA`, `TORC_MMLA_MIN`, `TORC_MMLA8_MIN`, `TORC_MMLA_PANEL`, `TORC_VPANEL` | development | ARM i8mm (SMMLA) kernels and their thresholds |
 | `TORC_Q4X4`, `TORC_Q4X4_EXPERTS`, `TORC_Q4X4_HEAD`, `TORC_Q4X4_MIN`, `TORC_Q4X4_MAX` | setting: `TORC_Q4X4`; the rest development | repacked Q4_0 layout for i8mm machines |

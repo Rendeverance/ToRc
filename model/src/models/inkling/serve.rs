@@ -195,7 +195,7 @@ pub fn open(path: &str, ctx: usize, name: Option<String>) -> Box<dyn Serve> {
         marks: Vec::new(),
         stops,
         name,
-        block: crate::switches::num::<usize>("TORC_BLOCK").filter(|&b| b > 0).unwrap_or(64).min(BLOCK_MAX),
+        block: crate::switches::num::<usize>("TORC_BLOCK").filter(|&b| b > 0).unwrap_or(512).min(BLOCK_MAX),
         kept: 0,
         timed: (0, 0.0, 0.0, 0, 0.0),
         replies: 0,
