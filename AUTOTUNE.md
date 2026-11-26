@@ -62,6 +62,16 @@ is kept per layout, one machine or two, NPU or CPU, since the best block changes
 `torc-tune <model>`, by hand: a few minutes for a model in RAM. Start the server again afterwards; it reads the file
 once.
 
+## The NPU and the GPU
+
+The NPU and the GPU's share of long prompts read faster, but they round differently from the CPU, so the results are
+not bit-exact: not with the CPU's, and not between platforms and vendors. The effect on quality is slight, and replies
+are always written on the CPU.
+
+So the app asks before using either. When Auto-tune finishes on a Snapdragon X with the NPU off, it asks whether to use
+the NPU; once the GPU switch is on, it asks whether to keep using the GPU. Use it is the highlighted choice, CPU only
+the other, and each is asked once: the switches on the Load screen change it any time after.
+
 ## Sharing settings
 
 The settings a model runs with on one machine can go to another. The server gives them as a profile at
