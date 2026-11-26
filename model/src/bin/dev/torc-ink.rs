@@ -32,6 +32,53 @@ fn compare(a: &[f32], b: &[f32], nv: usize, what: &str) -> bool {
     differ == 0
 }
 
+/// kbench=1: the one-token products alone, as GB/s of weights read: the experts' gate/up rows (IQ4_NL, 8 experts of a
+/// layer, as one token's decode asks for them) and the layers' attn_q (Q8_0), each over the whole pool with one
+/// quantised vector, over every layer.
+fn kbench(m: &Ink) {
+    use format::BlockKind;
+    use model::moe::{Mat, apply_group};
+    let dm = m.h.d_model;
+    let x: Vec<f32> = (0..dm).map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0).collect();
+    let mut xq = kernels::Q8::new(dm / kernels::QK);
+    kernels::ops::q8k_quantize(&x, xq.view_mut());
+    let ff = m.h.d_ff;
+    for _round in 0..4 {
+        // experts: 8 a layer (ids spread over the 128), gate and up of each, the real ff rows
+        let (mut bytes, t) = (0usize, Instant::now());
+        for l in 0..m.h.n_layer as u32 {
+            let g = m.w.file.blocks.iter().find(|b| b.layer == l && b.kind == BlockKind::Moe).and_then(|b| b.experts);
+            let Some(g) = g else { continue };
+            let ids: Vec<u32> = (0..8u32).map(|i| i * 16 + 3).collect();
+            let packs = m.w.experts_of(l, g, &ids).unwrap();
+            let mut outs = vec![vec![0.0f32; ff]; 16];
+            let mut jobs: Vec<(Mat, &mut [f32])> = Vec::new();
+            for (i, o) in outs.iter_mut().enumerate() {
+                let (pk, pack) = packs[i / 2];
+                let p = if i % 2 == 0 { &pack.gate } else { &pack.up };
+                let rb = p.bytes as usize / p.rows as usize;
+                let data = &pk[p.at as usize..p.at as usize + ff * rb];
+                bytes += data.len();
+                jobs.push((Mat { ty: p.ty, rows: ff, cols: p.cols as usize, data }, &mut o[..]));
+            }
+            apply_group(&mut jobs, xq.view());
+        }
+        let s = t.elapsed().as_secs_f64();
+        println!("experts gate/up: {:.0} MB in {:.2} ms = {:.1} GB/s", bytes as f64 / 1e6, s * 1e3, bytes as f64 / s / 1e9);
+        // attn_q of every layer (Q8_0)
+        let (mut bytes, t) = (0usize, Instant::now());
+        for l in 0..m.h.n_layer as u32 {
+            let tq = m.w.layer(l, "attn_q.weight").unwrap();
+            let mm = Mat::of(&tq);
+            bytes += mm.data.len();
+            let mut y = vec![0.0f32; mm.rows];
+            apply_group(&mut [(mm, &mut y[..])], xq.view());
+        }
+        let s = t.elapsed().as_secs_f64();
+        println!("attn_q (Q8_0): {:.0} MB in {:.2} ms = {:.1} GB/s", bytes as f64 / 1e6, s * 1e3, bytes as f64 / s / 1e9);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt =
@@ -67,6 +114,10 @@ fn main() {
     let t0 = Instant::now();
     let mut m = Ink::load(path, ctx).unwrap_or_else(|e| fail(e));
     let nv = m.n_vocab();
+    if opt("kbench").is_some() {
+        kbench(&m);
+        return;
+    }
     println!(
         "loaded in {:.1} s: {} layer passes, {} tokens to read: {:?}",
         t0.elapsed().as_secs_f64(),
