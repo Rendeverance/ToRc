@@ -37,7 +37,7 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_BLOCK` | setting | the prompt block size the server reads with (else the tuned value, else the rule: 512 on the CPU, 256 with the NPU, or 1024 with the NPU on the Qwen3.6-35B and the other Qwen3.5 / 3.6 MoE models when the whole model is in memory, and 128 on two machines) |
 | `TORC_BLOCK_LONG` | setting | block size for long prompts |
 | `TORC_CHECKPOINT`, `TORC_CHECKPOINT_MIN` | development: `TORC_CHECKPOINT`; the rest setting | state checkpoints while reading a prompt (retry granularity; the fewest tokens worth one) |
-| `TORC_GEMM_MIN`, `TORC_PACKED_MIN` | development | from how many vectors the packed matrix kernels take over |
+| `TORC_GEMM_MIN`, `TORC_PACKED_MIN`, `TORC_GEMM_IQ4` | development | from how many vectors the packed matrix kernels take over; `TORC_GEMM_IQ4=0` keeps x86 IQ4_NL on the row kernels |
 | `TORC_MULTI`, `TORC_GROUPED`, `TORC_GROUPED_MAX` | development | multi-vector and grouped expert products |
 | `TORC_RC`, `TORC_RC_WIDE` | development | rows per task in the row-split products |
 | `TORC_FUSE` | development | fuses the down products into the gate/up sweep |

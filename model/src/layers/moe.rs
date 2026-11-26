@@ -694,17 +694,24 @@ unsafe fn dot_multi_rows(
         return;
     }
     // Q8_0 the same way (the resident Q8_0 products: ssm_out, k, v and the shared expert), and MXFP4 (gpt-oss's
-    // experts) by the packed GEMM alone
+    // experts) and IQ4_NL (the Inkling and Flash Next experts) by the packed GEMM alone, with the same bits as
+    // x86mm's lanes_pass (parity test). IQ4_NL went through x86mm alone before, which reads a row's weights again for
+    // every 4 vectors: a prompt's experts were bound by memory and did not gain from threads (13900K, Inkling, 26 Nov:
+    // reading 46-50 tok/s at 8 to 32 threads, the experts 56% of it). TORC_GEMM_IQ4=0 keeps x86mm
+    #[cfg(target_arch = "x86_64")]
+    static IQ4: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !crate::switches::is("TORC_GEMM_IQ4", "0"));
     #[cfg(target_arch = "x86_64")]
     {
         let vnni = kernels::x86mm::vnni();
         let packed = vnni > 0 && nv >= 2 && nv >= *PACKED_MIN;
-        if ty == 8 && (packed || vnni == 1 && nv >= 2) || ty == 39 && packed {
+        if ty == 8 && (packed || vnni == 1 && nv >= 2) || (ty == 39 || ty == 20 && *IQ4) && packed {
             let r8 = rows / 8 * 8;
             unsafe {
                 if r8 > 0 && packed {
                     if ty == 8 {
                         kernels::x86_gemm::gemm_q8_0(&w[..r8 * row_bytes], row_bytes, r8, x.g, nv, y, y_stride);
+                    } else if ty == 20 {
+                        kernels::x86_gemm::gemm_iq4_nl(&w[..r8 * row_bytes], row_bytes, r8, x.g, nv, y, y_stride);
                     } else {
                         kernels::x86_gemm::gemm_mxfp4(&w[..r8 * row_bytes], row_bytes, r8, x.g, nv, y, y_stride);
                     }
