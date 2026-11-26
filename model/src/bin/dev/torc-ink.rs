@@ -35,7 +35,9 @@ fn compare(a: &[f32], b: &[f32], nv: usize, what: &str) -> bool {
 /// kbench=1: the one-token products alone, as GB/s of weights read: the experts' gate/up rows (IQ4_NL, 8 experts of a
 /// layer, as one token's decode asks for them) and the layers' attn_q (Q8_0), each over the whole pool with one
 /// quantised vector, over every layer.
-fn kbench(m: &Ink) {
+/// kbench=2: 24 rounds, each asking for 8 other experts a layer (all 128 touched by round 16), as real decode does,
+/// instead of the same 8; from round 16 on they are warm but not the last round's.
+fn kbench(m: &Ink, spread: bool) {
     use format::BlockKind;
     use model::moe::{Mat, apply_group};
     let dm = m.h.d_model;
@@ -43,13 +45,14 @@ fn kbench(m: &Ink) {
     let mut xq = kernels::Q8::new(dm / kernels::QK);
     kernels::ops::q8k_quantize(&x, xq.view_mut());
     let ff = m.h.d_ff;
-    for _round in 0..4 {
+    let rounds = if spread { 24 } else { 4 };
+    for round in 0..rounds {
         // experts: 8 a layer (ids spread over the 128), gate and up of each, the real ff rows
         let (mut bytes, t) = (0usize, Instant::now());
         for l in 0..m.h.n_layer as u32 {
             let g = m.w.file.blocks.iter().find(|b| b.layer == l && b.kind == BlockKind::Moe).and_then(|b| b.experts);
             let Some(g) = g else { continue };
-            let ids: Vec<u32> = (0..8u32).map(|i| i * 16 + 3).collect();
+            let ids: Vec<u32> = (0..8u32).map(|i| i * 16 + if spread { (round as u32 * 5) % 16 } else { 3 }).collect();
             let packs = m.w.experts_of(l, g, &ids).unwrap();
             let mut outs = vec![vec![0.0f32; ff]; 16];
             let mut jobs: Vec<(Mat, &mut [f32])> = Vec::new();
@@ -115,7 +118,7 @@ fn main() {
     let mut m = Ink::load(path, ctx).unwrap_or_else(|e| fail(e));
     let nv = m.n_vocab();
     if opt("kbench").is_some() {
-        kbench(&m);
+        kbench(&m, opt("kbench").as_deref() == Some("2"));
         return;
     }
     println!(
