@@ -845,8 +845,11 @@ impl Ngram {
             }
             rows = rows.max(off[hh] + voc[hh]);
         }
-        let t = w.need("per_layer_token_embd.weight")?;
-        if t.t.n_dims != 2 || t.t.dims[0] as usize != dim || t.t.dims[1] < rows || ![20, 8, 2].contains(&t.t.ty) {
+        // the entry only: a mapless load reads this table's rows from the file (Weights::table_rows)
+        let t = w
+            .entry("per_layer_token_embd.weight")
+            .ok_or_else(|| format::Error("missing per_layer_token_embd".into()))?;
+        if t.n_dims != 2 || t.dims[0] as usize != dim || t.dims[1] < rows || ![20, 8, 2].contains(&t.ty) {
             return err("per_layer_token_embd.weight missing or unexpected");
         }
         let l = ngl as u32;
@@ -932,8 +935,11 @@ impl Ngram {
         let (dm, hc) = (h.d_model as usize, h.hc as usize);
         let d = hc * dm;
         let n = tokens.len();
-        let tab = w.need("per_layer_token_embd.weight")?;
-        let rb = tab.row_bytes();
+        const TAB: &str = "per_layer_token_embd.weight";
+        // in memory (the mapping), or after a mapless load only its entry, the rows read from the file per chunk
+        let tab = w.tensor(TAB);
+        let te = w.entry(TAB).ok_or_else(|| format::Error("missing per_layer_token_embd".into()))?;
+        let (ty, rb) = (te.ty, (te.bytes / te.dims[1].max(1)) as usize);
         let heads = (self.n - 1) * self.per;
         let (wk, wv) = (self.key.get(w), self.val.get(w));
         let mut emb = vec![0.0f32; NG_CHUNK * dm];
@@ -955,6 +961,11 @@ impl Ngram {
                     self.rows(pos0 + c0 + j, &mut r);
                     rows[j * heads..(j + 1) * heads].copy_from_slice(&r[..heads]);
                 }
+                // mapless: the rows' bytes read from the file first, in the order of `rows`
+                let got = match &tab {
+                    Some(_) => Vec::new(),
+                    None => w.table_rows(TAB, &rows)?,
+                };
                 let ep = SyncPtr::new(&mut emb);
                 let dim = self.dim;
                 crate::pool::par_for(cn * heads, &|i| {
@@ -962,7 +973,11 @@ impl Ngram {
                     let r = rows[i] as usize;
                     // SAFETY: item i owns head hh's slice of token j's row
                     let e = unsafe { ep.slice(j * dm + hh * dim, dim) };
-                    kops::dequantize(tab.t.ty, &tab.data[r * rb..(r + 1) * rb], e);
+                    let src = match &tab {
+                        Some(t) => &t.data[r * rb..(r + 1) * rb],
+                        None => &got[i * rb..(i + 1) * rb],
+                    };
+                    kops::dequantize(ty, src, e);
                     for v in e.iter_mut() {
                         *v = to_bf16(*v);
                     }

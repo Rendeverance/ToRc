@@ -29,6 +29,18 @@ const SECTIONS = [
 const KIND_BADGE = { setting: 'badge accent', diagnostic: 'badge warn', development: 'badge' };
 // the switches the app sets itself (desktop/src/main.rs APP_OWNED): shown here, not taken
 const APP_OWNED = ['TORC_HOST', 'TORC_API_KEY'];
+// the two status page switches that show what people asked and where from: each says so while it is on
+const PRIVATE = {
+  TORC_STATUS_TEXT: 'the end of each request and the start of its reply',
+  TORC_STATUS_CLIENT: 'the address each request came from',
+};
+// `settings`: said in the words of the Settings section rather than the switches' names
+const privacyWarning = (name, settings) =>
+  `With this on, the status page shows ${PRIVATE[name]} to anyone who can open it. ` +
+  (settings
+    ? 'If Other machines is on, turn on Ask for the API key so they need it.'
+    : 'If the page is open to your network (TORC_STATUS_NET=1), set TORC_STATUS_KEY=1 so other machines need the ' +
+      'API key.');
 
 // `openName`: a switch to show with its explanation already open.
 function openAdvanced(openName) {
@@ -77,6 +89,9 @@ function switchGroups(wanted, openName) {
 
 function switchRow(w, open) {
   const env = S.settings.env;
+  // shown only while the switch is on (the engine also needs TORC_STATUS=1 for the page to exist)
+  const warn = PRIVATE[w.name] ? el('div', 'note warn', privacyWarning(w.name)) : null;
+  if (warn) warn.hidden = env[w.name] !== '1';
   const box = field(
     'text',
     env[w.name] ?? '',
@@ -88,6 +103,7 @@ function switchRow(w, open) {
       else next[w.name] = value;
       await setSettings({ env: next });
       box.classList.toggle('set', value !== '');
+      if (warn) warn.hidden = value !== '1';
     },
     { placeholder: 'default' },
   );
@@ -114,5 +130,6 @@ function switchRow(w, open) {
     rows[0].querySelector('.info').classList.add('on');
     setTimeout(() => rows[0].scrollIntoView({ block: 'center' }), 0);
   }
+  if (warn) rows.splice(1, 0, warn);
   return rows;
 }

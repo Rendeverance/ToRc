@@ -10,7 +10,7 @@
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; connect-src 'self'; img-src 'self'; style-src 'unsafe-inline';
            script-src 'unsafe-inline'">
-<title>torc · status</title>
+<title>ToRc · status</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 /* The colours, fonts and shapes below are the desktop app's own: the values are copied from ui/renderer/styles.css,
@@ -49,7 +49,6 @@ body {
 }
 @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
 .num, .v { font-variant-numeric: tabular-nums; }
-main { max-width: 1080px; }
 /* the model name and the two lines under it are the page's title block, in the app's own title sizes */
 h1 { font: 600 20px/1.25 var(--display); margin: 0 0 4px; overflow-wrap: anywhere; }
 .sub { color: var(--ink2); font-size: 12.5px; }
@@ -58,7 +57,7 @@ h1 { font: 600 20px/1.25 var(--display); margin: 0 0 4px; overflow-wrap: anywher
 .brand { display: flex; align-items: center; gap: 10px; }
 /* the app's mark and its round crop at the size a heading read from across a room works at - the app draws it inside
    a window, the page draws the same bytes larger. The size is written here and not left to the file: the mark's own
-   pixels are 96, and a rule CSS cannot parse is not an error page, it is a logo at 96 */
+   pixels are 96, and a rule CSS cannot parse leaves the logo at 96 */
 .brand .mark { width: 50px; height: 50px; display: block; border-radius: 50%; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
   padding: 14px 16px 16px; margin-top: 14px; }
@@ -74,7 +73,7 @@ h2, .k { font: 600 11px var(--ui); letter-spacing: .09em; text-transform: upperc
 .state { margin-bottom: 12px; }
 /* a metric is a column, and its graph is pushed to the bottom of it: the two graphs are then drawn at the same height
    on the page, which they were not while each card took its own height. What makes the reading card taller is its
-   progress bar, and the honest answer to that is for the other cards to leave the same space empty - a bar is not
+   progress bar, and the answer to that is for the other cards to leave the same space empty - a bar is not
    something a prompt that is not being read has - rather than for their graphs to ride up beside it */
 .metric { flex: 1 1 14rem; min-width: 12rem; display: flex; flex-direction: column; }
 .v { font-size: 1.75rem; font-weight: 600; line-height: 1.15; }
@@ -96,7 +95,7 @@ h2, .k { font: 600 11px var(--ui); letter-spacing: .09em; text-transform: upperc
    number and should not look like the same one. */
 /* the width a graph is drawn at, and the bar over it is drawn at the same width so the two read as two views of one
    prompt. Said once, because a plot that gets wider and leaves its bar behind is the interesting failure */
-:root { --plot: 220px; }
+:root { --plot: 100%; }
 .prog { margin-top: 10px; }
 .bar, #readspark, #writespark { width: var(--plot); max-width: 100%; }
 .bar { height: 6px; background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
@@ -129,16 +128,18 @@ th.n, td.n { text-align: right; }
 th { color: var(--ink3); vertical-align: top; font: 600 11px var(--ui); letter-spacing: .09em;
     text-transform: uppercase; }
 th .u { opacity: .6; }
-td.snip { padding-top: 0; color: var(--ink3); white-space: nowrap; overflow: hidden;
-          text-overflow: ellipsis; max-width: 34rem; }
+/* the end of the request on one line and the start of the reply on the next, each cut to the table's width: on one
+   shared line a long request pushed the reply off the end */
+td.snip { padding-top: 0; color: var(--ink3); max-width: 0; }
+td.snip div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* a request and its text are one entry: the line the shared cell border draws between them reads as another row of
    numbers, so the pair keeps one line under it and none inside */
 tr.pair td { border-bottom: 0; padding-bottom: 2px; }
 /* an address in the same fixed-width face the numbers use: it is compared across rows by eye, and a proportional face
    makes 192.0.2.1 and 192.0.2.7 look the same width apart */
 td.ip { font-family: var(--mono); font-size: 12px; color: var(--ink2); white-space: nowrap; }
-/* A phone is narrower than nine columns: measured at 390px the header row alone wants 744px, so the columns are
-   squeezed to 51-72px each, every header wraps to several lines and the last three columns leave the screen. Below that
+/* A phone is narrower than nine columns: the header row alone is about twice a phone's width, so the columns are
+   squeezed, every header wraps to several lines and the last three columns leave the screen. Below that
    width a reply becomes a small block instead, three lines of labelled values in the same order as the columns. The
    labels are the column headers' own words, carried on each cell as data-l for exactly this case, so nothing gains or
    loses a name between the two layouts and a renamed header has to be renamed in one place. */
@@ -156,12 +157,14 @@ td.ip { font-family: var(--mono); font-size: 12px; color: var(--ink2); white-spa
      are the span being looked at. Pinning it leaves the other eight cells to fill the lines below in column order. */
   #replies td[data-l="ended"] { grid-column: 3; grid-row: 1; }
   #replies td[colspan] { grid-column: 1 / -1; }
+  /* the table's width trick for the text lines has no table to take a width from here */
+  #replies td.snip { max-width: none; }
 }
 .off { color: var(--ink3); font-size: 12px; margin-top: 8px; }
 </style>
 <main>
 <div class="brand">
-  <img class="mark" src="/torc/mark.png" alt="">
+  <img class="mark" alt="">
   <div>
     <h1 id="model">connecting</h1>
     <div class="sub" id="engine"></div>
@@ -175,11 +178,11 @@ td.ip { font-family: var(--mono); font-size: 12px; color: var(--ink2); white-spa
       <div class="v" id="read">–</div>
       <div class="prog"><div class="bar" id="readbar"><i id="readfill"></i><i id="readpart" class="part"></i></div>
         <div class="pct" id="readpct"></div></div>
-      <svg id="readspark" width="220" height="38" viewBox="0 0 220 38" preserveAspectRatio="none"></svg>
+      <svg id="readspark" width="220" height="56" viewBox="0 0 220 56" preserveAspectRatio="none"></svg>
       <div class="s" id="readsub"></div></div>
     <div class="metric"><div class="k">writing reply</div>
       <div class="v" id="write">–</div>
-      <svg id="writespark" width="220" height="38" viewBox="0 0 220 38" preserveAspectRatio="none"></svg>
+      <svg id="writespark" width="220" height="56" viewBox="0 0 220 56" preserveAspectRatio="none"></svg>
       <div class="s" id="writesub"></div></div>
     <div class="metric"><div class="k">this run</div>
       <div class="s" id="run">context – · requests – · waiting –</div></div>
@@ -202,14 +205,22 @@ td.ip { font-family: var(--mono); font-size: 12px; color: var(--ink2); white-spa
 // The whole page is one poll of one address. Every rate on it is a number the server measured over a named interval:
 // the rate of the block being read, the span the reply's last tokens were written in, the seconds a prompt has been
 // reading. The page divides nothing that the server has not already timed, and where it does divide - the average over
-// a prompt so far - it says that is what it shows. The graphs are the last minute of those readings, newest at the
-// right, history flowing right to left.
-const AT = 60;                    // seconds of history in the graphs
-const H = {read: [], write: []};  // [epoch_seconds, value], trimmed to AT
+// a prompt so far - it says that is what it shows. The graphs are the last five minutes the server spent reading or
+// writing, newest at the right. Idle time is left out, so a finished reply stays on the graph until the next one.
+const AT = 300;                   // seconds of busy time in the graphs
+const H = {read: [], write: []};  // [busy-clock seconds, value], trimmed to AT
 const TOP = {};                   // top of each graph's scale, held between polls because it is approached, not reset
 // When each series began, kept even after the window has moved past it: the edge drawn at the start of a series
 // belongs to that moment, and once it has scrolled out at the left there is nothing there to close.
 const BEGUN = {read: 0, write: 0};
+// the graphs' clock: it runs only while the server is busy, and for the poll that sees it stop
+let V = 0, lastPoll = null, wasBusy = false;
+function tick(busy) {
+  const t = Date.now() / 1000;
+  if (lastPoll !== null && (busy || wasBusy)) V += t - lastPoll;
+  lastPoll = t;
+  wasBusy = busy;
+}
 const $ = (id) => document.getElementById(id);
 const num = (n, d = 0) => (Number.isFinite(n) ? n.toLocaleString(undefined, {maximumFractionDigits: d}) : "–");
 // One clock on this page, 24-hour, whatever the browser's locale is set to. The times in that table are read next to
@@ -218,8 +229,12 @@ const num = (n, d = 0) => (Number.isFinite(n) ? n.toLocaleString(undefined, {max
 const clock = (epoch) => new Date(epoch * 1000).toLocaleTimeString(undefined, {hour12: false});
 
 function spark(which, id, color) {
-  const now = Date.now() / 1000, pts = H[which].filter((p) => now - p[0] <= AT);
-  const svg = $(id), w = +svg.getAttribute("width"), h = +svg.getAttribute("height");
+  const now = V, pts = H[which].filter((p) => now - p[0] <= AT);
+  // drawn at the width the card gives it, so the plot is as wide as the window allows and stays sharp
+  const svg = $(id), h = +svg.getAttribute("height");
+  const w = Math.max(60, Math.round(svg.getBoundingClientRect().width) || +svg.getAttribute("width"));
+  svg.setAttribute("width", w);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
   const vals = pts.map((p) => p[1]);
   const hi = Math.max(...vals, 1), lo = Math.min(...vals, hi);
   // a series that never moves has no height to scale against, and a line pinned to the top of the frame reads as
@@ -244,7 +259,7 @@ function spark(which, id, color) {
   // bottom edge is cut in half by the frame, where it looks like a plot that stopped rather than a machine that is
   // idle - which is the one thing a person watching it needs to be able to tell apart.
   const x = (t) => w - ((now - t) / AT) * w;
-  // the box is 38 units for 30 of scale: 6 of air under the numbers above it and 2 inside its bottom edge. Both live
+  // the box is 56 units for 48 of scale: 6 of air under the numbers above it and 2 inside its bottom edge. Both live
   // in the drawing, because anything the box grows by in CSS takes the bottom of the plot away first.
   const y = (v) => 6 + (1 - v / top) * (h - 8);
   const xy = pts.map(([t, v]) => `${x(t)},${y(v)}`).join(" ");
@@ -299,7 +314,7 @@ function cadenceLimit(which, age) {
 }
 
 function push(which, value) {
-  const now = Date.now() / 1000;
+  const now = V;
   if (!H[which].length) BEGUN[which] = now;
   H[which].push([now, value]);
   while (H[which].length && now - H[which][0][0] > AT) H[which].shift();
@@ -375,12 +390,9 @@ function draw(d) {
   // prompt counter rather than by a state the server would have to keep for itself
   const prefill = running && live.prompt_tokens > 0;
   // the rate of the block being read is the server's own measurement, and it is the number that tells a reader
-  // whether this prefill is going well right now. Beside it the reading since this prompt's first block ended: both
-  // points of that span are measured, and it leaves out the block that begins a prompt, which pays for the machine
-  // coming back to the model and yields no tokens until it is over. The average over the whole prompt is not shown:
-  // on the 24,501-token prompt an agent sends for a two-letter message, that first block is most of what the number
-  // would be measuring, and a reader watching a run wants the speed of the run. The span runs between two of the
-  // engine's own reports, so this number moves once a block, like the one above it, and not once a second.
+  // whether this prefill is going well right now. Under it, the average since this prompt's first block ended, both
+  // ends of which the engine measured: tokens over seconds would keep counting seconds between two blocks and sag
+  // with every poll. Once the prompt is read, the line under the tile is the whole prompt's speed, as the API gives it
   const now = prefill ? (live.prompt_rate || 0) : 0;
   // the engine only measures a block once it has finished one, so at a long context this rate can be minutes old
   const ageS = prefill ? live.prompt_rate_age_s : null;
@@ -399,14 +411,13 @@ function draw(d) {
   // graph, where a flat line off a finished reply would read as a rate that held.
   const last = (d.replies || [])[0] || null;
   const lastWrite = last ? rate(last.output, last.output_seconds) : 0;
-  // a prompt's reading speed is its engine-measured span after the first block ended, not its whole seconds: the
-  // time before the first block ends is the machine coming back to the model, and it is a third of a long prompt.
-  // A prompt read in one block has no span between two readings - there the whole prompt is that block, and the
-  // pair over the whole prompt is the same reading.
-  const readRate = (r) => !r ? 0 : (r.reading_seconds > 0 ? rate(r.reading_tokens, r.reading_seconds)
-                                                          : rate(r.prompt, r.prompt_seconds));
+  // a prompt's reading speed: the tokens read over the seconds reading them, the figure the API's timings give
+  const readRate = (r) => (r ? rate(r.prompt, r.prompt_seconds) : 0);
   const lastRead = readRate(last);
-  push("read", read); push("write", write);
+  // the graphs take a sample while the server is busy, and one more as it stops, so a run ends on its line at 0
+  const was = wasBusy;
+  tick(running);
+  if (running || was) { push("read", read); push("write", write); }
   $("read").textContent = read ? `${num(read, 1)} tok/s` : "–";
   // a rate that has not moved for minutes is shown dimmed rather than dropped: it is the speed the last block of
   // this prompt was read at, which is the best guess at the one being read, but it is not a number that is moving
@@ -442,12 +453,13 @@ function draw(d) {
   // name, and the dash says that better than a sentence about why not.
   $("readsub").innerHTML = prefill
     ? `${num(live.prompt_done)} of ${num(live.prompt_tokens)} tokens<br>`
-      + (since ? `avg ${num(since, 1)} tok/s whole prompt` : "–")
+      + (since ? `avg ${num(since, 1)} tok/s since the first block` : "–")
     : running ? "reading nothing"
-      // once a prompt has been read there is a speed to name; before the first one there is nothing to say. The
-      // token count is the one the rate is taken over, so the two numbers name the same span.
-      : (lastRead ? `last prompt read: ${num(last.reading_seconds > 0 ? last.reading_tokens : last.prompt)}`
-        + ` tokens at avg ${num(lastRead, 1)} tok/s whole prompt` : "idle");
+      // the last prompt in the table's own numbers: its size, the part that came from cache, and the speed the rest
+      // was read at
+      : (lastRead ? `last prompt: ${num(last.prompt_total)} tokens`
+        + (last.cached ? `, ${num(last.cached)} from cache` : "")
+        + `, read at ${num(lastRead, 1)} tok/s` : "idle");
   $("write").textContent = write ? `${num(write, 1)} tok/s` : "–";
   $("writesub").textContent = running
     ? (prefill
@@ -482,10 +494,10 @@ function draw(d) {
     + `<td class="n" data-l="write t/s">${num(rate(r.output, r.output_seconds), 1)}</td>`
     + `<td class="n" data-l="model time s">${num(r.prompt_seconds + r.output_seconds, 1)} s</td>`
     + `<td data-l="ended">${r.finish}</td></tr>`
-    + (snip ? `<tr><td class="snip" colspan="${cols}">← ${esc(r.asked)} → `
+    + (snip ? `<tr><td class="snip" colspan="${cols}"><div>← ${esc(r.asked)}</div><div>→ `
         // a thinking model whose cap stopped it before it answered: what follows is what it thought, and the page
         // says so instead of letting it read as the answer
-        + (r.thinking ? "<em>thinking:</em> " : "") + esc(r.reply) + "</td></tr>" : "");
+        + (r.thinking ? "<em>thinking:</em> " : "") + esc(r.reply) + "</div></td></tr>" : "");
   }).join("");
   $("replies").tBodies[0].innerHTML = rows || `<tr><td colspan="${cols}" class="off">nothing yet</td></tr>`;
   $("notext").textContent = d.text ? "" : "the text of a request and its reply is not shown: TORC_STATUS_TEXT is off";
@@ -493,6 +505,10 @@ function draw(d) {
 
 const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => (
   {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+// with TORC_STATUS_KEY on, another machine's browser asks for the key once, in its own login box, and sends it with
+// both of these from then on
+document.querySelector("img.mark").src = "/torc/mark.png";
 
 async function poll() {
   try {

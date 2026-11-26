@@ -81,6 +81,32 @@ function modelCard() {
         'Settings turns it off'
       : 'Only this machine can use the engine’s API. Settings can share it on your network';
     fact('API', isShared ? shared : 'this machine only', how);
+    // the engine's status page, when TORC_STATUS was on at Load: its address, which opens it in the browser
+    const env = run.env || {};
+    if (env.TORC_STATUS === '1') {
+      // as the engine reads it: a whole number from 1 to 65535, or the API's port
+      const n = Number(String(env.TORC_STATUS_PORT || '').trim());
+      const own = Number.isInteger(n) && n > 0 && n < 65536 ? n : 0;
+      const at = own || run.port;
+      // other machines reach it on its own port with TORC_STATUS_NET, or on the API's when the API is shared too
+      const others = env.TORC_STATUS_NET === '1' && (own || isShared);
+      const page = el('button', 'kv kv-btn');
+      page.append(el('span', '', 'Status page'), el('b', 'num', `127.0.0.1:${at}`));
+      page.title =
+        'Opens the engine’s status page in your browser. ' +
+        (!others
+          ? 'Only this machine can open it.'
+          : env.TORC_STATUS_KEY !== '1'
+            ? `Other machines open it at this machine’s address on port ${at}.`
+            : (run.apiKey || '').trim()
+              ? `Other machines open it at this machine’s address on port ${at}, with the API key as the password.`
+              : 'Other machines are refused it: it asks for the API key and none is set.');
+      page.onclick = async () => {
+        const r = await window.torc.openStatus(at);
+        if (!r.ok) toast(`The status page did not open: ${r.error}`);
+      };
+      card.append(page);
+    }
   }
   fact('Tools', s.tools === 'basic' ? 'basic' : 'ToolFunnel');
 

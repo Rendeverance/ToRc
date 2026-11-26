@@ -131,10 +131,13 @@ function openSettings() {
     keyCtl,
     'Another machine’s requests must carry this key, the way any OpenAI or Anthropic client sends one: paste it ' +
       'where your app or agent asks for an API key (it goes as "Authorization: Bearer <key>" or "x-api-key: ' +
-      '<key>"). Requests from this machine, ToRc itself included, need no key. New key replaces it from the next ' +
+      '<key>"). Requests from this machine, ToRc itself included, need no key. With Ask for the API key on, the ' +
+      'status page asks other machines for it too, in their browser’s login box. New key replaces it from the next ' +
       'Load, and anything using the old one is refused after that. Keep it like a password.',
   );
+  // the key row is there while something uses the key: the shared API, or the status page asking other machines
   const showKey = (on) => {
+    on = on || (S.settings.env || {}).TORC_STATUS_KEY === '1';
     keyRow[0].hidden = !on;
     if (!on) keyRow[1].hidden = true;
   };
@@ -171,6 +174,10 @@ function openSettings() {
     ]),
   );
   showKey(!!s.share);
+  body.append(statusGroup(() => {
+    keyBox.value = S.settings.apiKey || '';
+    showKey(!!S.settings.share);
+  }));
 
   const bench = el('button', 'btn', 'Run the benchmark');
   bench.onclick = () => openJob('bench');
@@ -212,6 +219,61 @@ function openSettings() {
       ),
     ]),
   );
+}
+
+// The engine's status page: the same switches as in Advanced, where people look for them. `keyChanged` runs when
+// asking for the key made one, so the key row above can show it.
+function statusGroup(keyChanged) {
+  // the section's own copy of the switches, changed and sent whole each time: S.settings only catches up once a save
+  // is done, and two changes in quick succession built from it would each drop the other's
+  const draft = { ...(S.settings.env || {}) };
+  const env = () => draft;
+  const setEnv = (name, value) => {
+    if (value === undefined) delete draft[name];
+    else draft[name] = value;
+    return setSettings({ env: { ...draft } });
+  };
+  const flag = (name) =>
+    toggle(env()[name] === '1', (v) => setEnv(name, v ? '1' : undefined));
+  const port = field(
+    'text',
+    env().TORC_STATUS_PORT || '',
+    (typed) => {
+      const n = Number(typed.trim());
+      return setEnv('TORC_STATUS_PORT', Number.isInteger(n) && n > 0 && n < 65536 ? String(n) : undefined);
+    },
+    { placeholder: 'the API’s' },
+  );
+  const asks = toggle(env().TORC_STATUS_KEY === '1', async (v) => {
+    // asking for a key needs one: the first time, one is made, as sharing the API does
+    await setEnv('TORC_STATUS_KEY', v ? '1' : undefined);
+    if (v && !S.settings.apiKey) await setSettings({ apiKey: newApiKey() });
+    keyChanged();
+  });
+  const warned = (name, label, hint, text) => {
+    const warn = el('div', 'note warn', privacyWarning(name, true));
+    warn.hidden = env()[name] !== '1';
+    const box = toggle(env()[name] === '1', async (v) => {
+      await setEnv(name, v ? '1' : undefined);
+      warn.hidden = !v;
+    });
+    return [...row(label, hint, box, text), warn];
+  };
+  return group('Status page', [
+    row(
+      'Status page',
+      'The engine’s own page: the model, the prompt being read, the replies',
+      flag('TORC_STATUS'),
+      window.EXPLAIN.TORC_STATUS,
+    ),
+    row('Its own port', 'Empty: the API’s port', port, window.EXPLAIN.TORC_STATUS_PORT),
+    row('Other machines', 'Off: this machine only', flag('TORC_STATUS_NET'), window.EXPLAIN.TORC_STATUS_NET),
+    row('Ask for the API key', 'Other machines log in with it', asks, window.EXPLAIN.TORC_STATUS_KEY),
+    ...warned('TORC_STATUS_TEXT', 'Show what was asked', 'The end of each request and the start of its reply',
+      window.EXPLAIN.TORC_STATUS_TEXT),
+    ...warned('TORC_STATUS_CLIENT', 'Show where from', 'The address each request came from',
+      window.EXPLAIN.TORC_STATUS_CLIENT),
+  ]);
 }
 
 // A new API key: 24 random bytes, as letters and digits another app can take in a paste.

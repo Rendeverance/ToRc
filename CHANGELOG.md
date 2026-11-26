@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.8 (26 November 2026)
+
+Thank you to RainerSC for two pull requests: a status page for the server, and attention scores on ARM's matrix units.
+This release builds on those plus addresses some speed and drafting bugs + cleans up the UI experience a little making
+things clearer for the user.
+
+- A status page: ToRc now serves a Status page - Turn on in Settings under Status page or start the server with
+  `TORC_STATUS=1`. Off by default, local only unless you let other machines see it (`TORC_STATUS_NET=1`). Port may be
+  chosen to suit: (`TORC_STATUS_PORT`). It can be open to your network while the API isn't, or it can ask other machines
+  for the API key (`TORC_STATUS_KEY=1`). What people asked and where from are shown only if you turn them on
+  (`TORC_STATUS_TEXT`, `TORC_STATUS_CLIENT`).
+- Attention scores on ARM's matrix units: with `TORC_ATTN_FAST=1` on a CPU with I8MM, long prompts' scores run on SMMLA,
+  same results bit for bit.
+- Faster on Windows when the experts don't fit in memory: with the expert cache streaming, the model file is no longer
+  mapped as well, so the reads from the SSD go faster. Flash Next on the two Snapdragon boxes reads prompts up to 8k
+  faster (1k: 73 tok/s vs 61, 4k: 80 vs 76, 8k: 62 vs 53); Qwen3.6-35B with a restricted (tiny) 3 GB cache on a 12600K
+  writes at 9.5 tok/s up from 7.4.
+- A saved system prompt now keeps its drafts: one loaded from disk after a restart had lost its MTP rows, so it drafted
+  far less (about 80 tok/s down to 40 on a 13900K). The replies were the same either way, this just fixes the speed /
+  MTP handling bug.
+- Auto-tune now asks before using the NPU or the GPU: reading is faster, but round slightly differently from the CPU, so
+  the results may not be bit-exact.
+- Fixed a drafting bug
+
 ## 0.1.7 (20 November 2026)
 
 Thank you to RainerSC for three pull requests: seven more weight types, so the smallest quants of the big models now

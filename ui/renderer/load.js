@@ -348,12 +348,56 @@ async function openJob(kind, args) {
   log.textContent += r.ok ? `${NL}Done.` : `${NL}${r.error || `Stopped (exit ${r.code}).`}`;
   log.scrollTop = log.scrollHeight;
   setStatus('Idle', false);
+  if (tuning && r.ok) for (const k of toAsk()) body.insertBefore(consent(k), acts);
   if ((tuning || converting) && r.ok) {
     const again = el('button', 'btn primary', converting ? 'Auto-tune it' : 'Load the model');
     again.onclick = converting ? () => openJob('tune') : loadNow;
     acts.append(again);
   }
   return r;
+}
+
+// What Auto-tune asks about when it finishes: the NPU on a Snapdragon X while it is off, and the GPU once its switch
+// is on, each until it has been answered once (settings.asked). Both round differently from the CPU.
+function toAsk() {
+  const asked = S.settings.asked || {};
+  const kinds = [];
+  if (S.info.npu === 'snapdragon' && !S.settings.npu && !asked.npu) kinds.push('npu');
+  if (S.settings.gpu && !asked.gpu) kinds.push('gpu');
+  return kinds;
+}
+
+// The question before the NPU or the GPU is used. Using it is the highlighted choice, since it is faster and the
+// effect is slight, but the user decides. No number: how far the odds move depends on the model, and means nothing
+// to someone choosing.
+function consent(kind) {
+  const npu = kind === 'npu';
+  const box = el('div', 'note consent');
+  box.append(
+    el('b', '', npu ? 'Use the NPU?' : 'Use the GPU for long prompts?'),
+    el(
+      'p',
+      '',
+      'It reads prompts faster, with a slight effect on quality from rounding: the results are not exact with the ' +
+        'CPU’s, or between platforms and vendors. Replies are still written on the CPU.',
+    ),
+  );
+  const btns = el('div', 'row-actions');
+  const answer = async (on) => {
+    // after any save still in flight, so two answers in a row both stay remembered
+    await S.saving;
+    await setSettings({ [kind]: on, asked: { ...(S.settings.asked || {}), [kind]: true } });
+    renderPane();
+    const what = npu ? 'the NPU' : 'the GPU for long prompts';
+    btns.replaceChildren(el('span', '', on ? `Using ${what} from the next Load.` : 'CPU only. Nothing else changes.'));
+  };
+  const yes = el('button', 'btn primary', npu ? 'Use the NPU' : 'Use the GPU');
+  const no = el('button', 'btn', 'CPU only');
+  yes.onclick = () => answer(true);
+  no.onclick = () => answer(false);
+  btns.append(yes, no);
+  box.append(btns);
+  return box;
 }
 
 // What the engine and the tool servers have printed, for when something goes wrong.

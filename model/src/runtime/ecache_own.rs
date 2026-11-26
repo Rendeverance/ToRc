@@ -20,7 +20,7 @@ use std::time::Instant;
 
 /// Unbuffered reads need the buffer, offset and length on sector boundaries; 4 KiB covers the sector size of any drive
 /// in use today.
-const ALIGN: usize = 4096;
+pub(crate) const ALIGN: usize = 4096;
 
 /// The experts the cache serves, from the file's EXPERTS records: (layers, experts per layer, each layer's pack bytes
 /// (0 for none), each (layer, expert)'s absolute offset in the file).
@@ -465,7 +465,7 @@ pub struct OwnCache {
 /// The file, opened for unbuffered reads: FILE_FLAG_NO_BUFFERING on Windows, O_DIRECT on Linux (x86-64 and ARM64).
 /// TORC_IO_BUFFERED=1 opens it plainly, so the reads go through the page cache, and so does a Linux file system that
 /// refuses O_DIRECT (tmpfs, and some network and FUSE file systems), which is said once.
-fn open_unbuffered(path: &str) -> std::io::Result<File> {
+pub(crate) fn open_unbuffered(path: &str) -> std::io::Result<File> {
     if crate::switches::on("TORC_IO_BUFFERED") {
         return File::open(path);
     }
@@ -522,7 +522,7 @@ fn direct_read_works(f: &File) -> std::io::Result<()> {
 }
 
 /// Reads len bytes at off into p (all multiples of ALIGN): the whole length, or an error.
-fn read_at(f: &File, p: *mut u8, len: usize, off: u64) -> std::io::Result<()> {
+pub(crate) fn read_at(f: &File, p: *mut u8, len: usize, off: u64) -> std::io::Result<()> {
     // SAFETY: p holds len writable bytes that nothing else touches during the read
     let buf = unsafe { std::slice::from_raw_parts_mut(p, len) };
     let mut done = 0;

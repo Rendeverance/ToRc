@@ -430,12 +430,16 @@ pub(crate) const APP_OWNED: &[&str] = &["TORC_HOST", "TORC_API_KEY"];
 /// server listens there, or on every network when Settings shares it (0.0.0.0 takes 127.0.0.1 too); an address of one
 /// network alone would shut the app out. Shared, it always has a key (only other machines need it, so the app's own
 /// requests carry none), and without one it isn't shared. Only the server gets these, not the tuner, the benchmark or
-/// a second machine.
+/// a second machine. The status page can ask other machines for the same key without the API being shared, so the key
+/// goes to the server then too, with the API still on this machine only.
 pub(crate) fn server_switches(s: &Value) -> Vec<(String, String)> {
     let mut env = switches_for(s);
     let key = s["apiKey"].as_str().map(str::trim).unwrap_or("");
+    let status_key = s["env"]["TORC_STATUS_KEY"] == "1";
     if s["share"] == true && !key.is_empty() {
         env.push(("TORC_HOST".into(), "0.0.0.0".into()));
+        env.push(("TORC_API_KEY".into(), key.into()));
+    } else if status_key && !key.is_empty() {
         env.push(("TORC_API_KEY".into(), key.into()));
     }
     env
@@ -905,6 +909,7 @@ async fn call(app: AppHandle, shell: State<'_, Arc<Shell>>, name: String, args: 
         "tfInstall" => shell.tf_install(&app),
         "tfUninstall" => shell.tf_uninstall(&app),
         "tfManage" => shell.manage(&a(0), &a(1)),
+        "openStatus" => open_status(&a(0)),
         "addresses" => {
             json!(jobs::interfaces().into_iter().map(|(n, a)| json!({"name": n, "address": a})).collect::<Vec<_>>())
         }
@@ -913,6 +918,29 @@ async fn call(app: AppHandle, shell: State<'_, Arc<Shell>>, name: String, args: 
     .await
     .map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// The engine's status page in the default browser. Always this machine's own address: the page passes only the port,
+/// so it can't have anything else opened.
+fn open_status(port: &Value) -> Value {
+    let Some(port) = port.as_u64().filter(|p| (1..=65535).contains(p)) else {
+        return json!({"ok": false, "error": "no port"});
+    };
+    let url = format!("http://127.0.0.1:{port}/");
+    #[cfg(windows)]
+    let mut cmd = Command::new("cmd");
+    #[cfg(windows)]
+    cmd.args(["/C", "start", "", &url]);
+    #[cfg(target_os = "macos")]
+    let mut cmd = Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = Command::new("xdg-open");
+    #[cfg(not(windows))]
+    cmd.arg(&url);
+    match jobs::quiet(&mut cmd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(_) => json!({"ok": true, "url": url}),
+        Err(e) => json!({"ok": false, "error": e.to_string()}),
+    }
 }
 
 #[tauri::command]
@@ -1130,6 +1158,12 @@ mod tests {
         assert_eq!(host(shared.clone()), Some("0.0.0.0".into()));
         assert_eq!(get(shared, "TORC_API_KEY"), Some("k1".into()));
         assert_eq!(get(serde_json::json!({"env": typed, "apiKey": "k1"}), "TORC_API_KEY"), None);
+        // the status page asking other machines for the key gets it, and the API stays on this machine
+        let asks = serde_json::json!({"env": {"TORC_STATUS": "1", "TORC_STATUS_KEY": "1"}, "apiKey": "k1"});
+        assert_eq!(get(asks.clone(), "TORC_API_KEY"), Some("k1".into()));
+        assert_eq!(host(asks), None);
+        let none = serde_json::json!({"env": {"TORC_STATUS": "1", "TORC_STATUS_KEY": "1"}, "apiKey": " "});
+        assert_eq!(get(none, "TORC_API_KEY"), None, "no key, none passed");
         // only the server gets them: the tuner, the benchmark and a second machine never see the address or the key
         let others = super::switches_for(&serde_json::json!({"env": typed, "share": true, "apiKey": "k1"}));
         assert!(others.iter().all(|(k, _)| k != "TORC_HOST" && k != "TORC_API_KEY"), "{others:?}");

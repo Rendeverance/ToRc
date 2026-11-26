@@ -132,8 +132,8 @@ The top row is two machines working together. On one machine, expect the second 
 under a long load (thermals: we haven't seen that on the IdeaCentre mini PCs, but it can happen on a laptop).
 
 **Bigger than memory: Qwen3.8 Flash Next, a 107 GB file, on the same two boxes with 64 GB of RAM between them, the
-experts that don't fit read from the SSDs as they are needed. About 67 tokens a second reading a 16k-token prompt and
-17 writing.**
+experts that don't fit read from the SSDs as they are needed. About 69 tokens a second reading a 16k-token prompt and
+16 writing.**
 
 **Every model and machine measured so far, with llama.cpp beside it where it was run: [PERFORMANCE.md](PERFORMANCE.md).**
 

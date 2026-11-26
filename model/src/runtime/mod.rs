@@ -13,6 +13,7 @@ pub mod pool;
 pub mod preflight;
 pub mod profile;
 pub mod repack;
+pub mod rows;
 pub mod scratch;
 pub mod tune;
 pub mod weights;

@@ -501,6 +501,20 @@ impl Model {
         }
     }
 
+    /// mtp_fill for prompt rows still in the hidden-row log (log_hidden), which goes on: the rows at pos0 + j with
+    /// tokens[j]. Ok(false), with nothing run, if there is no such block or the log does not hold those rows.
+    pub fn mtp_fill_logged(&mut self, tokens: &[u32], pos0: u32) -> Result<bool> {
+        let dm = self.hidden_width();
+        let Model { mtp, w, h, eng, hidden_log, .. } = self;
+        let (Some(b), Some((s, log))) = (mtp.as_mut(), hidden_log.as_ref()) else { return Ok(false) };
+        let (s, a, n) = (*s as usize, pos0 as usize, tokens.len());
+        if a < s || a + n > s + log.len() / dm {
+            return Ok(false);
+        }
+        b.fill(w, h, eng, tokens, &log[(a - s) * dm..(a - s + n) * dm], pos0)?;
+        Ok(true)
+    }
+
     /// The number of floats in a row of `hidden`: the streams (hc x d_model) with qwen4exp's MTP block, else d_model.
     pub fn hidden_width(&self) -> usize {
         if self.mtp_hc.is_some() { self.hc_width() } else { self.h.d_model as usize }
@@ -689,7 +703,7 @@ impl Model {
             let s = self.split();
             // not counted: here this machine runs layers 0..s and the worker the rest, so a count of this call would
             // reach its end while the block is still being read somewhere else. On a piped run the page's inside-a-
-            // block line stays at zero, which is honest, rather than showing a share that is not the whole pass.
+            // block line stays at zero rather than showing a share that is not the whole pass.
             self.std_layers(pos0, n, 0, s)?;
             // with logits, the hidden rows come back too (the MTP block drafts from them on this machine)
             // a prompt read under log_hidden (without logits): the worker's out-normed rows come back for the log, so
@@ -773,7 +787,7 @@ impl Model {
     /// std_layers, counting each finished layer into [status](crate::status) as it goes. A block of a prompt is one
     /// pass over these layers, so between one block's `TORC_BLOCK` tokens and the next there is nothing else that
     /// moves, and a page watching a long prefill would otherwise wait minutes to see anything change. The count is
-    /// this call's own share of the layers, which is the honest denominator on a two-machine split. It costs one
+    /// this call's own share of the layers, which is the right denominator on a two-machine split. It costs one
     /// relaxed store per layer of a pass that takes seconds, and no part of the pass reads it back.
     fn std_layers_counted(&mut self, pos0: u32, n: usize, l0: usize, l1: usize) -> Result<()> {
         crate::status::pass_begin(l1 - l0);

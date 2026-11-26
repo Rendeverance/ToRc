@@ -9,7 +9,7 @@
 //!
 //! Nothing here changes what a model produces. The counters describe a run in progress, and the text a server was
 //! asked and answered is kept only when `TORC_STATUS_TEXT` asks for it, as the address a request came from is kept
-//! only when `TORC_STATUS_CLIENT` does, because a request is someone's business.
+//! only when `TORC_STATUS_CLIENT` does: both belong to whoever sent the request.
 //!
 //! Inside one block of a prompt there is nothing further to count: a block is one pass over the model's layers, and a
 //! long one can take minutes. So the layers of that pass are counted too, and the page shows them as what they are -
@@ -20,8 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
-/// How many finished replies the page can look back at. It is a window onto the server, not a history: the history is
-/// what TORC_METRICS writes.
+/// How many finished replies the page can look back at. The full record is what TORC_METRICS writes.
 const WINDOW: usize = 40;
 
 /// The most characters of a request and of its reply that are kept. Long enough to tell one chat from another at a
@@ -116,7 +115,7 @@ pub fn read_rate(tokens_per_second: f64, full_pass: bool) {
 
 /// `done` of that prompt's tokens are read. Held as the engine reports it, in both places it is written: a prompt
 /// that is read through a pipeline worker can lose the worker mid-stretch and be read again from the last checkpoint
-/// (models/qwen/serve.rs), and then the honest number goes back. A page that divides it by the seconds the reading
+/// (models/qwen/serve.rs), and then the measured number goes back. A page that divides it by the seconds the reading
 /// has taken needs no promise that it only rises, and a number here that disagreed with the same moment's
 /// TORC_METRICS line would be a number nobody could check.
 pub fn read_done(done: usize) {
@@ -298,7 +297,7 @@ pub fn note_token() -> bool {
 
 /// The rate of the reply in progress over the last `WRITE_WINDOW_NS`, or `None` when the tokens written in it are too
 /// few to measure a span from. A caller that wants a number then falls back to the whole-reply average, which is the
-/// number the engine itself prints: both are honest, one is current and one is not, and the page says which it shows.
+/// number the engine itself prints: both are true, one is current and one is not, and the page says which it shows.
 pub fn writing_rate() -> Option<f64> {
     let now = nanos();
     let mut q = written().lock().unwrap();
@@ -350,9 +349,9 @@ pub struct Record {
     pub prompt_s: f64,
     pub first_token_s: f64,
     pub output_s: f64,
-    /// the tokens read after this prompt's first block ended, and the seconds the engine spent on them: the pair
-    /// the page divides to get the prompt's reading speed. `(0, 0.0)` when the prompt was a single block - then the
-    /// whole prompt is that block, and the page reads the pair above
+    /// the tokens read after this prompt's first block ended, and the seconds the engine spent on them: the reading
+    /// without the first block's start, for a monitor that wants it. `(0, 0.0)` when the prompt was a single block.
+    /// The page shows the whole prompt's speed, from the pair above
     pub reading: (usize, f64),
     /// why it ended: "stop", "length" or "tool_calls"
     pub finish: &'static str,
@@ -376,7 +375,7 @@ impl Record {
             "prompt": self.prompt,
             "cached": self.cached,
             // the prompt the request arrived with: the two counts above added, not a third measurement. The rate
-            // columns stay over `prompt`, because reading 1,543 of 78,110 tokens is what took the seconds.
+            // columns stay over `prompt`, because the tokens actually read are what took the seconds.
             "prompt_total": self.prompt + self.cached,
             "output": self.output,
             "prompt_seconds": self.prompt_s,
@@ -408,9 +407,8 @@ pub fn snippet(answer: &str, thinking: &str) -> (String, bool) {
     }
 }
 
-/// Whether a reply's text may be kept and shown. Read each time rather than once: it changes nothing about what the
-/// model does, only about what the server holds for a page, and a server should not be holding someone's text
-/// because of a decision made at startup that nobody can undo.
+/// Whether a reply's text may be kept and shown. It changes nothing about what the model does, only about what the
+/// server holds for its page.
 fn text_kept() -> bool {
     crate::switches::on("TORC_STATUS_TEXT")
 }
@@ -423,8 +421,9 @@ fn client_kept() -> bool {
     crate::switches::on("TORC_STATUS_CLIENT")
 }
 
-/// A request's text, with the control tokens a chat template leaves in it taken out, and cut to the window. The last
-/// user message is what a person typed; a system prompt is the same on every request and says nothing about this one.
+/// The end of a request's last user message, cut to the window. The last user message is what a person typed; a
+/// system prompt is the same on every request and says nothing about this one. Its end, because a pasted document
+/// comes first and the question after it.
 pub fn asked(msgs: &[Value]) -> String {
     let text = |m: &Value| match m.get("content") {
         Some(Value::String(s)) => s.clone(),
@@ -440,7 +439,17 @@ pub fn asked(msgs: &[Value]) -> String {
         .map(text)
         .next_back()
         .unwrap_or_default();
-    cut(&last)
+    tail(&last)
+}
+
+/// The last characters of a text, on a character boundary.
+pub fn tail(text: &str) -> String {
+    let text = text.trim_end();
+    let n = text.chars().count();
+    if n <= SNIPPET {
+        return text.to_string();
+    }
+    "…".to_string() + &text.chars().skip(n - SNIPPET).collect::<String>()
 }
 
 /// The first characters of a reply, on a character boundary.
@@ -492,7 +501,7 @@ pub fn finished() -> usize {
     FINISHED.load(Ordering::Relaxed)
 }
 
-/// `TORC_STATUS_NAMES`, read once: `192.168.1.196=am08, 192.168.1.184=arm2`. Entries are separated by commas or
+/// `TORC_STATUS_NAMES`, read once: `192.0.2.10=desk, 192.0.2.11=laptop`. Entries are separated by commas or
 /// semicolons and a pair by its first `=`, so spaces around the sign are allowed; `:` is accepted as the sign when an
 /// entry has no `=`, because a list of pairs reads either way and nobody should have to remember which one the code
 /// picked. An address with colons in it (IPv6) has to be written with `=` for that reason, which the example in
@@ -534,6 +543,69 @@ pub fn allowed(local: bool) -> bool {
     crate::switches::on("TORC_STATUS") && (local || crate::switches::on("TORC_STATUS_NET"))
 }
 
+/// Whether another machine must carry the API key to see the page (`TORC_STATUS_KEY`), as it must for the API. Off by
+/// default, so a page opened to the network with `TORC_STATUS_NET` needs no key. This machine never needs
+/// the key, as it never does for the API; and with no `TORC_API_KEY` set there is no key to carry, so the server
+/// refuses the page to every other machine rather than show it to all of them.
+pub fn keyed() -> bool {
+    crate::switches::on("TORC_STATUS_KEY")
+}
+
+/// The status page's own port (`TORC_STATUS_PORT`), when it has one: there it can be open to the network while the API
+/// stays on this machine. None: the page is on the API's port.
+pub fn port() -> Option<u16> {
+    crate::switches::get("TORC_STATUS_PORT").and_then(|v| v.trim().parse::<u16>().ok()).filter(|p| *p > 0)
+}
+
+/// How far the page can be seen, which is what the start-up warning has to say.
+#[derive(Clone, Copy)]
+pub struct Reach {
+    /// `TORC_STATUS`: the page is served at all
+    pub page: bool,
+    /// `TORC_STATUS_NET`: other machines may ask for it
+    pub net: bool,
+    /// the page can be reached from more than this machine: its own port with `TORC_STATUS_NET`, or the API's port
+    /// when `TORC_HOST` opens it
+    pub open: bool,
+    /// `TORC_STATUS_KEY`: other machines must carry the API key
+    pub keyed: bool,
+    /// `TORC_API_KEY` is set
+    pub key: bool,
+}
+
+impl Reach {
+    pub fn now(open: bool, key: bool) -> Reach {
+        let on = crate::switches::on;
+        Reach { page: on("TORC_STATUS"), net: on("TORC_STATUS_NET"), open, keyed: keyed(), key }
+    }
+}
+
+/// The line the server prints at start when its page shows what someone asked or where they asked it from, so whoever
+/// turned those on hears who else can read them. Nothing when neither is on, or when the page is off: the warning is
+/// about the two switches: the counters alone say nothing about anyone's requests.
+pub fn warning(text: bool, client: bool, r: Reach) -> Option<String> {
+    let what = match (text, client) {
+        (true, true) => "the end of each request and the start of its reply, and the address it came from,",
+        (true, false) => "the end of each request and the start of its reply",
+        (false, true) => "the address each request came from",
+        (false, false) => return None,
+    };
+    if !r.page {
+        return None;
+    }
+    let who = if !r.net || !r.open {
+        "anyone who can use this machine"
+    } else if r.keyed && r.key {
+        "this machine and any machine that has the API key"
+    } else if r.keyed {
+        "this machine only, since TORC_STATUS_KEY asks other machines for a key and TORC_API_KEY is not set"
+    } else {
+        "any machine that can reach this server, with no key asked for: set TORC_STATUS_KEY=1 and TORC_API_KEY to \
+         keep it to machines that have the key"
+    };
+    Some(format!("torc-server: warning: the status page shows {what} to {who}"))
+}
+
 /// The page itself, kept in the binary so that serving it needs no folder beside the executable: it reads two URLs,
 /// both below, and has no other files to load.
 pub const PAGE: &str = include_str!("status.html");
@@ -543,16 +615,15 @@ pub const PAGE: &str = include_str!("status.html");
 /// compiled in for the same reason the page is: a server binary copied onto another machine has no folder to carry.
 pub const MARK: &[u8] = include_bytes!("../../../ui/assets/mark-color.png");
 
-/// The name a model is called by on any screen a person reads: the file it was loaded from, with the folder it lives
-/// in and the extension it has both left off. This is the rule the desktop app uses when it says what it has loaded.
-/// Both separators are looked for because the path arrives from whichever machine this server happens to run on, and
-/// which one that machine uses is none of this function's business. A file with no extension answers its own name.
+/// The name a model is called by on any screen a person reads: the file it was loaded from, without its folder and
+/// without a .torc or .gguf extension, the rule the desktop app uses. Only those two come off: a model's name has dots
+/// of its own (Qwen3.6-35B), and the server usually hands over the name already without its extension.
 pub fn model_name(path: &str) -> String {
     let file = path.rsplit(['/', '\\']).next().unwrap_or("");
-    match file.rfind('.') {
-        // a name that starts with a dot has no extension to take off: that dot is part of the name
-        Some(i) if i > 0 => file[..i].to_string(),
-        _ => file.to_string(),
+    let lower = file.to_ascii_lowercase();
+    match [".torc", ".gguf"].iter().find(|x| lower.ends_with(*x) && file.len() > x.len()) {
+        Some(x) => file[..file.len() - x.len()].to_string(),
+        None => file.to_string(),
     }
 }
 
@@ -573,21 +644,24 @@ mod tests {
     /// a malformed entry all have to leave the row showing the address rather than a blank or a guess.
     #[test]
     fn an_address_is_named_only_when_someone_named_it() {
-        let m = parse_names("192.168.1.196=am08, 192.168.1.184:arm2;10.0.0.1 = laptop-one ;=nope =x;fe80::1=router");
-        assert_eq!(m.get("192.168.1.196").map(String::as_str), Some("am08"));
-        assert_eq!(m.get("192.168.1.184").map(String::as_str), Some("arm2"));
-        assert_eq!(m.get("10.0.0.1").map(String::as_str), Some("laptop-one"), "spaces around the sign are allowed");
+        let m = parse_names("192.0.2.10=desk, 192.0.2.11:laptop;192.0.2.12 = spare ;=nope =x;fe80::1=router");
+        assert_eq!(m.get("192.0.2.10").map(String::as_str), Some("desk"));
+        assert_eq!(m.get("192.0.2.11").map(String::as_str), Some("laptop"));
+        assert_eq!(m.get("192.0.2.12").map(String::as_str), Some("spare"), "spaces around the sign are allowed");
         assert_eq!(m.get("fe80::1").map(String::as_str), Some("router"), "an address with colons needs the = sign");
         assert_eq!(m.len(), 4, "an entry without one side of the pair is not a name");
         assert_eq!(client_name(""), None, "a record that keeps no address gets no name either");
     }
 
-    /// The name on the page is the one a person recognises, not the path a switch was given. Neither separator nor
-    /// either kind of name is allowed to produce a path or an empty heading.
+    /// The name on the page is the one a person recognises: the file's name, without folder or extension. Neither
+    /// separator nor either kind of name is allowed to produce a path or an empty heading.
     #[test]
     fn a_model_is_called_by_its_file_and_not_by_the_folder_it_lives_in() {
         assert_eq!(model_name(r"C:\llm\models\Qwen_Qwen3.6-35B-A3B-Q4_0.gguf"), "Qwen_Qwen3.6-35B-A3B-Q4_0");
-        assert_eq!(model_name("/home/rainer/llm-models/qwen36-35b.torc"), "qwen36-35b");
+        assert_eq!(model_name("/models/qwen36-35b.torc"), "qwen36-35b");
+        // what the server passes: the name already without its extension, dots and all
+        assert_eq!(model_name("Qwen3.6-35B-A3B-Q4_0"), "Qwen3.6-35B-A3B-Q4_0");
+        assert_eq!(model_name("GLM-4.7-Flash"), "GLM-4.7-Flash");
         assert_eq!(model_name("model"), "model");
         assert_eq!(model_name(".cache"), ".cache");
         assert_eq!(model_name("/srv/models/"), "");
@@ -846,6 +920,39 @@ mod tests {
     }
 
     #[test]
+    fn the_warning_comes_only_with_the_two_switches_and_says_who_can_read_them() {
+        // the reach is passed in rather than read from the switches, which other tests here change as they run
+        let r = |page, net, open, keyed, key| Reach { page, net, open, keyed, key };
+        let all = r(true, true, true, false, false);
+        assert!(warning(false, false, all).is_none(), "the counters alone warn nobody");
+        assert!(warning(true, false, r(false, true, true, false, false)).is_none(), "an off page shows nothing");
+        let w = warning(true, false, all).unwrap();
+        assert!(w.contains("reply") && !w.contains("address"), "{w}");
+        assert!(w.contains("any machine") && w.contains("TORC_STATUS_KEY=1"), "an open page says how to close it: {w}");
+        let w = warning(false, true, all).unwrap();
+        assert!(w.contains("address") && !w.contains("reply"), "{w}");
+        let w = warning(true, true, all).unwrap();
+        assert!(w.contains("reply") && w.contains("address"), "{w}");
+        // not opened to the network, either by the page's switch or by where the server listens
+        for local in [r(true, false, true, false, false), r(true, true, false, false, false)] {
+            let w = warning(true, false, local).unwrap();
+            assert!(w.contains("this machine") && !w.contains("any machine"), "{w}");
+        }
+        let w = warning(true, false, r(true, true, true, true, true)).unwrap();
+        assert!(w.contains("has the API key") && !w.contains("TORC_STATUS_KEY=1"), "{w}");
+        let w = warning(true, false, r(true, true, true, true, false)).unwrap();
+        assert!(w.contains("this machine only") && w.contains("TORC_API_KEY"), "{w}");
+    }
+
+    #[test]
+    fn the_page_never_puts_the_key_in_an_address() {
+        // the key comes from the browser's own login box, which sends it with every request the page makes. A key in
+        // an address stays in the browser's history
+        assert!(!PAGE_LF.contains("key="), "no key in any address the page reads");
+        assert!(PAGE_LF.contains("fetch(\"/torc/status\""), "the data from this server, as the page was opened");
+    }
+
+    #[test]
     fn the_page_reads_the_address_the_data_is_answered_at() {
         // the route is written in two places, and a rename that misses one shows as a blank page
         assert!(PAGE_LF.contains("/torc/status"), "the page must poll what the server answers");
@@ -870,15 +977,13 @@ mod tests {
             "client",
             "client_name",
             "model_name",
-            "reading_tokens",
-            "reading_seconds",
             "prompt_total",
         ] {
             assert!(PAGE_LF.contains(field), "the page reads {field}, which status_json answers");
         }
         // the header is the desktop app's: its mark served by this server (not a copy of it in another folder, and not
         // a fetch to somewhere else), and the product named before the model, so a page on a LAN is recognisably ours
-        assert!(PAGE_LF.contains("src=\"/torc/mark.png\""), "the app's mark is asked for from this server");
+        assert!(PAGE_LF.contains(".src = \"/torc/mark.png\""), "the app's mark is asked for from this server");
         // the app's own file and crop, at the size a heading across a room is read at rather than the 28 px a
         // window draws it at - the file is not resized, only the box it is drawn into
         assert!(PAGE_LF.contains(".brand .mark { width: 50px"), "the mark is sized for the page, not for the app");
@@ -932,7 +1037,7 @@ mod tests {
         );
         assert!(
             // the bar over a graph is drawn at the graph's width, from one shared value
-            PAGE_LF.contains(":root { --plot: 220px; }")
+            PAGE_LF.contains(":root { --plot: 100%; }")
                 && PAGE_LF.contains(".bar, #readspark, #writespark { width: var(--plot); max-width: 100%; }"),
             "the progress bar and the plot under it share one width"
         );
@@ -943,6 +1048,17 @@ mod tests {
         assert!(
             PAGE_LF.contains("stroke-opacity=\".6\"") && PAGE_LF.contains("stroke-dasharray=\"3 3\""),
             "the line at 0 is dashed, in the series colour, under any measured rate"
+        );
+        assert!(
+            // the graphs' clock runs only while the server is busy, so a finished reply stays drawn until the next one
+            PAGE_LF.contains("if (lastPoll !== null && (busy || wasBusy)) V += t - lastPoll;")
+                && PAGE_LF.contains("if (running || was) { push("),
+            "idle time is left out of the graphs"
+        );
+        assert!(
+            PAGE_LF.contains("const readRate = (r) => (r ? rate(r.prompt, r.prompt_seconds) : 0);")
+                && PAGE_LF.contains("live.prompt_rate_sustained"),
+            "a finished prompt's speed is the API's own; the live average is the engine's, since the first block"
         );
         assert!(
             PAGE_LF.contains("spark(\"write\", \"writespark\", \"var(--write)\");\npoll();"),
@@ -1015,7 +1131,7 @@ mod tests {
             "the past write rate comes from the record of replies, not from a counter"
         );
         assert!(PAGE_LF.contains("the last reply:"), "and the page names where that speed came from");
-        assert!(PAGE_LF.contains("last prompt read:"), "the same for the last prompt's read speed");
+        assert!(PAGE_LF.contains("last prompt: "), "the same for the last prompt's read speed");
         // a past speed stays words under the tile. The tile's own number means "this second", and a finished reply
         // has no this second, so it must not fill it in
         assert!(
@@ -1030,7 +1146,7 @@ mod tests {
 
     #[test]
     fn a_narrow_screen_keeps_naming_every_number() {
-        // measured at 390px: the header row alone wants 744px, so the columns get squeezed to about 51-72px, headers
+        // on a phone the header row alone is about twice the screen's width, so the columns get squeezed, headers
         // wrap over several lines and the last three leave the screen. Below that width the header goes away and a
         // reply becomes a block where each value carries the header's own words, so the two lists of names are one
         // list on purpose - a column renamed in the header but not in its label would print an unnumbered number on
@@ -1083,5 +1199,14 @@ mod tests {
         assert!(c.chars().count() <= SNIPPET + 1, "cut to the window");
         assert!(c.is_char_boundary(c.len()), "and on a boundary");
         assert!(c.ends_with("…"), "and says so");
+    }
+
+    #[test]
+    fn a_request_shows_its_end_where_the_question_is() {
+        let doc = format!("{}\n\nSum this up in two sentences.\n", "<p>markup</p> ".repeat(100));
+        let a = asked(&[json!({"role": "system", "content": "Be brief."}), json!({"role": "user", "content": doc})]);
+        assert!(a.ends_with("Sum this up in two sentences."), "the question, not the markup");
+        assert!(a.starts_with('…') && a.chars().count() == SNIPPET + 1, "cut to the window and says so");
+        assert_eq!(asked(&[json!({"role": "user", "content": "Hello"})]), "Hello", "short text whole");
     }
 }
