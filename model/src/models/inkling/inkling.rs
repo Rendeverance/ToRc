@@ -209,8 +209,8 @@ struct Pass {
 }
 
 /// The time spent in each phase of forward, summed over calls (TORC_PROF=1).
-pub static PROF: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
-pub const PHASES: [&str; 9] = [
+pub static PROF: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+pub const PHASES: [&str; 12] = [
     "embed, mixes and head",
     "inputs",
     "q, k, v products",
@@ -218,8 +218,11 @@ pub const PHASES: [&str; 9] = [
     "attention",
     "output",
     "router",
-    "experts",
+    "experts (blocks of tokens)",
     "expert sums",
+    "experts, one token: fetch and quantise",
+    "experts, one token: set-up",
+    "experts, one token: the sweep (gate, up, SITU, down)",
 ];
 
 pub struct Ink {
@@ -911,37 +914,75 @@ impl Ink {
                 data: unsafe { std::slice::from_raw_parts(pk.as_ptr().add(p.at as usize), p.bytes as usize) },
             };
             let xq = quant(&xn, 1, dm);
-            let mut gu = vec![0.0f32; 2 * k * ffp];
-            {
-                let mut jobs: Vec<(Mat, &mut [f32])> = Vec::with_capacity(2 * k);
-                for (i, part) in gu.chunks_mut(ffp).enumerate() {
-                    let (pk, pack) = packs[i / 2];
-                    jobs.push((piece(pk, if i % 2 == 0 { &pack.gate } else { &pack.up }), part));
-                }
-                crate::moe::apply_group(&mut jobs, xq.view());
+            lap.lap(9);
+            // the one-token sweep (moe.rs's moe_token shape, Inkling's own copy): stage 1 is every expert's gate and up
+            // rows in GU_RC-row chunks over the whole pool, and the thread that finishes an expert's last chunk makes
+            // its SITU activations, quantised; stage 2 is every expert's down rows in chunks over the whole pool. Each
+            // row is the same dot_rows call as before and each expert's activations the same steps, so the bits are
+            // the same as the whole-matrix calls
+            const GU_RC: usize = 64;
+            let gate_mats: Vec<[Mat; 3]> = packs
+                .iter()
+                .map(|&(pk, pack)| [piece(pk, &pack.gate), piece(pk, &pack.up), piece(pk, &pack.down)])
+                .collect();
+            let gu_per = 2 * ffp.div_ceil(GU_RC);
+            let n_gu = k * gu_per;
+            let threads = crate::pool::get().threads.max(1);
+            // down chunks: the most rows (a multiple of 16 dividing the width) that still gives every thread work
+            let mut drc = dm;
+            while drc > 16 && k * dm.div_ceil(drc) < 4 * threads {
+                drc = (drc / 2).div_ceil(16) * 16;
             }
+            let d_per = dm.div_ceil(drc);
+            let mut gu = vec![0.0f32; 2 * k * ffp];
+            let mut hq = Q8::new(k * ffp / QK);
             let mut y = vec![0.0f32; k * dm];
             {
+                let gp = SyncPtr::new(&mut gu);
+                let hp = crate::pool::Q8Ptr::new(hq.view_mut());
                 let yp = SyncPtr::new(&mut y);
-                let (gu, packs) = (&gu, &packs);
+                let left: Vec<std::sync::atomic::AtomicUsize> =
+                    (0..k).map(|_| std::sync::atomic::AtomicUsize::new(gu_per)).collect();
                 let (beta, lb) = (h.situ_beta, h.situ_lb);
-                each(k, &|i| {
-                    let (g, u) = (&gu[2 * i * ffp..(2 * i + 1) * ffp], &gu[(2 * i + 1) * ffp..(2 * i + 2) * ffp]);
-                    let mut row = vec![0.0f32; ffp];
-                    for j in 0..ff {
-                        let act = beta * (g[j] / beta).tanh() * (1.0 / (1.0 + (-g[j]).exp()));
-                        row[j] = act * if lb > 0.0 { lb * (u[j] / lb).tanh() } else { u[j] };
+                let xqv = xq.view();
+                let mats = &gate_mats;
+                let gate_up = |c: usize| {
+                    let (i, r) = (c / gu_per, c % gu_per);
+                    let half = ffp.div_ceil(GU_RC);
+                    let (which, r0) = (r / half, (r % half) * GU_RC);
+                    let m = &mats[i][which];
+                    let rows = GU_RC.min(m.rows - r0);
+                    let rb = m.data.len() / m.rows;
+                    // SAFETY: chunk c owns rows r0.. of expert i's gate (or up) output
+                    let ys = unsafe { gp.slice((2 * i + which) * ffp + r0, rows) };
+                    crate::moe::dot_rows(m.ty, &m.data[r0 * rb..(r0 + rows) * rb], rb, xqv, ys);
+                    if left[i].fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        // the expert's last chunk: every gate and up row is written
+                        // SAFETY: no other chunk of expert i is left, so its outputs are read only here
+                        let (g, u) = unsafe { (gp.slice(2 * i * ffp, ffp), gp.slice((2 * i + 1) * ffp, ffp)) };
+                        let mut row = vec![0.0f32; ffp];
+                        for j in 0..ff {
+                            let act = beta * (g[j] / beta).tanh() * (1.0 / (1.0 + (-g[j]).exp()));
+                            row[j] = act * if lb > 0.0 { lb * (u[j] / lb).tanh() } else { u[j] };
+                        }
+                        // SAFETY: expert i owns its ffp / QK blocks of hq
+                        kops::q8k_quantize(&row, unsafe { hp.slice(i * ffp / QK, ffp / QK) });
                     }
-                    let mut hq = Q8::new(ffp / QK);
-                    kops::q8k_quantize(&row, hq.view_mut());
-                    let (pk, pack) = packs[i];
-                    let d = piece(pk, &pack.down);
-                    // SAFETY: item i owns expert i's row of y
-                    crate::moe::dot_rows(d.ty, d.data, d.data.len() / d.rows, hq.view(), unsafe {
-                        yp.slice(i * dm, dm)
-                    });
-                });
+                };
+                let down = |c: usize| {
+                    let (i, r0) = (c / d_per, (c % d_per) * drc);
+                    let m = &mats[i][2];
+                    let rows = drc.min(m.rows - r0);
+                    let rb = m.data.len() / m.rows;
+                    // SAFETY: stage 1 is done, so expert i's activations are written and no longer change; chunk c
+                    // owns rows r0.. of expert i's output
+                    let (hj, ys) = unsafe { (hp.part(i * ffp / QK, ffp / QK), yp.slice(i * dm + r0, rows)) };
+                    crate::moe::dot_rows(m.ty, &m.data[r0 * rb..(r0 + rows) * rb], rb, hj, ys);
+                };
+                lap.lap(10);
+                crate::pool::par_stages(&[(n_gu, &gate_up), (k * d_per, &down)]);
             }
+            lap.lap(11);
             for (i, c) in choice[0].iter().enumerate() {
                 ys[0].push((c.0, c.1, y[i * dm..(i + 1) * dm].to_vec()));
             }
