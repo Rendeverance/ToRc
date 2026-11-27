@@ -441,10 +441,10 @@ pub const OP_RESET: u32 = 64;
 /// before it is read).
 pub const OP_SAVE: u32 = 128;
 pub const OP_LOAD: u32 = 256;
-/// The worker's mark slots: 0 for the server's last prompt, 1 for its system prompt, and 2 for a long prompt's
-/// checkpoint. The slot rides in bits 16.. of an OP_SAVE / OP_LOAD, which have no tokens, so KEPT and TOPK never ride
-/// on them.
-pub const MARK_SLOTS: usize = 3;
+/// The worker's mark slots: on the qwen engine 0 for the server's last prompt, 1 for its system prompt, and 2 for a
+/// long prompt's checkpoint; Inkling keeps the ends of its last four prompts in 0..4. The slot rides in bits 16.. of
+/// an OP_SAVE / OP_LOAD, which have no tokens, so KEPT and TOPK never ride on them.
+pub const MARK_SLOTS: usize = 4;
 
 pub fn slot_bits(slot: usize) -> u32 {
     (slot.min(MARK_SLOTS - 1) as u32) << 16
@@ -613,13 +613,51 @@ pub fn bind_host() -> String {
     crate::switches::get("TORC_PIPE_BIND").unwrap_or_else(|| "0.0.0.0".into())
 }
 
+/// What a pipeline worker runs (serve): the qwen engine's Model and Inkling's Ink each fill this in, so both serve the
+/// same protocol. Everything past the hello goes through these.
+pub trait Worker {
+    /// The context it was loaded with (a request's row limit).
+    fn n_ctx(&self) -> usize;
+    /// The f32s a request of n rows for layers l0.. carries after its tokens (the qwen engine: n streams).
+    fn res_len(&self, l0: usize, n: usize) -> usize;
+    /// A new run: every layer's state back to zero.
+    fn clear_states(&mut self);
+    /// A new run: no marks kept.
+    fn clear_marks(&mut self);
+    /// A saved-state request (KEYOP): Ok(false) when not done.
+    fn worker_mark(&mut self, op: u32, key: u64, l0: usize, npos: usize) -> Result<bool>;
+    /// The head's rows r0..r1 over xq (HEADOP, TORC_HEAD_SPLIT).
+    fn head_rows(&self, xq: kernels::Q8s, r0: usize, r1: usize) -> Result<Vec<f32>>;
+    /// The worker's half of a pass: layers l0.. on `res`, then what `want` asks for (or a control request when there
+    /// are no tokens). `early` sends a frame ahead of the reply.
+    fn hc_back(
+        &mut self,
+        tokens: &[u32],
+        pos0: u32,
+        l0: usize,
+        res: Vec<f32>,
+        want: u32,
+        early: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Result<Vec<f32>>;
+    /// TORC_PROF: the per-part times since the last reset, for a model that keeps them.
+    fn prof(&self) -> Option<crate::forward::Prof> {
+        None
+    }
+    fn prof_reset(&mut self) {}
+    /// The expert cache's counters, for a model that streams its experts.
+    fn cache_stats(&self) -> Option<crate::ecache::Stats> {
+        None
+    }
+    /// Writes the experts this run used into the machine's usage file.
+    fn usage_flush(&self) {}
+}
+
 /// The worker: serves requests in turn until the main machine hangs up, then takes the next connection (a new run,
 /// whose states start again from zero).
-pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
+pub fn serve<M: Worker>(m: &mut M, port: u16) -> Result<()> {
     let host = bind_host();
     let l = TcpListener::bind((host.as_str(), port)).map_err(io)?;
     eprintln!("two boxes (pipeline): serving layers on {host}:{port} (no authentication: a trusted link only)");
-    let d = m.stream_width();
     for conn in l.incoming() {
         let Ok(mut s) = conn else { continue };
         let _ = s.set_nodelay(true);
@@ -640,13 +678,13 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
         let mut nrows = 0usize;
         if prof {
             // this connection's own profile (the decode one resets again at its first pass)
-            m.prof = Default::default();
+            m.prof_reset();
             for (_, _, table) in crate::phase_tables() {
                 for a in table {
                     a.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            c0 = m.w.cache.as_ref().map(|c| c.stats());
+            c0 = m.cache_stats();
         }
         // the worker serves one connection at a time: one that says nothing in its first 30 s is dropped, so it can't
         // hold the worker while the real main machine waits. After that a quiet link is a main machine between chats
@@ -765,9 +803,10 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
                 break;
             }
             let mut tb = vec![0u8; n * 4];
-            let mut res = vec![0.0f32; n * d];
+            let len = m.res_len(l0, n);
+            let mut res = vec![0.0f32; len];
             // SAFETY: f32 has no invalid bit patterns
-            let rb = unsafe { std::slice::from_raw_parts_mut(res.as_mut_ptr() as *mut u8, n * d * 4) };
+            let rb = unsafe { std::slice::from_raw_parts_mut(res.as_mut_ptr() as *mut u8, len * 4) };
             if let Err(e) = s.read_exact(&mut tb).and_then(|_| s.read_exact(rb)) {
                 eprintln!("two boxes (pipeline): {e}");
                 break;
@@ -776,7 +815,7 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
             if prof && n == 0 && want & OP_RESET != 0 {
                 armed = true;
                 // a new prompt starts its profile from zero (not from the last reply's decode passes)
-                m.prof = Default::default();
+                m.prof_reset();
                 for (_, _, table) in crate::phase_tables() {
                     for a in table {
                         a.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -789,16 +828,22 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
                 armed = false;
                 // the prompt just served: where this machine's share of it went (a server prints one per request)
                 if nrows > 0 {
-                    let (p, k) = (m.prof, 1e3 / nrows as f64);
-                    eprintln!(
-                        "worker, {nrows} prompt rows: {tprompt:.2} s computing, {} page faults; ms a row: deltanet {:.3} attention {:.3} moe {:.3} output {:.3} norms {:.3}",
-                        page_faults() - pf0,
-                        p.rec * k,
-                        p.attn * k,
-                        p.moe * k,
-                        p.out * k,
-                        p.norm * k
-                    );
+                    let k = 1e3 / nrows as f64;
+                    match m.prof() {
+                        Some(p) => eprintln!(
+                            "worker, {nrows} prompt rows: {tprompt:.2} s computing, {} page faults; ms a row: deltanet {:.3} attention {:.3} moe {:.3} output {:.3} norms {:.3}",
+                            page_faults() - pf0,
+                            p.rec * k,
+                            p.attn * k,
+                            p.moe * k,
+                            p.out * k,
+                            p.norm * k
+                        ),
+                        None => eprintln!(
+                            "worker, {nrows} prompt rows: {tprompt:.2} s computing, {} page faults",
+                            page_faults() - pf0
+                        ),
+                    }
                     for (name, phases, table) in crate::phase_tables() {
                         let parts: Vec<String> = phases
                             .iter()
@@ -818,13 +863,13 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
                     (nrows, tprompt) = (0, 0.0);
                 }
                 (ndec, tdec) = (0, 0.0);
-                m.prof = Default::default();
+                m.prof_reset();
                 for (_, _, table) in crate::phase_tables() {
                     for a in table {
                         a.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                c0 = m.w.cache.as_ref().map(|c| c.stats());
+                c0 = m.cache_stats();
             }
             let t = std::time::Instant::now();
             let r = if n > 0 && want & WANT_STATES != 0 {
@@ -899,21 +944,22 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
         }
         eprintln!("two boxes (pipeline): main box gone after {nreq} requests, {comp:.2} s computing");
         // the experts this run used go into the machine's usage file (a worker is stopped rather than exiting)
-        if let Some(c) = &m.w.cache {
-            c.usage_flush();
-        }
+        m.usage_flush();
         if prof && ndec == 0 && nrows > 0 {
             // a prompt-only run (torc-run nologits, prefill tests): where this machine's share of the prompt went
-            let (p, k) = (m.prof, 1e3 / nrows as f64);
-            eprintln!(
-                "worker, {nrows} prompt rows: {:.2} s computing; ms a row: deltanet {:.3} attention {:.3} moe {:.3} output {:.3} norms {:.3}",
-                comp,
-                p.rec * k,
-                p.attn * k,
-                p.moe * k,
-                p.out * k,
-                p.norm * k
-            );
+            let k = 1e3 / nrows as f64;
+            match m.prof() {
+                Some(p) => eprintln!(
+                    "worker, {nrows} prompt rows: {:.2} s computing; ms a row: deltanet {:.3} attention {:.3} moe {:.3} output {:.3} norms {:.3}",
+                    comp,
+                    p.rec * k,
+                    p.attn * k,
+                    p.moe * k,
+                    p.out * k,
+                    p.norm * k
+                ),
+                None => eprintln!("worker, {nrows} prompt rows: {comp:.2} s computing"),
+            }
             for (name, phases, table) in crate::phase_tables() {
                 let ns: Vec<u64> = table.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
                 if ns.iter().any(|&v| v > 0) {
@@ -926,8 +972,7 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
                     eprintln!("worker {name} ms/row: {}", parts.join(", "));
                 }
             }
-            if let (Some(c), Some(a)) = (&m.w.cache, c0) {
-                let s = c.stats();
+            if let (Some(s), Some(a)) = (m.cache_stats(), c0) {
                 let (rq, h) = (s.asked - a.asked, s.resident - a.resident);
                 eprintln!(
                     "worker expert cache over the prompt: {rq} requests, {:.1}% hits, {:.0} MB read, waited {:.2} s",
@@ -938,16 +983,19 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
             }
         }
         if prof && ndec > 0 {
-            let (p, k) = (m.prof, 1e3 / ndec as f64);
-            eprintln!(
-                "worker, {ndec} decode passes: {:.2} ms a pass; deltanet {:.2} attention {:.2} moe {:.2} output {:.2} norms {:.2}",
-                tdec * k,
-                p.rec * k,
-                p.attn * k,
-                p.moe * k,
-                p.out * k,
-                p.norm * k
-            );
+            let k = 1e3 / ndec as f64;
+            match m.prof() {
+                Some(p) => eprintln!(
+                    "worker, {ndec} decode passes: {:.2} ms a pass; deltanet {:.2} attention {:.2} moe {:.2} output {:.2} norms {:.2}",
+                    tdec * k,
+                    p.rec * k,
+                    p.attn * k,
+                    p.moe * k,
+                    p.out * k,
+                    p.norm * k
+                ),
+                None => eprintln!("worker, {ndec} decode passes: {:.2} ms a pass", tdec * k),
+            }
             for (name, phases, table) in crate::phase_tables() {
                 let ns: Vec<u64> = table.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
                 if ns.iter().any(|&v| v > 0) {
@@ -960,8 +1008,7 @@ pub fn serve(m: &mut crate::forward::Model, port: u16) -> Result<()> {
                     eprintln!("worker {name} ms/pass: {}", parts.join(", "));
                 }
             }
-            if let (Some(c), Some(a)) = (&m.w.cache, c0) {
-                let s = c.stats();
+            if let (Some(s), Some(a)) = (m.cache_stats(), c0) {
                 let (rq, h) = (s.asked - a.asked, s.resident - a.resident);
                 eprintln!(
                     "worker expert cache over them: {rq} requests, {:.1}% hits, {:.0} MB read, waited {:.2} s",

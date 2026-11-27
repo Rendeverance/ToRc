@@ -411,7 +411,16 @@ fn att1_split() -> usize {
 /// Three heads' value sums over columns c0.. of a key head (the deep one-token path): out[x][e] += ws[x][i] x value
 /// row (lo + i)[c0 + e], i in order, 16 columns at a time held in registers, as value_sums3 does for all columns.
 #[allow(clippy::too_many_arguments)]
-fn value_cols3(out: [&mut [f32]; 3], ws: [&[f32]; 3], lo: usize, cv: &[f32], g: usize, cap: usize, hd: usize, c0: usize) {
+fn value_cols3(
+    out: [&mut [f32]; 3],
+    ws: [&[f32]; 3],
+    lo: usize,
+    cv: &[f32],
+    g: usize,
+    cap: usize,
+    hd: usize,
+    c0: usize,
+) {
     const VS: usize = 16;
     let len = ws[0].len();
     let (w0, w1, w2) = (&ws[0][..len], &ws[1][..len], &ws[2][..len]);
@@ -819,6 +828,35 @@ impl Ink {
         (l, l, None)
     }
 
+    /// The length of Carry::to_f32 for n tokens stopped before pass `from`: the header, then every vector it holds,
+    /// counted by walking the passes as forward_range does (the pipeline worker reads exactly this many).
+    pub fn carry_len(&self, from: usize, n: usize) -> usize {
+        // a control request (no tokens) carries nothing, not even the header
+        if n == 0 {
+            return 0;
+        }
+        let h = &self.h;
+        let (mut blocks, mut prelude, mut bank) = (0usize, None::<usize>, None::<usize>);
+        for ci in 0..from.min(self.n_calls()) {
+            let (_, l, pass) = self.call(ci);
+            if let Some(p) = pass
+                && l == h.loop_start
+            {
+                if p == 0 {
+                    prelude = Some(blocks);
+                } else if let Some(nb0) = prelude {
+                    bank = Some(blocks.saturating_sub(nb0 + 1));
+                    blocks = nb0;
+                }
+            }
+            if l.is_multiple_of(h.block) {
+                blocks += 1;
+            }
+        }
+        let vectors = 1 + blocks + prelude.map_or(0, |pb| 1 + pb) + bank.map_or(0, |bb| bb + 1);
+        5 + vectors * n * h.d_model
+    }
+
     /// forward over layer passes from..to (of n_calls): from 0 it starts with the embedding, otherwise from `carry`
     /// (what a run up to `from` returned); at n_calls it ends with the head into `out`. Returns the carry when it stops
     /// short of the end. Two machines split a token's passes this way (pipe.rs) with the same steps in the same order
@@ -1035,12 +1073,20 @@ impl Ink {
                 if npu_k {
                     apply_group_multi(&mut [(Mat::of(&pk), &mut ktap[..])], qs[ki].view(), n);
                 } else {
-                    apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..]), (Mat::of(&pk), &mut ktap[..])], qs[ki].view(), n);
+                    apply_group_multi(
+                        &mut [(Mat::of(&tk), &mut kk[..]), (Mat::of(&pk), &mut ktap[..])],
+                        qs[ki].view(),
+                        n,
+                    );
                 }
                 if npu_v {
                     apply_group_multi(&mut [(Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
                 } else {
-                    apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..]), (Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
+                    apply_group_multi(
+                        &mut [(Mat::of(&tv), &mut vv[..]), (Mat::of(&pv), &mut vtap[..])],
+                        qs[vi].view(),
+                        n,
+                    );
                 }
             }
         }
@@ -1057,7 +1103,12 @@ impl Ink {
             let (kp, vp) = (SyncPtr::new(&mut kk), SyncPtr::new(&mut vv));
             let (ck, cv) = (SyncPtr::new(&mut st.k), SyncPtr::new(&mut st.v));
             let gk = st.gkv.as_mut().map(|g| {
-                (SyncPtr::new(&mut g.k16), SyncPtr::new(&mut g.v16), SyncPtr::new(&mut g.k_scale), SyncPtr::new(&mut g.v_scale))
+                (
+                    SyncPtr::new(&mut g.k16),
+                    SyncPtr::new(&mut g.v16),
+                    SyncPtr::new(&mut g.k_scale),
+                    SyncPtr::new(&mut g.v_scale),
+                )
             });
             each(n, &|t| {
                 let pos = pos0 as usize + t;
@@ -1211,190 +1262,190 @@ impl Ink {
                     crate::pool::par_stages(&[(nkv * runs, &scores), (nh, &softmax), (nkv * SLICES, &values)]);
                     let _ = &sums;
                 } else {
-                each(nkv, &|g| {
-                    let h0 = g * per;
-                    let mut bias = vec![0.0f32; per * ext];
-                    let mut sc = vec![0.0f32; per * span];
-                    for j in 0..per {
-                        let rh = &rel[(h0 + j) * nr..(h0 + j + 1) * nr];
-                        for (d, b) in bias[j * ext..(j + 1) * ext].iter_mut().enumerate() {
-                            *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                    each(nkv, &|g| {
+                        let h0 = g * per;
+                        let mut bias = vec![0.0f32; per * ext];
+                        let mut sc = vec![0.0f32; per * span];
+                        for j in 0..per {
+                            let rh = &rel[(h0 + j) * nr..(h0 + j + 1) * nr];
+                            for (d, b) in bias[j * ext..(j + 1) * ext].iter_mut().enumerate() {
+                                *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                            }
                         }
-                    }
-                    for (i, p) in (lo..=pos).enumerate() {
-                        let d = pos - p;
-                        let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-                        if per == 3 && att3() & 4 != 0 {
-                            let qr = |x: usize| &q[(h0 + x) * hd..(h0 + x + 1) * hd];
-                            let ds = dot3([qr(0), qr(1), qr(2)], k);
-                            for (j, dv) in ds.iter().enumerate() {
+                        for (i, p) in (lo..=pos).enumerate() {
+                            let d = pos - p;
+                            let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+                            if per == 3 && att3() & 4 != 0 {
+                                let qr = |x: usize| &q[(h0 + x) * hd..(h0 + x + 1) * hd];
+                                let ds = dot3([qr(0), qr(1), qr(2)], k);
+                                for (j, dv) in ds.iter().enumerate() {
+                                    let hh = h0 + j;
+                                    let b = if d < ext { bias[j * ext + d] } else { 0.0 };
+                                    sc[j * span + i] = dv * scale + (b - sink[hh]);
+                                }
+                                continue;
+                            }
+                            for j in 0..per {
                                 let hh = h0 + j;
                                 let b = if d < ext { bias[j * ext + d] } else { 0.0 };
-                                sc[j * span + i] = dv * scale + (b - sink[hh]);
-                            }
-                            continue;
-                        }
-                        for j in 0..per {
-                            let hh = h0 + j;
-                            let b = if d < ext { bias[j * ext + d] } else { 0.0 };
-                            sc[j * span + i] = dot(&q[hh * hd..(hh + 1) * hd], k) * scale + (b - sink[hh]);
-                        }
-                    }
-                    let mut sums = vec![0.0f32; per];
-                    for j in 0..per {
-                        let row = &mut sc[j * span..(j + 1) * span];
-                        let mut mx = 0.0f32;
-                        for &v in row.iter() {
-                            mx = mx.max(v);
-                        }
-                        let mut sum = (-mx).exp();
-                        for v in row.iter_mut() {
-                            *v = (*v - mx).exp();
-                            sum += *v;
-                        }
-                        sums[j] = sum;
-                    }
-                    // SAFETY: item g owns heads h0..h0 + per of the token's row of att
-                    let og = unsafe { ap.slice(h0 * hd, per * hd) };
-                    // each value row read once for the item's `per` heads (value_sums, a head at a time with its
-                    // output in registers, read each row `per` times: box 1 server writing at 8k 13.8 -> 12.7, 27 Nov)
-                    for (i, p) in (lo..=pos).enumerate() {
-                        let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-                        for j in 0..per {
-                            let wgt = sc[j * span + i] / sums[j];
-                            for (a, b) in og[j * hd..(j + 1) * hd].iter_mut().zip(v) {
-                                *a = wgt.mul_add(*b, *a);
+                                sc[j * span + i] = dot(&q[hh * hd..(hh + 1) * hd], k) * scale + (b - sink[hh]);
                             }
                         }
-                    }
-                    for (a, gt) in og.iter_mut().zip(&gate[h0 * hd..(h0 + per) * hd]) {
-                        *a *= 1.0 / (1.0 + (-gt).exp());
-                    }
-                });
+                        let mut sums = vec![0.0f32; per];
+                        for j in 0..per {
+                            let row = &mut sc[j * span..(j + 1) * span];
+                            let mut mx = 0.0f32;
+                            for &v in row.iter() {
+                                mx = mx.max(v);
+                            }
+                            let mut sum = (-mx).exp();
+                            for v in row.iter_mut() {
+                                *v = (*v - mx).exp();
+                                sum += *v;
+                            }
+                            sums[j] = sum;
+                        }
+                        // SAFETY: item g owns heads h0..h0 + per of the token's row of att
+                        let og = unsafe { ap.slice(h0 * hd, per * hd) };
+                        // each value row read once for the item's `per` heads (value_sums, a head at a time with its
+                        // output in registers, read each row `per` times: box 1 server writing at 8k 13.8 -> 12.7, 27 Nov)
+                        for (i, p) in (lo..=pos).enumerate() {
+                            let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+                            for j in 0..per {
+                                let wgt = sc[j * span + i] / sums[j];
+                                for (a, b) in og[j * hd..(j + 1) * hd].iter_mut().zip(v) {
+                                    *a = wgt.mul_add(*b, *a);
+                                }
+                            }
+                        }
+                        for (a, gt) in og.iter_mut().zip(&gate[h0 * hd..(h0 + per) * hd]) {
+                            *a *= 1.0 / (1.0 + (-gt).exp());
+                        }
+                    });
                 }
             } else {
                 let _ = tiles;
                 // the tile items for the block's tokens a..b (a a multiple of ATT_QT), writing through op (token a's row
                 // of att first), with the output's gate when `gated` (the GPU's tokens come back without it)
                 let run_tiles = |a: usize, b: usize, op: SyncPtr<f32>, gated: bool| {
-                each((b - a).div_ceil(ATT_QT) * groups, &|it| {
-                    let (tile, h0) = (it / groups, (it % groups) * hpi);
-                    let (t0, t1) = (a + tile * ATT_QT, (a + (tile + 1) * ATT_QT).min(b));
-                    let g = h0 / per;
-                    // the item's queries: (token, head) for t0..t1 and h0..h0 + hpi, query j = (t - t0) * hpi + (hh - h0)
-                    let nq = (t1 - t0) * hpi;
-                    let tok = |j: usize| t0 + j / hpi;
-                    let head = |j: usize| h0 + j % hpi;
-                    // each query's first key, and the item's span of keys
-                    let lo_of = |t: usize| {
-                        let pos = pos0 as usize + t;
-                        if swa { (pos + 1).saturating_sub(h.window) } else { 0 }
-                    };
-                    let (span_lo, span_hi) = (lo_of(t0), pos0 as usize + t1 - 1);
-                    let width = span_hi + 1 - span_lo;
-                    // the scores, a row of width a query (query j's own keys lo_of(t)..=pos at their offsets)
-                    let mut sc = vec![0.0f32; nq * width];
-                    let mut bias = vec![0.0f32; nq * h.extent];
-                    for j in 0..nq {
-                        let (t, hh) = (tok(j), head(j));
-                        let rh = &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr];
-                        for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
-                            *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                    each((b - a).div_ceil(ATT_QT) * groups, &|it| {
+                        let (tile, h0) = (it / groups, (it % groups) * hpi);
+                        let (t0, t1) = (a + tile * ATT_QT, (a + (tile + 1) * ATT_QT).min(b));
+                        let g = h0 / per;
+                        // the item's queries: (token, head) for t0..t1 and h0..h0 + hpi, query j = (t - t0) * hpi + (hh - h0)
+                        let nq = (t1 - t0) * hpi;
+                        let tok = |j: usize| t0 + j / hpi;
+                        let head = |j: usize| h0 + j % hpi;
+                        // each query's first key, and the item's span of keys
+                        let lo_of = |t: usize| {
+                            let pos = pos0 as usize + t;
+                            if swa { (pos + 1).saturating_sub(h.window) } else { 0 }
+                        };
+                        let (span_lo, span_hi) = (lo_of(t0), pos0 as usize + t1 - 1);
+                        let width = span_hi + 1 - span_lo;
+                        // the scores, a row of width a query (query j's own keys lo_of(t)..=pos at their offsets)
+                        let mut sc = vec![0.0f32; nq * width];
+                        let mut bias = vec![0.0f32; nq * h.extent];
+                        for j in 0..nq {
+                            let (t, hh) = (tok(j), head(j));
+                            let rh = &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr];
+                            for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
+                                *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                            }
                         }
-                    }
-                    for p in span_lo..=span_hi {
-                        let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-                        if hpi == 3 && att3() & 1 != 0 {
-                            // a token's three heads share the key row (dot3: each the same steps as dot)
-                            for t in t0..t1 {
+                        for p in span_lo..=span_hi {
+                            let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+                            if hpi == 3 && att3() & 1 != 0 {
+                                // a token's three heads share the key row (dot3: each the same steps as dot)
+                                for t in t0..t1 {
+                                    let pos = pos0 as usize + t;
+                                    if p < lo_of(t) || p > pos {
+                                        continue;
+                                    }
+                                    let d = pos - p;
+                                    let qr = |x: usize| &q[t * qd + (h0 + x) * hd..t * qd + (h0 + x + 1) * hd];
+                                    let ds = dot3([qr(0), qr(1), qr(2)], k);
+                                    for (x, dv) in ds.iter().enumerate() {
+                                        let (j, hh) = ((t - t0) * 3 + x, h0 + x);
+                                        let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
+                                        sc[j * width + (p - span_lo)] = dv * scale + (b - sink[t * nh + hh]);
+                                    }
+                                }
+                                continue;
+                            }
+                            for j in 0..nq {
+                                let (t, hh) = (tok(j), head(j));
                                 let pos = pos0 as usize + t;
                                 if p < lo_of(t) || p > pos {
                                     continue;
                                 }
                                 let d = pos - p;
-                                let qr = |x: usize| &q[t * qd + (h0 + x) * hd..t * qd + (h0 + x + 1) * hd];
-                                let ds = dot3([qr(0), qr(1), qr(2)], k);
-                                for (x, dv) in ds.iter().enumerate() {
-                                    let (j, hh) = ((t - t0) * 3 + x, h0 + x);
-                                    let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
-                                    sc[j * width + (p - span_lo)] = dv * scale + (b - sink[t * nh + hh]);
-                                }
+                                let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
+                                let qh = &q[t * qd + hh * hd..t * qd + (hh + 1) * hd];
+                                sc[j * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
                             }
-                            continue;
                         }
+                        // each query's softmax over its own keys, in position order, with the sink's zero beside them
+                        let mut sums = vec![0.0f32; nq];
                         for j in 0..nq {
-                            let (t, hh) = (tok(j), head(j));
-                            let pos = pos0 as usize + t;
-                            if p < lo_of(t) || p > pos {
-                                continue;
+                            let t = tok(j);
+                            let (lo, pos) = (lo_of(t), pos0 as usize + t);
+                            let row = &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
+                            let mut mx = 0.0f32;
+                            for &v in row.iter() {
+                                mx = mx.max(v);
                             }
-                            let d = pos - p;
-                            let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
-                            let qh = &q[t * qd + hh * hd..t * qd + (hh + 1) * hd];
-                            sc[j * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
+                            let mut sum = (-mx).exp();
+                            for v in row.iter_mut() {
+                                *v = (*v - mx).exp();
+                                sum += *v;
+                            }
+                            sums[j] = sum;
                         }
-                    }
-                    // each query's softmax over its own keys, in position order, with the sink's zero beside them
-                    let mut sums = vec![0.0f32; nq];
-                    for j in 0..nq {
-                        let t = tok(j);
-                        let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                        let row = &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
-                        let mut mx = 0.0f32;
-                        for &v in row.iter() {
-                            mx = mx.max(v);
-                        }
-                        let mut sum = (-mx).exp();
-                        for v in row.iter_mut() {
-                            *v = (*v - mx).exp();
-                            sum += *v;
-                        }
-                        sums[j] = sum;
-                    }
-                    // the values: each query's weights (score / sum, as before), then its output VS numbers at a time
-                    // held in registers over all its positions, in position order (the same sums), stored once (the
-                    // output row was loaded and stored again for every position: box 1, 27 Nov, a third of a prompt
-                    // block's attention)
-                    for j in 0..nq {
-                        let t = tok(j);
-                        let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                        let s = sums[j];
-                        for w in &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)] {
-                            *w /= s;
-                        }
-                    }
-                    if hpi == 3 && hd.is_multiple_of(16) && att3() & 2 != 0 {
-                        // a token's three heads have the same keys, so each value row is read once for them
-                        for t in t0..t1 {
-                            let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                            let j = (t - t0) * 3;
-                            let ws = |x: usize| {
-                                &sc[(j + x) * width + (lo - span_lo)..(j + x) * width + (pos + 1 - span_lo)]
-                            };
-                            // SAFETY: item it owns heads h0..h0 + 3 of token t's row of att
-                            let o3 = unsafe { op.slice((t - a) * qd + h0 * hd, 3 * hd) };
-                            value_sums3(o3, [ws(0), ws(1), ws(2)], lo, cv, g, cap, hd);
-                        }
-                    } else {
+                        // the values: each query's weights (score / sum, as before), then its output VS numbers at a time
+                        // held in registers over all its positions, in position order (the same sums), stored once (the
+                        // output row was loaded and stored again for every position: box 1, 27 Nov, a third of a prompt
+                        // block's attention)
                         for j in 0..nq {
-                            let (t, hh) = (tok(j), head(j));
+                            let t = tok(j);
                             let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                            // SAFETY: item it owns heads h0..h0 + hpi of tokens t0..t1's rows of att
+                            let s = sums[j];
+                            for w in &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)] {
+                                *w /= s;
+                            }
+                        }
+                        if hpi == 3 && hd.is_multiple_of(16) && att3() & 2 != 0 {
+                            // a token's three heads have the same keys, so each value row is read once for them
+                            for t in t0..t1 {
+                                let (lo, pos) = (lo_of(t), pos0 as usize + t);
+                                let j = (t - t0) * 3;
+                                let ws = |x: usize| {
+                                    &sc[(j + x) * width + (lo - span_lo)..(j + x) * width + (pos + 1 - span_lo)]
+                                };
+                                // SAFETY: item it owns heads h0..h0 + 3 of token t's row of att
+                                let o3 = unsafe { op.slice((t - a) * qd + h0 * hd, 3 * hd) };
+                                value_sums3(o3, [ws(0), ws(1), ws(2)], lo, cv, g, cap, hd);
+                            }
+                        } else {
+                            for j in 0..nq {
+                                let (t, hh) = (tok(j), head(j));
+                                let (lo, pos) = (lo_of(t), pos0 as usize + t);
+                                // SAFETY: item it owns heads h0..h0 + hpi of tokens t0..t1's rows of att
+                                let oh = unsafe { op.slice((t - a) * qd + hh * hd, hd) };
+                                let ws = &sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
+                                value_sums(oh, ws, lo, cv, g, cap, hd);
+                            }
+                        }
+                        // the output's gate
+                        for j in (0..nq).filter(|_| gated) {
+                            let (t, hh) = (tok(j), head(j));
+                            // SAFETY: as above
                             let oh = unsafe { op.slice((t - a) * qd + hh * hd, hd) };
-                            let ws = &sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
-                            value_sums(oh, ws, lo, cv, g, cap, hd);
+                            for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
+                                *a *= 1.0 / (1.0 + (-g).exp());
+                            }
                         }
-                    }
-                    // the output's gate
-                    for j in (0..nq).filter(|_| gated) {
-                        let (t, hh) = (tok(j), head(j));
-                        // SAFETY: as above
-                        let oh = unsafe { op.slice((t - a) * qd + hh * hd, hd) };
-                        for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
-                            *a *= 1.0 / (1.0 + (-g).exp());
-                        }
-                    }
-                });
+                    });
                 };
                 // TORC_GPU_ATTN=1: the GPU takes the block's first tokens (its scores with the same bias by distance
                 // and sink, from the 16-bit copy; not bit-identical) while the tile items do the rest here
@@ -1508,7 +1559,7 @@ impl Ink {
                 unsafe { cp.slice(t, 1)[0] = lg.iter().map(|&(e, _, p)| (e, p / sum * h.w_scale)).collect() };
             });
         }
-        crate::npu::record(lw as u32, &choice);
+        crate::npu::record(lw, &choice);
         lap.lap(6);
         let mut users: Vec<Vec<usize>> = vec![Vec::new(); h.n_expert];
         for (t, c) in choice.iter().enumerate() {
@@ -1575,7 +1626,7 @@ impl Ink {
         // the layer's hot experts with enough tokens go to the NPU (its graph, SITU in f32), started before the CPU
         // takes the rest and collected after (TORC_NPU_HOT_MIN tokens at least; rows padded to 32s, at least 64)
         let hot = if n > 1 && SITU_NPU.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::npu::hot(lw as u32, n)
+            crate::npu::hot(lw, n)
         } else {
             Vec::new()
         };
@@ -1735,8 +1786,10 @@ impl Ink {
 fn att3() -> u32 {
     static A: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *A.get_or_init(|| {
-        crate::switches::get("TORC_ATT3")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(if cfg!(target_arch = "aarch64") { 7 } else { 2 })
+        crate::switches::get("TORC_ATT3").and_then(|v| v.parse().ok()).unwrap_or(if cfg!(target_arch = "aarch64") {
+            7
+        } else {
+            2
+        })
     })
 }

@@ -16,8 +16,9 @@ use crate::api::Chat;
 use crate::serve::{Call, Reply, Serve};
 use serde_json::Value;
 
-/// The marks kept: the ends of the last prompts read.
+/// The marks kept: the ends of the last prompts read (on two machines, each in a worker mark slot of its own).
 const MARKS: usize = 4;
+const _: () = assert!(MARKS <= crate::pipe::MARK_SLOTS);
 
 struct Engine {
     m: Ink,
@@ -26,9 +27,10 @@ struct Engine {
     ctx: usize,
     /// the tokens the model has read, in order (its state is the one after them)
     seen: Vec<u32>,
-    /// positions the convolution state is kept for, oldest first: (tokens read, state, the pipeline worker's)
-    marks: Vec<(usize, Vec<f32>, Vec<f32>)>,
-    /// TORC_INK_PIPE: the later layer passes on a second machine (pipe.rs)
+    /// positions the convolution state is kept for, oldest first: (tokens read, state, the pipeline worker's mark
+    /// slot holding its half)
+    marks: Vec<(usize, Vec<f32>, usize)>,
+    /// TORC_PIPE: the later layer passes on a second machine (pipe.rs)
     pipe: Option<super::pipe::Pipe>,
     stops: Vec<u32>,
     name: String,
@@ -48,10 +50,10 @@ impl Engine {
         }
         self.marks.retain(|(p, _, _)| *p <= keep);
         match self.marks.last() {
-            Some((p, state, ws)) => {
+            Some((p, state, slot)) => {
                 self.m.set_conv_state(state)?;
                 if let Some(pp) = self.pipe.as_mut() {
-                    pp.set_state(ws)?;
+                    pp.load(*slot)?;
                 }
                 Ok(*p)
             }
@@ -111,11 +113,12 @@ impl Serve for Engine {
         if self.marks.len() == MARKS {
             self.marks.remove(0);
         }
-        let ws = match self.pipe.as_mut() {
-            Some(pp) => pp.state()?,
-            None => Vec::new(),
-        };
-        self.marks.push((ids.len(), self.m.conv_state(), ws));
+        // the worker keeps its half of the mark in a slot no other mark kept here uses
+        let slot = (0..MARKS).find(|k| self.marks.iter().all(|m| m.2 != *k)).unwrap_or(0);
+        if let Some(pp) = self.pipe.as_mut() {
+            pp.save(slot)?;
+        }
+        self.marks.push((ids.len(), self.m.conv_state(), slot));
         let tg = std::time::Instant::now();
         let (mut pend, mut n_out, mut n_think) = (Vec::<u8>::new(), 0usize, 0usize);
         let mut finish = "length";

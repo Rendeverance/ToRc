@@ -40,7 +40,6 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_ATT3` | development | Inkling: which three-head attention kernels run (bits 1 prompt scores, 2 prompt value sums, 4 one-token scores; ARM 7, x86 2) |
 | `TORC_ATT1_SPLIT` | development | Inkling: depth from which one-token attention on a full layer is spread over every core (default 2048; same bits) |
 | `TORC_LARGE_LAYERS` | setting | `a-b`: TORC_EXPERTS_LARGE copies only layers a..b (a two-machine Inkling's share; the rest stay untouched in the mapping) |
-| `TORC_INK_PIPE`, `TORC_INK_SPLIT` | setting | Inkling over two machines: the worker's `host:port` (`torc-ink <model> serve=<port>` there) and the first layer pass it runs (default 13 of every 24; prompt blocks of 256 when piped) |
 | `TORC_INK_WAVE` | development | Inkling: `0` runs a prompt block's experts one at a time instead of as one wave (same bits) |
 | `TORC_GEMM_MIN`, `TORC_PACKED_MIN`, `TORC_GEMM_IQ4` | development | from how many vectors the packed matrix kernels take over; `TORC_GEMM_IQ4=0` keeps x86 IQ4_NL on the row kernels |
 | `TORC_MULTI`, `TORC_GROUPED`, `TORC_GROUPED_MAX` | development | multi-vector and grouped expert products |
@@ -87,7 +86,7 @@ The switches are read once, when the program starts, so changing one means start
 
 | Switch | Kind | What it does |
 |---|---|---|
-| `TORC_PIPE`, `TORC_PIPE_SPLIT`, `TORC_PIPE_PULL`, `TORC_PIPE_TIMEOUT`, `TORC_PIPE_FALLBACK`, `TORC_PIPE_TOPK` | development: `TORC_PIPE_TOPK`; the rest setting | the layer pipeline over two machines ([TWO-BOX.md](TWO-BOX.md)) |
+| `TORC_PIPE`, `TORC_PIPE_SPLIT`, `TORC_PIPE_PULL`, `TORC_PIPE_TIMEOUT`, `TORC_PIPE_FALLBACK`, `TORC_PIPE_TOPK` | development: `TORC_PIPE_TOPK`; the rest setting | the layer pipeline over two machines ([TWO-BOX.md](TWO-BOX.md)); for Inkling 2 the split counts layer passes (default 26 of 48) and the prompt is read in blocks of 256 |
 | `TORC_PIPE_BIND` | setting | on a worker: the address it listens on (default: every interface; a worker has no authentication) |
 | `TORC_PIPESPEC` | development | `0` turns pipelined speculation off |
 | `TORC_EP`, `TORC_EP_MIN_N` | development | expert-parallel worker and the smallest block worth sending |

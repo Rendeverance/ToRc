@@ -52,6 +52,23 @@ fn main() {
     // ctx=N: the context (4096 by default). A pipeline worker needs the main machine's context, or longer prompts fail
     // there
     let n_ctx = args.iter().find_map(|a| a.strip_prefix("ctx=")).and_then(|v| v.parse::<u32>().ok()).unwrap_or(4096);
+    // serve-pipe=PORT on an Inkling 2 file: the worker runs Inkling's own forward pass over the same pipeline
+    // (models/inkling/pipe.rs)
+    if let Some(port) = args.iter().find_map(|a| a.strip_prefix("serve-pipe=")).and_then(|v| v.parse::<u16>().ok())
+        && format::read::Model::open(pos[0])
+            .ok()
+            .and_then(|f| format::meta::Meta::parse(&f.metadata).ok())
+            .is_some_and(|mm| mm.str("general.architecture") == Some("inkling2_loop"))
+    {
+        let mut m = model::models::inkling::inkling::Ink::load(pos[0], n_ctx).unwrap_or_else(|e| {
+            eprintln!("torc-run: {e}");
+            std::process::exit(1)
+        });
+        if let Err(e) = model::models::inkling::pipe::serve(&mut m, port) {
+            eprintln!("torc-run: {e}");
+        }
+        return;
+    }
     let mut m = match model::Model::load(pos[0], n_ctx) {
         Ok(m) => m,
         Err(e) => {
