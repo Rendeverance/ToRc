@@ -14,7 +14,7 @@ use format::{Result, err};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -146,25 +146,64 @@ pub(crate) fn large_leak(bytes: usize) -> Option<&'static mut [u8]> {
 /// One block of memory behind an arena's slots: (base, bytes, large).
 type Piece = (*mut u8, usize, bool);
 
+/// How much more of the expert cache may still go on large pages (set_lock_cap; unlimited unless set). Large pages are
+/// locked: Windows can't trim them, so a cache that nearly fills the machine once the resident weights and the NPU's
+/// share are in, all of it locked, leaves the system too little to run (on a freshly booted 32 GB machine, where
+/// nothing is fragmented and the whole cache gets them, writing fell to about 1 token a second).
+static LOCK_LEFT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Whether set_lock_cap kept part of a cache off large pages (for the load's message).
+static CAPPED: AtomicBool = AtomicBool::new(false);
+
+/// The most the expert cache may lock on large pages; the rest of it goes on ordinary pages (weights.rs sets it from
+/// the machine's memory before the cache is made).
+pub(crate) fn set_lock_cap(bytes: u64) {
+    LOCK_LEFT.store(bytes, Ordering::Relaxed);
+}
+
+/// Takes `bytes` from what may still be locked, if there is that much left.
+fn take_lock(bytes: usize) -> bool {
+    LOCK_LEFT.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(bytes as u64)).is_ok()
+}
+
+/// Gives back what take_lock took when the large-page allocation did not happen.
+fn give_lock(bytes: usize) {
+    if LOCK_LEFT.load(Ordering::Relaxed) != u64::MAX {
+        LOCK_LEFT.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
 /// The memory for n slots of slot_size, in pieces of whole slots: one piece on large pages where the system allows it,
 /// else pieces of about 512 MiB, each on large pages if it can still get them (a large-page block needs free physical
 /// memory in large-page units, which a few server restarts can fragment so that one ~20 GB block fails while 512 MiB
-/// ones still succeed), else from the allocator. Returns the pieces and the slots each holds (the last may hold fewer).
+/// ones still succeed), else from the allocator. Pieces past what may still be locked (set_lock_cap) go on ordinary
+/// pages. Returns the pieces and the slots each holds (the last may hold fewer).
 fn new_pieces(n: usize, slot_size: usize) -> Result<(Vec<Piece>, usize)> {
     if !large_wanted() {
-        return Ok((vec![new_arena(n * slot_size, false)?], n));
+        return Ok((vec![new_arena(n * slot_size, false, false)?], n));
     }
-    let whole = new_arena(n * slot_size, true)?;
-    if whole.1 != 0 {
-        return Ok((vec![whole], n));
+    if take_lock(n * slot_size) {
+        let whole = new_arena(n * slot_size, true, true)?;
+        if whole.1 != 0 {
+            return Ok((vec![whole], n));
+        }
+        give_lock(n * slot_size);
     }
     let per = ((512usize << 20) / slot_size).clamp(1, n);
     let mut pieces = Vec::new();
     let mut left = n;
     while left > 0 {
         let k = per.min(left);
-        match new_arena(k * slot_size, false) {
-            Ok(p) => pieces.push(p),
+        let may = take_lock(k * slot_size);
+        if !may {
+            CAPPED.store(true, Ordering::Relaxed);
+        }
+        match new_arena(k * slot_size, false, may) {
+            Ok(p) => {
+                if may && !p.2 {
+                    give_lock(k * slot_size);
+                }
+                pieces.push(p)
+            }
             Err(e) => {
                 for &(b, s, l) in &pieces {
                     // SAFETY: from new_arena with these values, and nothing uses them yet
@@ -186,10 +225,10 @@ fn large_wanted() -> bool {
 /// An arena of at least `bytes`: on large pages where the system allows it (fewer TLB misses while the experts'
 /// products stream through it; TORC_LARGE_PAGES=0 turns this off), else page-aligned from the allocator. With
 /// probe, a large-page failure returns a zero-size piece instead of allocating the bytes from the allocator (new_pieces
-/// then tries smaller pieces). Returns (base, bytes, large).
-fn new_arena(bytes: usize, probe: bool) -> Result<(*mut u8, usize, bool)> {
+/// then tries smaller pieces); without `large` it goes straight to the allocator. Returns (base, bytes, large).
+fn new_arena(bytes: usize, probe: bool, large: bool) -> Result<(*mut u8, usize, bool)> {
     #[cfg(windows)]
-    if large_wanted() {
+    if large && large_wanted() {
         static PRIV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(win::lock_memory_privilege);
         // SAFETY: plain Win32 calls, where a null result means there are no large pages here
         unsafe {
@@ -215,7 +254,7 @@ fn new_arena(bytes: usize, probe: bool) -> Result<(*mut u8, usize, bool)> {
             }
         }
     }
-    let _ = probe;
+    let _ = (probe, large);
     let layout = std::alloc::Layout::from_size_align(bytes, ALIGN)
         .map_err(|_| format::Error("expert cache: arena too large".into()))?;
     // SAFETY: a non-zero size, freed by arena_free with the same layout
@@ -673,7 +712,13 @@ impl OwnCache {
             if np > arenas.len() { format!(", {np} pieces") } else { String::new() },
             if large == all { ", large pages" } else { "" }
         );
-        if large < all && large_wanted() {
+        if large < all && CAPPED.load(Ordering::Relaxed) {
+            eprintln!(
+                "expert cache (own): {} of {} MiB on large pages, the rest on ordinary pages, so the system keeps room \n                beside the resident weights and the NPU",
+                large >> 20,
+                all >> 20
+            );
+        } else if large < all && large_wanted() {
             eprintln!(
                 "expert cache (own): WARNING only {} of {} MiB on large pages: Windows had too little unfragmented \
                 memory (often after several restarts; a reboot restores it). Without them the first prompt pays to fault \

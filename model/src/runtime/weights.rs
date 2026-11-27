@@ -260,6 +260,11 @@ fn meminfo(key: &str) -> Option<u64> {
     Some(kb << 10)
 }
 
+/// Room kept for the NPU tier's weights when TORC_NPU=1 (they are uploaded after the expert cache is sized): 2 GB.
+fn npu_room() -> u64 {
+    if crate::switches::is("TORC_NPU", "1") { 2u64 << 30 } else { 0 }
+}
+
 /// The physical memory free now, in bytes (None where it is not known).
 fn avail_phys() -> Option<u64> {
     #[cfg(windows)]
@@ -558,12 +563,21 @@ impl Weights {
                     avail += copied;
                     own = own.max(copied);
                 }
-                // at least 2 GB, and never more than the experts take (a small model can need less than that)
-                avail.saturating_sub(own + margin).max(2 << 30).min(w.file.expert_region.bytes)
+                // at least 2 GB, and never more than the experts take (a small model can need less than that); the
+                // NPU's weights come in after this, so their room is kept too
+                avail.saturating_sub(own + margin + npu_room()).max(2 << 30).min(w.file.expert_region.bytes)
             }
             None => 0,
         };
         if budget > 0 && w.file.expert_region.bytes > 0 {
+            // the most of the cache that may be locked on large pages (ecache_own::set_lock_cap): the machine's memory
+            // less the resident weights, the NPU's room and 4 GB for the system, the rest of the cache on ordinary
+            // pages the system can trim
+            let resident: u64 =
+                if mapless { w.own.values().map(|o| o.len as u64).sum() } else { w.file.resident.bytes };
+            if let Some(total) = total_phys() {
+                crate::ecache_own::set_lock_cap(total.saturating_sub(resident + npu_room() + (4u64 << 30)));
+            }
             let n_layer = w.file.blocks.iter().map(|b| b.layer + 1).max().unwrap_or(0);
             // the widest layer's: a model whose first layers are dense (one expert) keeps its usage rows that wide
             let n_expert = w.file.experts.iter().map(|x| x.n_expert).max().unwrap_or(0);
