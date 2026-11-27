@@ -428,6 +428,9 @@ impl Ink {
         }
         let w = Weights::load(path)?;
         let h = InkHp::from_meta(&w.file.metadata)?;
+        // TORC_NPU=1: the dense products of big prompt blocks on the NPU (attention's q, gate, k, v and output; no
+        // hot experts yet), uploaded once for every pass that uses them; off, nothing changes
+        crate::npu::load(&w, h.n_layer as u32, &[]);
         crate::pipe::set_ident(
             &w.file.header.model_id,
             w.file.header.file_bytes,
@@ -716,24 +719,44 @@ impl Ink {
         {
             let (tq, tr, ts, tg) =
                 (t_("attn_q.weight")?, t_("attn_rel.weight")?, t_("attn_sink_proj.weight")?, t_("attn_gate.weight")?);
-            apply_group_multi(
-                &mut [
-                    (Mat::of(&tq), &mut q[..]),
-                    (Mat::of(&tr), &mut rel[..]),
-                    (Mat::of(&ts), &mut sink[..]),
-                    (Mat::of(&tg), &mut gate[..]),
-                ],
-                qs[qi].view(),
-                n,
-            );
+            // TORC_NPU=1 (npu.rs): a big prompt block's q, gate, k and v products on the NPU, from the f32 inputs (not
+            // bit-identical: checked by tolerance); the small ones (relative vectors, sinks, the taps) stay here
+            if crate::npu::apply(&mut [(Mat::of(&tq), &mut q[..]), (Mat::of(&tg), &mut gate[..])], &ins[qi], n) {
+                apply_group_multi(&mut [(Mat::of(&tr), &mut rel[..]), (Mat::of(&ts), &mut sink[..])], qs[qi].view(), n);
+            } else {
+                apply_group_multi(
+                    &mut [
+                        (Mat::of(&tq), &mut q[..]),
+                        (Mat::of(&tr), &mut rel[..]),
+                        (Mat::of(&ts), &mut sink[..]),
+                        (Mat::of(&tg), &mut gate[..]),
+                    ],
+                    qs[qi].view(),
+                    n,
+                );
+            }
             let (tk, tv) = (t_("attn_k.weight")?, t_("attn_v.weight")?);
+            let npu_k = crate::npu::apply(&mut [(Mat::of(&tk), &mut kk[..])], &ins[ki], n);
+            let npu_v = crate::npu::apply(&mut [(Mat::of(&tv), &mut vv[..])], &ins[vi], n);
             if swa {
-                apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..])], qs[ki].view(), n);
-                apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..])], qs[vi].view(), n);
+                if !npu_k {
+                    apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..])], qs[ki].view(), n);
+                }
+                if !npu_v {
+                    apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..])], qs[vi].view(), n);
+                }
             } else {
                 let (pk, pv) = (t_("attn_k_conv_proj.weight")?, t_("attn_v_conv_proj.weight")?);
-                apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..]), (Mat::of(&pk), &mut ktap[..])], qs[ki].view(), n);
-                apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..]), (Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
+                if npu_k {
+                    apply_group_multi(&mut [(Mat::of(&pk), &mut ktap[..])], qs[ki].view(), n);
+                } else {
+                    apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..]), (Mat::of(&pk), &mut ktap[..])], qs[ki].view(), n);
+                }
+                if npu_v {
+                    apply_group_multi(&mut [(Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
+                } else {
+                    apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..]), (Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
+                }
             }
         }
         lap.lap(2);
@@ -947,7 +970,9 @@ impl Ink {
         let mut out = vec![0.0f32; n * dm];
         {
             let two = t_("attn_output.weight")?;
-            apply_group_multi(&mut [(Mat::of(&two), &mut out[..])], quant(&att, n, qd).view(), n);
+            if !crate::npu::apply(&mut [(Mat::of(&two), &mut out[..])], &att, n) {
+                apply_group_multi(&mut [(Mat::of(&two), &mut out[..])], quant(&att, n, qd).view(), n);
+            }
         }
         convolve(&mut out, n, dm, &ly.attn_conv, None, ha);
         // a block's first layer starts a new stream; the one it leaves joins the blocks
