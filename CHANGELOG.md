@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.9 (27 November 2026)
+
+Inkling 2 Mini comes to ToRc!!!
+
+- Inkling 2 Mini (ggml-org's IQ4_NL GGUF, converted in the app or with `torc convert-gguf`). On one Snapdragon X box it
+  reads 74 tok/s and writes 17.9 at 1k (llama.cpp reads 52 and writes 12.1), and on a 13900K 82 / 15.5 (llama.cpp at
+  its best: 80 / 12.0). **Two boxes read 123 at 8k.**
+- Saved chats, reconnects and going back to an earlier point in a chat all work for Inkling as they do for the other
+  models (saved chats on one machine for now, multi-box state saving will come in the next update).
+- Faster prompt reading on x86 with VNNI for all IQ4_NL files: they now go through the packed VNNI matrix kernel, same
+  results bit for bit. Inkling and Flash Next's IQ4_NL file both read faster on a 13900K.
+- Attention cache now supports f32 format (in addition to int8 and 16-bit). The attention cache's format can be chosen
+  with TORC_KV: 8 (int8), 16 or f32. I.e. Inkling's int8 cache writes faster at long contexts than f32, with the same
+  text in our checks.
+- The expert cache now leaves room for the NPU and the system, and locks no more than that in memory. Straight after a
+  reboot, Flash Next on two boxes could lock its whole cache on the second box and leave Windows too little (about 1
+  tok/s); it now writes at its usual speed.
+
 ## 0.1.8 (26 November 2026)
 
 Thank you to RainerSC for two pull requests: a status page for the server, and attention scores on ARM's matrix units.

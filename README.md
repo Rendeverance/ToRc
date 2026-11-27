@@ -4,6 +4,8 @@
 
 [![CI](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml/badge.svg)](https://github.com/Rendeverance/ToRc/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#licence) [![Release](https://img.shields.io/github/v/release/Rendeverance/ToRc)](https://github.com/Rendeverance/ToRc/releases/latest) [![Works with ToolFunnel](https://img.shields.io/badge/works%20with-ToolFunnel-8250df)](https://github.com/Rendeverance/toolfunnel)
 
+***Now supports Inkling 2 Mini (faster than llama.cpp)***
+
 *By Rendeverance.*
 
 ToRc started by accident. I had two base Snapdragon X mini PCs left over after some testing on Windows on ARM, and I
@@ -78,6 +80,7 @@ on your hardware.
 | LFM2.5-8B | `lfm2moe` | its own template's format |
 | Gemma 4 26B-A4B | `gemma4` | its own template's format |
 | gpt-oss | `gpt-oss` | its own template's format |
+| Inkling 2 Mini (one box or two) | `inkling2_loop` | its own template's format |
 
 Quant types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4, and Q2_K, Q2_0,
 IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ1_M through portable kernels that run on any CPU (Q2_K and Q2_0 with vector code
@@ -274,6 +277,9 @@ thinking.
 Gemma doesn't save chats on the whole-NPU tier (`TORC_NPU=pure`), where the cache lives on the NPU. Gemma 4's output
 head is requantised to Q4_0 at load, fewer bytes a token than the file's Q6_K, so its logits are not the file's:
 `TORC_HEAD=file` keeps the file's head, `q8_0` takes the middle way.
+
+Inkling 2 Mini goes through the same server too, on one machine or two. Its chats are saved on disk on one machine for
+now; with two, a chat that comes back is read again. It has no system-prompt mark yet.
 
 ## Roadmap
 
