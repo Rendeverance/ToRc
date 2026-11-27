@@ -72,8 +72,7 @@ pub enum KvFmt {
 }
 
 /// TORC_KV: the cache format a model with a choice keeps (f32, 16 or 8), or None when unset (the model's own default).
-/// Inkling 2 (inkling.rs): set, its attention runs on the shared engine (fattn.rs) with a cache of that format; unset,
-/// on its own f32 kernels.
+/// Inkling 2 (inkling.rs): its cache's format (default int8) on the shared engine (fattn.rs).
 pub fn kv_switch() -> Result<Option<KvFmt>> {
     match crate::switches::get("TORC_KV").as_deref() {
         None | Some("") => Ok(None),

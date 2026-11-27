@@ -202,24 +202,17 @@ struct ILayer {
     looped: Option<Loop>,
 }
 
-/// One layer pass's state: its keys and values at every position (so a prompt that extends an earlier one finds
-/// them), and the last three inputs of its four convolutions (keys, values, attention output, the experts' output),
-/// oldest first. The keys and values are kept a key head at a time (head g's row for slot s at (g * cap + s) * hd),
-/// so one head's attention reads its rows one after another in memory: kept by position (all heads of a slot side by
-/// side), each head read 512 bytes every 4 KB, a new page a position, and attention waited on memory, not maths
-/// (box 1, 26 Nov: 13 ms a token at 590 positions, 43 ms at 8.6k).
+/// One layer pass's state: its keys and values (so a prompt that extends an earlier one finds them) in the shared
+/// engine's cache (attn::KvCache, a key head at a time; TORC_KV picks its format, int8 by default; a ring of its last
+/// positions on a sliding-window pass that keeps one), and the last three inputs of its four convolutions (keys,
+/// values, attention output, the experts' output), oldest first.
 struct Pass {
-    k: Vec<f32>,
-    v: Vec<f32>,
+    kc: crate::attn::KvCache,
     cap: usize,
     hist: Vec<f32>,
     /// TORC_GPU_ATTN=1 (gpu builds): the same keys and values at 16 bits with a scale a row, as the GPU tier takes
-    /// them (gpu::run_block_ink), kept beside the f32 ones
+    /// them (gpu::run_block_ink), kept beside kc
     gkv: Option<crate::attn::KvCache>,
-    /// TORC_KV (f32, 16 or 8): the keys and values in a shared cache of that format, a ring on a sliding-window pass
-    /// that keeps one, and attention on the shared engine (fattn::run_block_ex with Inkling's extras); k and v are
-    /// then empty. Unset: None, and Inkling's own kernels on k and v.
-    kc: Option<crate::attn::KvCache>,
 }
 
 /// Whether prompt blocks' attention may go to the GPU tier (a gpu build with TORC_GPU_ATTN=1).
@@ -351,151 +344,6 @@ fn rms(out: &mut [f32], x: &[f32], eps: f32) {
     for (o, &v) in out.iter_mut().zip(x) {
         *o = v * scale;
     }
-}
-
-/// out[e] += ws[i] x (key head g's value row at position lo + i)[e] for i in order: a query's attention output from its
-/// weights. VS numbers of out at a time stay in registers over all the positions (so out is loaded and stored once, not
-/// once a position); each number takes the same fused steps in the same order as a loop over the positions outside,
-/// so the bits are the same.
-fn value_sums(out: &mut [f32], ws: &[f32], lo: usize, cv: &[f32], g: usize, cap: usize, hd: usize) {
-    const VS: usize = 32;
-    if !hd.is_multiple_of(VS) {
-        for (i, &wgt) in ws.iter().enumerate() {
-            let p = lo + i;
-            let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-            for (a, b) in out.iter_mut().zip(v) {
-                *a = wgt.mul_add(*b, *a);
-            }
-        }
-        return;
-    }
-    for c in (0..hd).step_by(VS) {
-        let mut acc = [0.0f32; VS];
-        acc.copy_from_slice(&out[c..c + VS]);
-        for (i, &wgt) in ws.iter().enumerate() {
-            let p = lo + i;
-            let at = (g * cap + p % cap) * hd + c;
-            let v: &[f32; VS] = cv[at..at + VS].try_into().unwrap();
-            for k in 0..VS {
-                acc[k] = wgt.mul_add(v[k], acc[k]);
-            }
-        }
-        out[c..c + VS].copy_from_slice(&acc);
-    }
-}
-
-/// value_sums for three heads with the same positions (a token's heads of one key head): out holds their three rows
-/// of hd, and each value row is read once for the three. Each number takes the same steps as in value_sums. Three
-/// named accumulators (not an array of them), so they stay in registers.
-fn value_sums3(out: &mut [f32], ws: [&[f32]; 3], lo: usize, cv: &[f32], g: usize, cap: usize, hd: usize) {
-    const VS: usize = 16;
-    let len = ws[0].len();
-    let (w0, w1, w2) = (&ws[0][..len], &ws[1][..len], &ws[2][..len]);
-    for c in (0..hd).step_by(VS) {
-        let mut a0: [f32; VS] = out[c..c + VS].try_into().unwrap();
-        let mut a1: [f32; VS] = out[hd + c..hd + c + VS].try_into().unwrap();
-        let mut a2: [f32; VS] = out[2 * hd + c..2 * hd + c + VS].try_into().unwrap();
-        for i in 0..len {
-            let p = lo + i;
-            let at = (g * cap + p % cap) * hd + c;
-            let v: &[f32; VS] = cv[at..at + VS].try_into().unwrap();
-            let (x0, x1, x2) = (w0[i], w1[i], w2[i]);
-            for k in 0..VS {
-                a0[k] = x0.mul_add(v[k], a0[k]);
-                a1[k] = x1.mul_add(v[k], a1[k]);
-                a2[k] = x2.mul_add(v[k], a2[k]);
-            }
-        }
-        out[c..c + VS].copy_from_slice(&a0);
-        out[hd + c..hd + c + VS].copy_from_slice(&a1);
-        out[2 * hd + c..2 * hd + c + VS].copy_from_slice(&a2);
-    }
-}
-
-/// TORC_ATT1_SPLIT: from how many positions one token's attention in a pass spreads over the whole pool (att1's deep
-/// path; the same bits). Default 2048: only the full-attention passes past that depth (the sliding windows are 1024).
-fn att1_split() -> usize {
-    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *S.get_or_init(|| crate::switches::num("TORC_ATT1_SPLIT").unwrap_or(2048))
-}
-
-/// Three heads' value sums over columns c0.. of a key head (the deep one-token path): out[x][e] += ws[x][i] x value
-/// row (lo + i)[c0 + e], i in order, 16 columns at a time held in registers, as value_sums3 does for all columns.
-#[allow(clippy::too_many_arguments)]
-fn value_cols3(
-    out: [&mut [f32]; 3],
-    ws: [&[f32]; 3],
-    lo: usize,
-    cv: &[f32],
-    g: usize,
-    cap: usize,
-    hd: usize,
-    c0: usize,
-) {
-    const VS: usize = 16;
-    let len = ws[0].len();
-    let (w0, w1, w2) = (&ws[0][..len], &ws[1][..len], &ws[2][..len]);
-    let [o0, o1, o2] = out;
-    let width = o0.len();
-    for c in (0..width).step_by(VS) {
-        let mut a0: [f32; VS] = o0[c..c + VS].try_into().unwrap();
-        let mut a1: [f32; VS] = o1[c..c + VS].try_into().unwrap();
-        let mut a2: [f32; VS] = o2[c..c + VS].try_into().unwrap();
-        for i in 0..len {
-            let p = lo + i;
-            let at = (g * cap + p % cap) * hd + c0 + c;
-            let v: &[f32; VS] = cv[at..at + VS].try_into().unwrap();
-            let (x0, x1, x2) = (w0[i], w1[i], w2[i]);
-            for k in 0..VS {
-                a0[k] = x0.mul_add(v[k], a0[k]);
-                a1[k] = x1.mul_add(v[k], a1[k]);
-                a2[k] = x2.mul_add(v[k], a2[k]);
-            }
-        }
-        o0[c..c + VS].copy_from_slice(&a0);
-        o1[c..c + VS].copy_from_slice(&a1);
-        o2[c..c + VS].copy_from_slice(&a2);
-    }
-}
-
-/// dot's lane sum: the 16 lanes added in pairs (8 apart, then 4, 2, 1), as dot ends.
-#[inline(always)]
-fn lanes16(mut ac: [f32; 16]) -> f32 {
-    let mut w = 16;
-    while w > 1 {
-        w /= 2;
-        for i in 0..w {
-            ac[i] += ac[i + w];
-        }
-    }
-    ac[0]
-}
-
-/// dot for three rows against the same row k: each result the same steps in the same order as dot(a[x], k) (lane i
-/// takes every 16th pair from i, then the lanes are added in pairs), with each part of k read once for the three.
-/// Three named accumulators, so they stay in registers.
-fn dot3(a: [&[f32]; 3], k: &[f32]) -> [f32; 3] {
-    let n = k.len();
-    let (q0, q1, q2) = (&a[0][..n], &a[1][..n], &a[2][..n]);
-    let (mut a0, mut a1, mut a2) = ([0.0f32; 16], [0.0f32; 16], [0.0f32; 16]);
-    let n16 = n / 16 * 16;
-    for c in (0..n16).step_by(16) {
-        let kc: &[f32; 16] = k[c..c + 16].try_into().unwrap();
-        let r0: &[f32; 16] = q0[c..c + 16].try_into().unwrap();
-        let r1: &[f32; 16] = q1[c..c + 16].try_into().unwrap();
-        let r2: &[f32; 16] = q2[c..c + 16].try_into().unwrap();
-        for i in 0..16 {
-            a0[i] = r0[i].mul_add(kc[i], a0[i]);
-            a1[i] = r1[i].mul_add(kc[i], a1[i]);
-            a2[i] = r2[i].mul_add(kc[i], a2[i]);
-        }
-    }
-    for i in 0..n - n16 {
-        a0[i] = q0[n16 + i].mul_add(k[n16 + i], a0[i]);
-        a1[i] = q1[n16 + i].mul_add(k[n16 + i], a1[i]);
-        a2[i] = q2[n16 + i].mul_add(k[n16 + i], a2[i]);
-    }
-    [lanes16(a0), lanes16(a1), lanes16(a2)]
 }
 
 /// Whether the NPU tier runs Inkling's SITU feed-forwards (set at load), so its hot experts may go there.
@@ -657,9 +505,9 @@ fn convolve(x: &mut [f32], n: usize, c: usize, taps: &[f32], dynamic: Option<(&[
 
 impl Ink {
     pub fn load(path: &str, n_ctx: u32) -> Result<Ink> {
-        // ARM: the experts on large pages by default (TORC_EXPERTS_LARGE=0 turns it off). Box 1, 26 Nov: the cold first
-        // pass 5.4 -> 18.8 tok/s and the experts' products 30 -> 100 GB/s when each token asks for other experts; the
-        // mapped pages are handed back after the copy there (weights.rs), so only one copy is held
+        // ARM: the experts on large pages by default (TORC_EXPERTS_LARGE=0 turns it off). Small pages make the first
+        // pass slow and leave the experts' products waiting on address translation when each token asks for other
+        // experts; the mapped pages are handed back after the copy there (weights.rs), so only one copy is held
         if cfg!(target_arch = "aarch64") && !crate::switches::given("TORC_EXPERTS_LARGE") {
             crate::switches::set("TORC_EXPERTS_LARGE", "1");
         }
@@ -754,9 +602,10 @@ impl Ink {
         let ring = (!crate::switches::is("TORC_INK_RING", "0") && !gpu_attn())
             .then_some(h.window + BLOCK_MAX + RING_SLACK)
             .filter(|&c| c < n_ctx as usize);
-        // TORC_KV: the shared engine's cache and attention (with TORC_GPU_ATTN the card keeps its 16-bit copy beside
-        // it, and the shared engine runs the CPU's share of each block)
-        let kvf = crate::attn::kv_switch()?;
+        // the cache's format: TORC_KV, else int8 with a scale a row (a quarter of f32's bytes to read for each token
+        // written, which is most of writing at depth, for about the drift f32 shows). With TORC_GPU_ATTN the card
+        // keeps its 16-bit copy beside it, and the shared engine runs the CPU's share of each block
+        let kvf = crate::attn::kv_switch()?.unwrap_or(crate::attn::KvFmt::I8);
         let span = h.loop_end - h.loop_start;
         let pass = (0..h.n_pass)
             .map(|s| {
@@ -765,15 +614,9 @@ impl Ink {
                     Some(c) if h.swa[l] => c,
                     _ => n_ctx as usize,
                 };
-                let kc = kvf.map(|f| {
-                    let mut c = crate::attn::KvCache::with_fmt(h.n_head_kv, h.head_dim, cap, f);
-                    c.ring = cap < n_ctx as usize;
-                    c
-                });
-                let own = if kc.is_some() { 0 } else { cap * kvd };
+                let mut kc = crate::attn::KvCache::with_fmt(h.n_head_kv, h.head_dim, cap, kvf);
+                kc.ring = cap < n_ctx as usize;
                 Pass {
-                    k: vec![0.0; own],
-                    v: vec![0.0; own],
                     cap,
                     hist: vec![0.0; 3 * (2 * kvd + 2 * dm)],
                     gkv: gpu_attn().then(|| crate::attn::KvCache::with(h.n_head_kv, h.head_dim, cap, true)),
@@ -807,7 +650,7 @@ impl Ink {
         self.h.n_vocab
     }
 
-    /// Every pass's convolution state, end to end: with the keys and values (kept by position), the model's whole
+    /// Every pass's convolution state, end to end: with the keys and values (in each pass's cache), the model's whole
     /// state after the tokens read so far. A prompt can go on from position p only with the state as it was at p.
     pub fn conv_state(&self) -> Vec<f32> {
         self.pass.iter().flat_map(|p| p.hist.iter().copied()).collect()
@@ -827,7 +670,7 @@ impl Ink {
         Ok(())
     }
 
-    /// Whether the state a saved chat needs is all in these f32 caches and the convolution state (not with the GPU
+    /// Whether the state a saved chat needs is all in the passes' caches and the convolution state (not with the GPU
     /// tier, which keeps a 16-bit copy of the keys and values beside them).
     pub fn saves_whole_state(&self) -> bool {
         self.pass.iter().all(|p| p.gkv.is_none())
@@ -844,7 +687,8 @@ impl Ink {
 
     /// A chat's state after `npos` tokens, for a saved chat on disk (chat/saved.rs): `conv` (the convolution state at
     /// npos, which a mark keeps), then each pass's keys and values at the positions going on from npos reads
-    /// (kept_rows), a key head at a time. As bytes: npos and conv's length (u32), then the f32s.
+    /// (kept_rows), a key head at a time. As bytes: npos and conv's length (u32), conv's f32s, then each row in its
+    /// cache's format (attn::KvCache::put_row_bytes; f32 rows are 4 bytes a number).
     pub fn state_bytes_at(&self, npos: usize, conv: &[f32]) -> Vec<u8> {
         let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
         let mut b = Vec::new();
@@ -858,15 +702,7 @@ impl Ink {
             for which in [false, true] {
                 for g in 0..nkv {
                     for q in rows.clone() {
-                        // TORC_KV: the shared cache's rows in its format (f32 rows are the same bytes as below)
-                        if let Some(kc) = &p.kc {
-                            kc.put_row_bytes(g, q, hd, which, &mut b);
-                            continue;
-                        }
-                        let at = (g * p.cap + q % p.cap) * hd;
-                        for x in &(if which { &p.v } else { &p.k })[at..at + hd] {
-                            b.extend(x.to_le_bytes());
-                        }
+                        p.kc.put_row_bytes(g, q, hd, which, &mut b);
                     }
                 }
             }
@@ -876,7 +712,7 @@ impl Ink {
 
     /// The bytes of one cache row of pass `s` in state_bytes_at.
     fn row_bytes(&self, s: usize) -> usize {
-        self.pass[s].kc.as_ref().map_or(4 * self.h.head_dim, |kc| kc.row_bytes(self.h.head_dim))
+        self.pass[s].kc.row_bytes(self.h.head_dim)
     }
 
     /// Puts state_bytes_at back: the convolution state, and the keys and values at their positions. Fails, leaving
@@ -905,15 +741,7 @@ impl Ink {
             for which in [false, true] {
                 for g in 0..nkv {
                     for q in r.clone() {
-                        if let Some(kc) = p.kc.as_mut() {
-                            kc.set_row_bytes(g, q, hd, which, &b[at..at + rb]);
-                        } else {
-                            let o = (g * p.cap + q % p.cap) * hd;
-                            let c = if which { &mut p.v } else { &mut p.k };
-                            for (x, w) in c[o..o + hd].iter_mut().zip(b[at..at + rb].chunks_exact(4)) {
-                                *x = f32::from_le_bytes(w.try_into().unwrap());
-                            }
-                        }
+                        p.kc.set_row_bytes(g, q, hd, which, &b[at..at + rb]);
                         at += rb;
                     }
                 }
@@ -1233,12 +1061,9 @@ impl Ink {
         convolve(&mut vv, n, kvd, &ly.v_conv, (!swa).then_some((&vtap[..], nkv)), hv);
         // the clips and norms, the keys and values into the cache
         let cap = st.cap;
-        // TORC_KV: the rows go to the shared cache after the loop (Inkling's own k and v are empty)
-        let own = st.kc.is_none();
         {
             let (qp, rp) = (SyncPtr::new(&mut q), SyncPtr::new(&mut rel));
             let (kp, vp) = (SyncPtr::new(&mut kk), SyncPtr::new(&mut vv));
-            let (ck, cv) = (SyncPtr::new(&mut st.k), SyncPtr::new(&mut st.v));
             let gk = st.gkv.as_mut().map(|g| {
                 (
                     SyncPtr::new(&mut g.k16),
@@ -1269,14 +1094,8 @@ impl Ink {
                     let c = vh.to_vec();
                     rms(vh, &c, h.eps);
                 }
-                for g in 0..nkv {
+                for g in (0..nkv).filter(|_| gk.is_some()) {
                     let slot = (g * cap + pos % cap) * hd;
-                    if own {
-                        unsafe {
-                            ck.slice(slot, hd).copy_from_slice(&kt[g * hd..(g + 1) * hd]);
-                            cv.slice(slot, hd).copy_from_slice(&vt[g * hd..(g + 1) * hd]);
-                        }
-                    }
                     if let Some((k16, v16, ks, vs)) = gk {
                         let r = g * cap + pos % cap;
                         // SAFETY: as above, the position's rows of the 16-bit copy
@@ -1288,21 +1107,21 @@ impl Ink {
                 }
             });
         }
-        if let Some(kc) = st.kc.as_mut() {
-            for t in 0..n {
-                for g in 0..nkv {
-                    let r = t * kvd + g * hd..t * kvd + (g + 1) * hd;
-                    kc.put_row(g, pos0 as usize + t, hd, &kk[r.clone()], &vv[r]);
-                }
+        // then into the cache, in its format (TORC_KV; int8 by default)
+        for t in 0..n {
+            for g in 0..nkv {
+                let r = t * kvd + g * hd..t * kvd + (g + 1) * hd;
+                st.kc.put_row(g, pos0 as usize + t, hd, &kk[r.clone()], &vv[r]);
             }
         }
         lap.lap(3);
         // 3. attention: each head's scores over the keys it sees, plus the bias by distance less the query's sink
         // logit, softmaxed with the sink's zero beside them
         let mut att = vec![0.0f32; n * qd];
-        if let Some(kc) = st.kc.as_ref() {
-            // TORC_KV: the shared engine (fattn.rs) with Inkling's bias by distance and per-token sink (Extras), on the
-            // shared cache; then the output's gate. Not the own kernels' bits (another order of adding)
+        {
+            // the shared engine (fattn.rs) with Inkling's bias by distance and per-token sink (Extras), on the pass's
+            // cache (TORC_KV: f32, 16 or 8; int8 by default); then the output's gate
+            let kc = &st.kc;
             let (scale, win) = (1.0 / (hd as f32).sqrt(), if swa { h.window } else { 0 });
             let f = crate::fattn::Fattn::new(nh, nkv, hd, Some(scale), win);
             // tokens a..b's extras (their rows of the relative vectors and sinks)
@@ -1352,340 +1171,6 @@ impl Ink {
                     *a *= 1.0 / (1.0 + (-g).exp());
                 }
             });
-        } else {
-            let ap = SyncPtr::new(&mut att);
-            let (ck, cv) = (&st.k, &st.v);
-            let scale = 1.0 / (hd as f32).sqrt();
-            let per = nh / nkv;
-            // an item is one head over a tile of up to ATT_QT tokens (so a single token's heads spread over the pool,
-            // and in a prompt block each key and value row is read once for the tile's queries while it is in the
-            // core's cache). Each query's numbers are the same steps in the same order as one query alone (its scores
-            // over its own keys in position order, the same maximum and sums, its value sums in position order), so
-            // the bits do not depend on n, the tile or how the items are dealt
-            const ATT_QT: usize = 8;
-            let tiles = n.div_ceil(ATT_QT);
-            // in a prompt block an item also takes every query head of one key head (GQA), so each key and value row
-            // is read once for all of them; a single token keeps a head an item, to spread over the pool
-            let hpi = if n > 1 { per } else { 1 };
-            let groups = nh / hpi;
-            if n == 1 {
-                // one token: nothing to tile (the tiled code below cost writing 3-5% on box1,
-                // 26 Nov). The same steps as the tiled path for one query, so the same bits
-                let pos = pos0 as usize;
-                let lo = if swa { (pos + 1).saturating_sub(h.window) } else { 0 };
-                // an item is one key head with its `per` query heads, so each key and value row is read from memory
-                // once for all of them (the cache is f32 by position: at depth it is most of a token's bytes). Each
-                // head's numbers are the same steps in the same order, so the same bits
-                let span = pos + 1 - lo;
-                // the distances this token sees are 0..span, so only those rows of the bias table (the same numbers)
-                let ext = h.extent.min(span);
-                if per == 3 && hd.is_multiple_of(64) && span >= att1_split() {
-                    // a deep full-attention pass: the whole pool in three stages (one item a key head left a 12-core
-                    // box a third idle, and at depth this is most of a token's attention), each number the same steps
-                    // in the same order as below: 1. scores, a key head over a run of positions (dot3); 2. a query
-                    // head's softmax and weights (score / sum); 3. value sums and the gate, a key head's three heads
-                    // over a quarter of the columns, every position in order
-                    let threads = crate::pool::get().threads.max(1);
-                    let runs = (2 * threads).div_ceil(nkv).clamp(1, span.div_ceil(256));
-                    let run = span.div_ceil(runs);
-                    const SLICES: usize = 4;
-                    let sw = hd / SLICES;
-                    let mut sc = vec![0.0f32; nh * span];
-                    let mut sums = vec![0.0f32; nh];
-                    let (sp, mp) = (SyncPtr::new(&mut sc), SyncPtr::new(&mut sums));
-                    let scores = |it: usize| {
-                        let (g, r) = (it / runs, it % runs);
-                        let (i0, i1) = (r * run, ((r + 1) * run).min(span));
-                        if i0 >= i1 {
-                            return;
-                        }
-                        let h0 = g * 3;
-                        // this run's distances: span - i1 .. span - i0 (those below ext have a bias)
-                        let (dlo, dhi) = (span - i1, (span - i0).min(ext));
-                        let bw = dhi.saturating_sub(dlo);
-                        let mut bias = vec![0.0f32; 3 * bw];
-                        for j in 0..3 {
-                            let rh = &rel[(h0 + j) * nr..(h0 + j + 1) * nr];
-                            for (e, b) in bias[j * bw..(j + 1) * bw].iter_mut().enumerate() {
-                                let d = dlo + e;
-                                *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
-                            }
-                        }
-                        let qr = |x: usize| &q[(h0 + x) * hd..(h0 + x + 1) * hd];
-                        for i in i0..i1 {
-                            let p = lo + i;
-                            let d = pos - p;
-                            let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-                            let ds = dot3([qr(0), qr(1), qr(2)], k);
-                            for (j, dv) in ds.iter().enumerate() {
-                                let hh = h0 + j;
-                                let b = if d < ext { bias[j * bw + d - dlo] } else { 0.0 };
-                                // SAFETY: item (g, r) owns positions i0..i1 of heads h0..h0 + 3
-                                unsafe { *sp.at(hh * span + i) = dv * scale + (b - sink[hh]) };
-                            }
-                        }
-                    };
-                    let softmax = |hh: usize| {
-                        // SAFETY: item hh owns head hh's scores and sum
-                        let row = unsafe { sp.slice(hh * span, span) };
-                        let mut mx = 0.0f32;
-                        for &v in row.iter() {
-                            mx = mx.max(v);
-                        }
-                        let mut sum = (-mx).exp();
-                        for v in row.iter_mut() {
-                            *v = (*v - mx).exp();
-                            sum += *v;
-                        }
-                        for v in row.iter_mut() {
-                            *v /= sum;
-                        }
-                        unsafe { *mp.at(hh) = sum };
-                    };
-                    let values = |it: usize| {
-                        let (g, sl) = (it / SLICES, it % SLICES);
-                        let (h0, c0) = (g * 3, sl * sw);
-                        // SAFETY: the weights are done (stage 2); item (g, sl) owns columns c0..c0 + sw of heads
-                        // h0..h0 + 3 of the token's row of att
-                        let ws = unsafe { std::slice::from_raw_parts(sp.at(0), nh * span) };
-                        let w = |x: usize| &ws[(h0 + x) * span..(h0 + x + 1) * span];
-                        let o = |x: usize| unsafe { ap.slice((h0 + x) * hd + c0, sw) };
-                        value_cols3([o(0), o(1), o(2)], [w(0), w(1), w(2)], lo, cv, g, cap, hd, c0);
-                        for x in 0..3 {
-                            let gr = &gate[(h0 + x) * hd + c0..(h0 + x) * hd + c0 + sw];
-                            for (a, gt) in o(x).iter_mut().zip(gr) {
-                                *a *= 1.0 / (1.0 + (-gt).exp());
-                            }
-                        }
-                    };
-                    crate::pool::par_stages(&[(nkv * runs, &scores), (nh, &softmax), (nkv * SLICES, &values)]);
-                    let _ = &sums;
-                } else {
-                    each(nkv, &|g| {
-                        let h0 = g * per;
-                        let mut bias = vec![0.0f32; per * ext];
-                        let mut sc = vec![0.0f32; per * span];
-                        for j in 0..per {
-                            let rh = &rel[(h0 + j) * nr..(h0 + j + 1) * nr];
-                            for (d, b) in bias[j * ext..(j + 1) * ext].iter_mut().enumerate() {
-                                *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
-                            }
-                        }
-                        for (i, p) in (lo..=pos).enumerate() {
-                            let d = pos - p;
-                            let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-                            if per == 3 && att3() & 4 != 0 {
-                                let qr = |x: usize| &q[(h0 + x) * hd..(h0 + x + 1) * hd];
-                                let ds = dot3([qr(0), qr(1), qr(2)], k);
-                                for (j, dv) in ds.iter().enumerate() {
-                                    let hh = h0 + j;
-                                    let b = if d < ext { bias[j * ext + d] } else { 0.0 };
-                                    sc[j * span + i] = dv * scale + (b - sink[hh]);
-                                }
-                                continue;
-                            }
-                            for j in 0..per {
-                                let hh = h0 + j;
-                                let b = if d < ext { bias[j * ext + d] } else { 0.0 };
-                                sc[j * span + i] = dot(&q[hh * hd..(hh + 1) * hd], k) * scale + (b - sink[hh]);
-                            }
-                        }
-                        let mut sums = vec![0.0f32; per];
-                        for j in 0..per {
-                            let row = &mut sc[j * span..(j + 1) * span];
-                            let mut mx = 0.0f32;
-                            for &v in row.iter() {
-                                mx = mx.max(v);
-                            }
-                            let mut sum = (-mx).exp();
-                            for v in row.iter_mut() {
-                                *v = (*v - mx).exp();
-                                sum += *v;
-                            }
-                            sums[j] = sum;
-                        }
-                        // SAFETY: item g owns heads h0..h0 + per of the token's row of att
-                        let og = unsafe { ap.slice(h0 * hd, per * hd) };
-                        // each value row read once for the item's `per` heads (value_sums, a head at a time with its
-                        // output in registers, read each row `per` times: box 1 server writing at 8k 13.8 -> 12.7, 27 Nov)
-                        for (i, p) in (lo..=pos).enumerate() {
-                            let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-                            for j in 0..per {
-                                let wgt = sc[j * span + i] / sums[j];
-                                for (a, b) in og[j * hd..(j + 1) * hd].iter_mut().zip(v) {
-                                    *a = wgt.mul_add(*b, *a);
-                                }
-                            }
-                        }
-                        for (a, gt) in og.iter_mut().zip(&gate[h0 * hd..(h0 + per) * hd]) {
-                            *a *= 1.0 / (1.0 + (-gt).exp());
-                        }
-                    });
-                }
-            } else {
-                let _ = tiles;
-                // the tile items for the block's tokens a..b (a a multiple of ATT_QT), writing through op (token a's row
-                // of att first), with the output's gate when `gated` (the GPU's tokens come back without it)
-                let run_tiles = |a: usize, b: usize, op: SyncPtr<f32>, gated: bool| {
-                    each((b - a).div_ceil(ATT_QT) * groups, &|it| {
-                        let (tile, h0) = (it / groups, (it % groups) * hpi);
-                        let (t0, t1) = (a + tile * ATT_QT, (a + (tile + 1) * ATT_QT).min(b));
-                        let g = h0 / per;
-                        // the item's queries: (token, head) for t0..t1 and h0..h0 + hpi, query j = (t - t0) * hpi + (hh - h0)
-                        let nq = (t1 - t0) * hpi;
-                        let tok = |j: usize| t0 + j / hpi;
-                        let head = |j: usize| h0 + j % hpi;
-                        // each query's first key, and the item's span of keys
-                        let lo_of = |t: usize| {
-                            let pos = pos0 as usize + t;
-                            if swa { (pos + 1).saturating_sub(h.window) } else { 0 }
-                        };
-                        let (span_lo, span_hi) = (lo_of(t0), pos0 as usize + t1 - 1);
-                        let width = span_hi + 1 - span_lo;
-                        // the scores, a row of width a query (query j's own keys lo_of(t)..=pos at their offsets)
-                        let mut sc = vec![0.0f32; nq * width];
-                        let mut bias = vec![0.0f32; nq * h.extent];
-                        for j in 0..nq {
-                            let (t, hh) = (tok(j), head(j));
-                            let rh = &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr];
-                            for (d, b) in bias[j * h.extent..(j + 1) * h.extent].iter_mut().enumerate() {
-                                *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
-                            }
-                        }
-                        for p in span_lo..=span_hi {
-                            let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
-                            if hpi == 3 && att3() & 1 != 0 {
-                                // a token's three heads share the key row (dot3: each the same steps as dot)
-                                for t in t0..t1 {
-                                    let pos = pos0 as usize + t;
-                                    if p < lo_of(t) || p > pos {
-                                        continue;
-                                    }
-                                    let d = pos - p;
-                                    let qr = |x: usize| &q[t * qd + (h0 + x) * hd..t * qd + (h0 + x + 1) * hd];
-                                    let ds = dot3([qr(0), qr(1), qr(2)], k);
-                                    for (x, dv) in ds.iter().enumerate() {
-                                        let (j, hh) = ((t - t0) * 3 + x, h0 + x);
-                                        let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
-                                        sc[j * width + (p - span_lo)] = dv * scale + (b - sink[t * nh + hh]);
-                                    }
-                                }
-                                continue;
-                            }
-                            for j in 0..nq {
-                                let (t, hh) = (tok(j), head(j));
-                                let pos = pos0 as usize + t;
-                                if p < lo_of(t) || p > pos {
-                                    continue;
-                                }
-                                let d = pos - p;
-                                let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
-                                let qh = &q[t * qd + hh * hd..t * qd + (hh + 1) * hd];
-                                sc[j * width + (p - span_lo)] = dot(qh, k) * scale + (b - sink[t * nh + hh]);
-                            }
-                        }
-                        // each query's softmax over its own keys, in position order, with the sink's zero beside them
-                        let mut sums = vec![0.0f32; nq];
-                        for j in 0..nq {
-                            let t = tok(j);
-                            let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                            let row = &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
-                            let mut mx = 0.0f32;
-                            for &v in row.iter() {
-                                mx = mx.max(v);
-                            }
-                            let mut sum = (-mx).exp();
-                            for v in row.iter_mut() {
-                                *v = (*v - mx).exp();
-                                sum += *v;
-                            }
-                            sums[j] = sum;
-                        }
-                        // the values: each query's weights (score / sum, as before), then its output VS numbers at a time
-                        // held in registers over all its positions, in position order (the same sums), stored once (the
-                        // output row was loaded and stored again for every position: box 1, 27 Nov, a third of a prompt
-                        // block's attention)
-                        for j in 0..nq {
-                            let t = tok(j);
-                            let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                            let s = sums[j];
-                            for w in &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)] {
-                                *w /= s;
-                            }
-                        }
-                        if hpi == 3 && hd.is_multiple_of(16) && att3() & 2 != 0 {
-                            // a token's three heads have the same keys, so each value row is read once for them
-                            for t in t0..t1 {
-                                let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                                let j = (t - t0) * 3;
-                                let ws = |x: usize| {
-                                    &sc[(j + x) * width + (lo - span_lo)..(j + x) * width + (pos + 1 - span_lo)]
-                                };
-                                // SAFETY: item it owns heads h0..h0 + 3 of token t's row of att
-                                let o3 = unsafe { op.slice((t - a) * qd + h0 * hd, 3 * hd) };
-                                value_sums3(o3, [ws(0), ws(1), ws(2)], lo, cv, g, cap, hd);
-                            }
-                        } else {
-                            for j in 0..nq {
-                                let (t, hh) = (tok(j), head(j));
-                                let (lo, pos) = (lo_of(t), pos0 as usize + t);
-                                // SAFETY: item it owns heads h0..h0 + hpi of tokens t0..t1's rows of att
-                                let oh = unsafe { op.slice((t - a) * qd + hh * hd, hd) };
-                                let ws = &sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
-                                value_sums(oh, ws, lo, cv, g, cap, hd);
-                            }
-                        }
-                        // the output's gate
-                        for j in (0..nq).filter(|_| gated) {
-                            let (t, hh) = (tok(j), head(j));
-                            // SAFETY: as above
-                            let oh = unsafe { op.slice((t - a) * qd + hh * hd, hd) };
-                            for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
-                                *a *= 1.0 / (1.0 + (-g).exp());
-                            }
-                        }
-                    });
-                };
-                // TORC_GPU_ATTN=1: the GPU takes the block's first tokens (its scores with the same bias by distance
-                // and sink, from the 16-bit copy; not bit-identical) while the tile items do the rest here
-                #[cfg(feature = "gpu")]
-                let on_gpu = match st.gkv.as_ref() {
-                    Some(gkv) => {
-                        let ink = crate::gpu::InkExtras { rel: &rel, relb: &ly.rel_bias, snq: &sink };
-                        let w = if swa { h.window } else { 0 };
-                        crate::gpu::run_block_ink(
-                            gkv,
-                            (nh, nkv, hd, scale, w),
-                            &ink,
-                            &q,
-                            qd,
-                            n,
-                            pos0 as usize,
-                            &mut att,
-                            &mut |a, b, o: &mut [f32]| run_tiles(a, b, SyncPtr::new(o), false),
-                        )
-                    }
-                    None => None,
-                };
-                #[cfg(not(feature = "gpu"))]
-                let on_gpu: Option<usize> = None;
-                match on_gpu {
-                    Some(hi) => {
-                        if let Some(gkv) = st.gkv.as_mut() {
-                            gkv.gpu_lo = hi;
-                        }
-                        let gp = SyncPtr::new(&mut att);
-                        each(n, &|t| {
-                            // SAFETY: item t owns token t's row of att
-                            let o = unsafe { gp.slice(t * qd, qd) };
-                            for (a, g) in o.iter_mut().zip(&gate[t * qd..(t + 1) * qd]) {
-                                *a *= 1.0 / (1.0 + (-g).exp());
-                            }
-                        });
-                    }
-                    None => run_tiles(0, n, ap, true),
-                }
-            }
         }
         lap.lap(4);
         let mut out = vec![0.0f32; n * dm];
@@ -1865,8 +1350,8 @@ impl Ink {
         }
         // a block's experts (those not on the NPU) as one wave, as the shared MoE layer runs them (moe::run_ejobs):
         // every expert's gate and up chunks in one sweep of the pool, then every token's SITU, then every down chunk,
-        // instead of an expert at a time with three fork-joins each (13900K, 4.3k prompt, 27 Nov: the experts ~33 s
-        // of 79 at ~350 G multiply-adds a second). The same products and the same SITU, so the same bits.
+        // instead of an expert at a time with three fork-joins each. The same products and the same SITU, so the same
+        // bits.
         // TORC_INK_WAVE=0 keeps an expert at a time.
         let wave = n > 1 && !crate::switches::is("TORC_INK_WAVE", "0");
         if wave {
@@ -1976,19 +1461,4 @@ impl Ink {
         lap.lap(8);
         Ok(())
     }
-}
-
-/// TORC_ATT3: which three-head attention kernels run (the same bits either way), bits 1 a prompt block's scores
-/// (dot3), 2 its value sums (value_sums3), 4 one token's scores (dot3). Default by what measured faster (27 Nov, 4.3k
-/// prompt's attention): ARM all (box 1: scores 23.6 -> 18.9 s, value sums -> 19.3 s, one token level); x86 the value
-/// sums alone (13900K: dot3 14.3 -> 17.1 s, value sums -> 13.5 s; the 12600K gained from both, the 13900K did not)
-fn att3() -> u32 {
-    static A: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *A.get_or_init(|| {
-        crate::switches::get("TORC_ATT3").and_then(|v| v.parse().ok()).unwrap_or(if cfg!(target_arch = "aarch64") {
-            7
-        } else {
-            2
-        })
-    })
 }

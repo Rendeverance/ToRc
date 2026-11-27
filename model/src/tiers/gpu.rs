@@ -641,8 +641,8 @@ fn run_with(
     cpu: &mut dyn FnMut(usize, usize, &mut [f32]),
 ) -> Option<usize> {
     let (min, from) = *LIMITS;
-    // Inkling's blocks go to the card from the first one unless TORC_GPU_FROM says otherwise (R9700, 27 Nov: a 4.3k
-    // prompt read 53.8 -> 61.7 tok/s with every block there, 55.0 with the shared default of 4096 keys)
+    // Inkling's blocks go to the card from the first one unless TORC_GPU_FROM says otherwise (its short prompts gain
+    // from the card too, unlike the shared default of 4096 keys)
     let from = if ink.is_some() && !crate::switches::given("TORC_GPU_FROM") { 0 } else { from };
     if n < min || pos0 + n < from || OFF.load(Ordering::Relaxed) {
         return None;

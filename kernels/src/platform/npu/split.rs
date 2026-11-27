@@ -382,7 +382,7 @@ impl Npu {
     /// activation as it was, when the backend does not take tanh or mul.
     pub fn set_situ(&mut self, beta: f32, lb: f32) -> bool {
         let f = &self.g.f;
-        // room for the five objects below (a context too small for them aborts in ggml: box 1, 27 Nov)
+        // room for the five objects below (a context too small for them aborts in ggml)
         let c = self.g.meta_ctx(8, false);
         if c.is_null() {
             return false;

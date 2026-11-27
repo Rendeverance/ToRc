@@ -696,8 +696,8 @@ unsafe fn dot_multi_rows(
     // Q8_0 the same way (the resident Q8_0 products: ssm_out, k, v and the shared expert), and MXFP4 (gpt-oss's
     // experts) and IQ4_NL (the Inkling and Flash Next experts) by the packed GEMM alone, with the same bits as
     // x86mm's lanes_pass (parity test). IQ4_NL went through x86mm alone before, which reads a row's weights again for
-    // every 4 vectors: a prompt's experts were bound by memory and did not gain from threads (13900K, Inkling, 26 Nov:
-    // reading 46-50 tok/s at 8 to 32 threads, the experts 56% of it). TORC_GEMM_IQ4=0 keeps x86mm
+    // every 4 vectors, so a prompt's experts were bound by memory and gained nothing from more threads. TORC_GEMM_IQ4=0
+    // keeps x86mm
     #[cfg(target_arch = "x86_64")]
     static IQ4: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !crate::switches::is("TORC_GEMM_IQ4", "0"));
     #[cfg(target_arch = "x86_64")]
