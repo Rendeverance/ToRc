@@ -652,6 +652,10 @@ fn run_with(
     if hd % 64 != 0 || hd > 576 || nkv == 0 || nh % nkv != 0 || nh / nkv > 64 || qd != nh * hd || kv.cap == 0 {
         return None;
     }
+    // the card's kernels read int8 or sixteen-bit rows by position: an f32 cache or a ring (TORC_KV) stays on the CPU
+    if kv.fmt() == crate::attn::KvFmt::F32 || kv.ring {
+        return None;
+    }
     let k16 = !kv.k16.is_empty();
     // the indexer's picks for this block's tokens (qwen4exp), as attn.rs's select_of hands them to the CPU kernel
     let qsa = kv.qsa && kv.ix_npool > 0 && kv.nv.len() >= n && kv.sel.len() >= n * kv.ix_npool;

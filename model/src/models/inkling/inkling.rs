@@ -216,6 +216,10 @@ struct Pass {
     /// TORC_GPU_ATTN=1 (gpu builds): the same keys and values at 16 bits with a scale a row, as the GPU tier takes
     /// them (gpu::run_block_ink), kept beside the f32 ones
     gkv: Option<crate::attn::KvCache>,
+    /// TORC_KV (f32, 16 or 8): the keys and values in a shared cache of that format, a ring on a sliding-window pass
+    /// that keeps one, and attention on the shared engine (fattn::run_block_ex with Inkling's extras); k and v are
+    /// then empty. Unset: None, and Inkling's own kernels on k and v.
+    kc: Option<crate::attn::KvCache>,
 }
 
 /// Whether prompt blocks' attention may go to the GPU tier (a gpu build with TORC_GPU_ATTN=1).
@@ -750,6 +754,9 @@ impl Ink {
         let ring = (!crate::switches::is("TORC_INK_RING", "0") && !gpu_attn())
             .then_some(h.window + BLOCK_MAX + RING_SLACK)
             .filter(|&c| c < n_ctx as usize);
+        // TORC_KV: the shared engine's cache and attention (with TORC_GPU_ATTN the card keeps its 16-bit copy beside
+        // it, and the shared engine runs the CPU's share of each block)
+        let kvf = crate::attn::kv_switch()?;
         let span = h.loop_end - h.loop_start;
         let pass = (0..h.n_pass)
             .map(|s| {
@@ -758,12 +765,19 @@ impl Ink {
                     Some(c) if h.swa[l] => c,
                     _ => n_ctx as usize,
                 };
+                let kc = kvf.map(|f| {
+                    let mut c = crate::attn::KvCache::with_fmt(h.n_head_kv, h.head_dim, cap, f);
+                    c.ring = cap < n_ctx as usize;
+                    c
+                });
+                let own = if kc.is_some() { 0 } else { cap * kvd };
                 Pass {
-                    k: vec![0.0; cap * kvd],
-                    v: vec![0.0; cap * kvd],
+                    k: vec![0.0; own],
+                    v: vec![0.0; own],
                     cap,
                     hist: vec![0.0; 3 * (2 * kvd + 2 * dm)],
                     gkv: gpu_attn().then(|| crate::attn::KvCache::with(h.n_head_kv, h.head_dim, cap, true)),
+                    kc,
                 }
             })
             .collect();
@@ -833,25 +847,36 @@ impl Ink {
     /// (kept_rows), a key head at a time. As bytes: npos and conv's length (u32), then the f32s.
     pub fn state_bytes_at(&self, npos: usize, conv: &[f32]) -> Vec<u8> {
         let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
-        let mut v: Vec<f32> = conv.to_vec();
+        let mut b = Vec::new();
+        b.extend((npos as u32).to_le_bytes());
+        b.extend((conv.len() as u32).to_le_bytes());
+        for x in conv {
+            b.extend(x.to_le_bytes());
+        }
         for (s, p) in self.pass.iter().enumerate() {
             let rows = self.kept_rows(s, npos);
-            for c in [&p.k, &p.v] {
+            for which in [false, true] {
                 for g in 0..nkv {
                     for q in rows.clone() {
+                        // TORC_KV: the shared cache's rows in its format (f32 rows are the same bytes as below)
+                        if let Some(kc) = &p.kc {
+                            kc.put_row_bytes(g, q, hd, which, &mut b);
+                            continue;
+                        }
                         let at = (g * p.cap + q % p.cap) * hd;
-                        v.extend_from_slice(&c[at..at + hd]);
+                        for x in &(if which { &p.v } else { &p.k })[at..at + hd] {
+                            b.extend(x.to_le_bytes());
+                        }
                     }
                 }
             }
         }
-        let mut b = Vec::with_capacity(8 + v.len() * 4);
-        b.extend((npos as u32).to_le_bytes());
-        b.extend((conv.len() as u32).to_le_bytes());
-        for x in v {
-            b.extend(x.to_le_bytes());
-        }
         b
+    }
+
+    /// The bytes of one cache row of pass `s` in state_bytes_at.
+    fn row_bytes(&self, s: usize) -> usize {
+        self.pass[s].kc.as_ref().map_or(4 * self.h.head_dim, |kc| kc.row_bytes(self.h.head_dim))
     }
 
     /// Puts state_bytes_at back: the convolution state, and the keys and values at their positions. Fails, leaving
@@ -860,27 +885,36 @@ impl Ink {
         let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
         let word = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()) as usize;
         let conv_len: usize = self.pass.iter().map(|p| p.hist.len()).sum();
-        let rows: usize = (0..self.pass.len()).map(|s| self.kept_rows(s, npos).len()).sum();
+        let kv_bytes: usize =
+            (0..self.pass.len()).map(|s| 2 * nkv * self.kept_rows(s, npos).len() * self.row_bytes(s)).sum();
         if npos > self.n_ctx as usize
-            || b.len() != 8 + 4 * (conv_len + 2 * nkv * hd * rows)
+            || b.len() < 8
+            || b.len() != 8 + 4 * conv_len + kv_bytes
             || word(0) != npos
             || word(1) != conv_len
         {
             return err("a saved chat of another shape or length");
         }
-        let f: Vec<f32> = b[8..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-        self.set_conv_state(&f[..conv_len])?;
-        let mut at = conv_len;
+        let conv: Vec<f32> =
+            b[8..8 + 4 * conv_len].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        self.set_conv_state(&conv)?;
+        let mut at = 8 + 4 * conv_len;
         for s in 0..self.pass.len() {
-            let r = self.kept_rows(s, npos);
+            let (r, rb) = (self.kept_rows(s, npos), self.row_bytes(s));
             let p = &mut self.pass[s];
-            for which in 0..2 {
+            for which in [false, true] {
                 for g in 0..nkv {
                     for q in r.clone() {
-                        let o = (g * p.cap + q % p.cap) * hd;
-                        let c = if which == 0 { &mut p.k } else { &mut p.v };
-                        c[o..o + hd].copy_from_slice(&f[at..at + hd]);
-                        at += hd;
+                        if let Some(kc) = p.kc.as_mut() {
+                            kc.set_row_bytes(g, q, hd, which, &b[at..at + rb]);
+                        } else {
+                            let o = (g * p.cap + q % p.cap) * hd;
+                            let c = if which { &mut p.v } else { &mut p.k };
+                            for (x, w) in c[o..o + hd].iter_mut().zip(b[at..at + rb].chunks_exact(4)) {
+                                *x = f32::from_le_bytes(w.try_into().unwrap());
+                            }
+                        }
+                        at += rb;
                     }
                 }
             }
@@ -1199,6 +1233,8 @@ impl Ink {
         convolve(&mut vv, n, kvd, &ly.v_conv, (!swa).then_some((&vtap[..], nkv)), hv);
         // the clips and norms, the keys and values into the cache
         let cap = st.cap;
+        // TORC_KV: the rows go to the shared cache after the loop (Inkling's own k and v are empty)
+        let own = st.kc.is_none();
         {
             let (qp, rp) = (SyncPtr::new(&mut q), SyncPtr::new(&mut rel));
             let (kp, vp) = (SyncPtr::new(&mut kk), SyncPtr::new(&mut vv));
@@ -1235,9 +1271,11 @@ impl Ink {
                 }
                 for g in 0..nkv {
                     let slot = (g * cap + pos % cap) * hd;
-                    unsafe {
-                        ck.slice(slot, hd).copy_from_slice(&kt[g * hd..(g + 1) * hd]);
-                        cv.slice(slot, hd).copy_from_slice(&vt[g * hd..(g + 1) * hd]);
+                    if own {
+                        unsafe {
+                            ck.slice(slot, hd).copy_from_slice(&kt[g * hd..(g + 1) * hd]);
+                            cv.slice(slot, hd).copy_from_slice(&vt[g * hd..(g + 1) * hd]);
+                        }
                     }
                     if let Some((k16, v16, ks, vs)) = gk {
                         let r = g * cap + pos % cap;
@@ -1250,11 +1288,71 @@ impl Ink {
                 }
             });
         }
+        if let Some(kc) = st.kc.as_mut() {
+            for t in 0..n {
+                for g in 0..nkv {
+                    let r = t * kvd + g * hd..t * kvd + (g + 1) * hd;
+                    kc.put_row(g, pos0 as usize + t, hd, &kk[r.clone()], &vv[r]);
+                }
+            }
+        }
         lap.lap(3);
         // 3. attention: each head's scores over the keys it sees, plus the bias by distance less the query's sink
         // logit, softmaxed with the sink's zero beside them
         let mut att = vec![0.0f32; n * qd];
-        {
+        if let Some(kc) = st.kc.as_ref() {
+            // TORC_KV: the shared engine (fattn.rs) with Inkling's bias by distance and per-token sink (Extras), on the
+            // shared cache; then the output's gate. Not the own kernels' bits (another order of adding)
+            let (scale, win) = (1.0 / (hd as f32).sqrt(), if swa { h.window } else { 0 });
+            let f = crate::fattn::Fattn::new(nh, nkv, hd, Some(scale), win);
+            // tokens a..b's extras (their rows of the relative vectors and sinks)
+            let ex = |a: usize, b: usize| crate::fattn::Extras {
+                rel: &rel[a * nh * nr..b * nh * nr],
+                relb: &ly.rel_bias,
+                nr,
+                ext: h.extent,
+                sink: &sink[a * nh..b * nh],
+            };
+            // TORC_GPU_ATTN=1: the card takes the block's first tokens from its 16-bit copy, the shared engine the rest
+            #[cfg(feature = "gpu")]
+            let on_gpu = match st.gkv.as_ref() {
+                Some(gkv) => {
+                    let ink = crate::gpu::InkExtras { rel: &rel, relb: &ly.rel_bias, snq: &sink };
+                    crate::gpu::run_block_ink(
+                        gkv,
+                        (nh, nkv, hd, scale, win),
+                        &ink,
+                        &q,
+                        qd,
+                        n,
+                        pos0 as usize,
+                        &mut att,
+                        &mut |a, b, o: &mut [f32]| {
+                            f.run_block_ex(kc, &q[a * qd..], qd, b - a, pos0 + a as u32, o, None, Some(&ex(a, b)))
+                        },
+                    )
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "gpu"))]
+            let on_gpu: Option<usize> = None;
+            match on_gpu {
+                Some(hi) => {
+                    if let Some(gkv) = st.gkv.as_mut() {
+                        gkv.gpu_lo = hi;
+                    }
+                }
+                None => f.run_block_ex(kc, &q, qd, n, pos0, &mut att, None, Some(&ex(0, n))),
+            }
+            let gp = SyncPtr::new(&mut att);
+            each(n, &|t| {
+                // SAFETY: item t owns token t's row of att
+                let o = unsafe { gp.slice(t * qd, qd) };
+                for (a, g) in o.iter_mut().zip(&gate[t * qd..(t + 1) * qd]) {
+                    *a *= 1.0 / (1.0 + (-g).exp());
+                }
+            });
+        } else {
             let ap = SyncPtr::new(&mut att);
             let (ck, cv) = (&st.k, &st.v);
             let scale = 1.0 / (hd as f32).sqrt();

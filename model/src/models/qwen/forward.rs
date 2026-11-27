@@ -181,6 +181,11 @@ impl Model {
         crate::tune::set_reads_block();
         // the tiled attention path is this architecture's default on ARM (fattn::set_tile_default)
         crate::fattn::set_tile_default(h.arch == "qwen35moe");
+        // TORC_KV (the attention cache's format, attn::kv_switch): a bad value refuses the load, and deepseek2's latent
+        // attention (mla.rs) keeps its own
+        if crate::attn::kv_switch()?.is_some() && h.mla.is_some() {
+            return Err(format::Error("TORC_KV: not for multi-head latent attention (deepseek2)".into()));
+        }
         crate::pipe::set_shape(h.n_layer, h.d_model, h.hc);
         crate::pipe::set_ident(
             &w.file.header.model_id,

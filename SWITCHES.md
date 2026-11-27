@@ -42,6 +42,7 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_LARGE_LAYERS` | setting | `a-b`: TORC_EXPERTS_LARGE copies only layers a..b (a two-machine Inkling's share; the rest stay untouched in the mapping) |
 | `TORC_INK_WAVE` | development | Inkling: `0` runs a prompt block's experts one at a time instead of as one wave (same bits) |
 | `TORC_INK_RING` | development | Inkling: `0` keeps every position in the sliding-window layers' cache; by default they keep a ring of their window plus 5,120 positions (same bits; going back to a saved mark further than that reads the prompt again). Off with `TORC_GPU_ATTN` |
+| `TORC_KV` | development | the attention cache's format: `f32`, `16` (sixteen-bit integers, a scale a row) or `8` (int8, a scale a row). Inkling: set, its attention runs on the shared engine (fattn.rs, with its bias by distance and per-token sink) on a cache of that format; unset, on its own f32 kernels (not the same bits as the shared engine). The Qwen family: replaces its default (int8; sixteen bits for qwen4exp); not deepseek2. An f32 cache keeps attention on the CPU (the GPU tier takes 8 and 16) |
 | `TORC_GEMM_MIN`, `TORC_PACKED_MIN`, `TORC_GEMM_IQ4` | development | from how many vectors the packed matrix kernels take over; `TORC_GEMM_IQ4=0` keeps x86 IQ4_NL on the row kernels |
 | `TORC_MULTI`, `TORC_GROUPED`, `TORC_GROUPED_MAX` | development | multi-vector and grouped expert products |
 | `TORC_RC`, `TORC_RC_WIDE` | development | rows per task in the row-split products |

@@ -196,6 +196,8 @@ impl MtpBlock {
             eat(std::slice::from_raw_parts(kv.v.as_ptr() as *const u8, kv.v.len()));
             eat(std::slice::from_raw_parts(kv.k16.as_ptr() as *const u8, kv.k16.len() * 2));
             eat(std::slice::from_raw_parts(kv.v16.as_ptr() as *const u8, kv.v16.len() * 2));
+            eat(std::slice::from_raw_parts(kv.k32.as_ptr() as *const u8, kv.k32.len() * 4));
+            eat(std::slice::from_raw_parts(kv.v32.as_ptr() as *const u8, kv.v32.len() * 4));
             eat(std::slice::from_raw_parts(kv.k_scale.as_ptr() as *const u8, kv.k_scale.len() * 4));
             eat(std::slice::from_raw_parts(kv.v_scale.as_ptr() as *const u8, kv.v_scale.len() * 4));
         }

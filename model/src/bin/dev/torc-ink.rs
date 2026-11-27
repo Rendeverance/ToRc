@@ -29,7 +29,8 @@ fn read_f32(path: &str) -> Vec<f32> {
 }
 
 /// Two runs' logits compared position by position: how many positions differ in any bit, how many pick another
-/// greedy token, and the biggest gap. True when no bit differs.
+/// greedy token, the biggest gap, and KL(b || a) (b the reference) as the mean and the largest over the positions.
+/// True when no bit differs.
 fn compare(a: &[f32], b: &[f32], nv: usize, what: &str) -> bool {
     let n = a.len().min(b.len()) / nv;
     let differ = (0..n)
@@ -39,7 +40,22 @@ fn compare(a: &[f32], b: &[f32], nv: usize, what: &str) -> bool {
         .count();
     let picks = (0..n).filter(|&p| argmax(&a[p * nv..(p + 1) * nv]) != argmax(&b[p * nv..(p + 1) * nv])).count();
     let gap = a[..n * nv].iter().zip(&b[..n * nv]).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-    println!("{what}: {differ} of {n} positions differ in some bit, {picks} pick another token, biggest gap {gap:.3e}");
+    // in f64: each row's log-softmax, then sum over the vocabulary of p_b (log p_b - log p_a)
+    let kl = |p: usize| {
+        let (x, y) = (&a[p * nv..(p + 1) * nv], &b[p * nv..(p + 1) * nv]);
+        let lse = |v: &[f32]| {
+            let m = v.iter().fold(f32::NEG_INFINITY, |m, &z| m.max(z)) as f64;
+            m + v.iter().map(|&z| (z as f64 - m).exp()).sum::<f64>().ln()
+        };
+        let (la, lb) = (lse(x), lse(y));
+        y.iter().zip(x).map(|(&yb, &xa)| (yb as f64 - lb).exp() * ((yb as f64 - lb) - (xa as f64 - la))).sum::<f64>()
+    };
+    let kls: Vec<f64> = (0..n).map(kl).collect();
+    let (mean, worst) = (kls.iter().sum::<f64>() / n.max(1) as f64, kls.iter().cloned().fold(0.0f64, f64::max));
+    println!(
+        "{what}: {differ} of {n} positions differ in some bit, {picks} pick another token, biggest gap {gap:.3e}, \
+         KL mean {mean:.3e} max {worst:.3e}"
+    );
     differ == 0
 }
 

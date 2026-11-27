@@ -41,6 +41,40 @@ pub struct Sel<'a> {
     pub kp: usize,
 }
 
+/// Per-token extras of a model whose scores carry more than the keys (Inkling 2): each (token j, query head h) has a
+/// bias by distance d = (its position - the key's) for d < `ext`, the dot of the table's row d (relb[d nr..]) with its
+/// own vector rel[(j n_head + h) nr..], added to the score; and a sink of its own, sink[j n_head + h], a logit that
+/// takes a share of the softmax and points at no value (as gpt-oss's per-head sinks). Rows are the call's tokens.
+pub struct Extras<'a> {
+    pub rel: &'a [f32],
+    pub relb: &'a [f32],
+    pub nr: usize,
+    pub ext: usize,
+    pub sink: &'a [f32],
+}
+
+impl Extras<'_> {
+    /// The bias of (token j, query head h) at distance d (< ext): the table row's dot with the token's vector, eight
+    /// lanes of fused multiply-adds folded as fold8 (and a plain chain for a tail below eight).
+    #[inline(always)]
+    fn bias(&self, nh: usize, j: usize, h: usize, d: usize) -> f32 {
+        let nr = self.nr;
+        let (a, b) = (&self.rel[(j * nh + h) * nr..(j * nh + h + 1) * nr], &self.relb[d * nr..(d + 1) * nr]);
+        let mut acc = [0.0f32; 8];
+        let whole = nr / 8 * 8;
+        for i in (0..whole).step_by(8) {
+            for l in 0..8 {
+                acc[l] = a[i + l].mul_add(b[i + l], acc[l]);
+            }
+        }
+        let mut s = fold8(&acc);
+        for i in whole..nr {
+            s = a[i].mul_add(b[i], s);
+        }
+        s
+    }
+}
+
 /// The first stage's results for one call: per (page, token, query head), with pages counted from the call's first
 /// page, the largest score and the weight sum (`stat`, two numbers) and the weighted value sum (`acc`, head_dim
 /// numbers).
@@ -98,7 +132,7 @@ fn fast_on() -> bool {
 /// Whether fast::scores takes this cache and head width: int8 keys, and a head of at most 256 numbers in whole
 /// sixteens (so a score's integer sum stays inside 32 bits: 256 x 127 x 32767 is under 2^31).
 fn fast_fits(kv: &KvCache, hd: usize) -> bool {
-    kv.k16.is_empty() && hd <= fast::HD_MAX && hd.is_multiple_of(16)
+    kv.k16.is_empty() && kv.k32.is_empty() && hd <= fast::HD_MAX && hd.is_multiple_of(16)
 }
 
 /// The gate of the packed fast scores (fast::scores_packed, ARM): the fast scores apply, this is an i8mm
@@ -682,7 +716,9 @@ fn fold8(a: &[f32; 8]) -> f32 {
 
 /// A cache row as f32 (exact), without its scale applied (the tests' reference and run_block_exact).
 fn row_f32(kv: &KvCache, v: bool, at: usize, hd: usize, out: &mut [f32]) {
-    if kv.k16.is_empty() {
+    if !kv.k32.is_empty() {
+        out[..hd].copy_from_slice(if v { &kv.v32[at..at + hd] } else { &kv.k32[at..at + hd] });
+    } else if kv.k16.is_empty() {
         let b = if v { &kv.v } else { &kv.k };
         for (o, &x) in out.iter_mut().zip(&b[at..at + hd]) {
             *o = x as f32;
@@ -750,10 +786,10 @@ impl Fattn {
                             let qv = &q[t * qd + h * hd..t * qd + (h + 1) * hd];
                             let sc: Vec<f64> = (lo(p)..=p)
                                 .map(|j| {
-                                    row_f32(kv, false, (kh * kv.cap + j) * hd, hd, &mut row);
+                                    row_f32(kv, false, (kh * kv.cap + kv.slot(j)) * hd, hd, &mut row);
                                     qv.iter().zip(&row).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>()
                                         * self.scale as f64
-                                        * kv.k_scale[kh * kv.cap + j] as f64
+                                        * kv.k_scale[kh * kv.cap + kv.slot(j)] as f64
                                 })
                                 .collect();
                             let m = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -761,8 +797,8 @@ impl Fattn {
                             let z: f64 = w.iter().sum();
                             let ot = &mut o[t * hd..(t + 1) * hd];
                             for (k, j) in (lo(p)..=p).enumerate() {
-                                row_f32(kv, true, (kh * kv.cap + j) * hd, hd, &mut row);
-                                let c = w[k] / z * kv.v_scale[kh * kv.cap + j] as f64;
+                                row_f32(kv, true, (kh * kv.cap + kv.slot(j)) * hd, hd, &mut row);
+                                let c = w[k] / z * kv.v_scale[kh * kv.cap + kv.slot(j)] as f64;
                                 for d in 0..hd {
                                     ot[d] += c * row[d] as f64;
                                 }
@@ -795,10 +831,36 @@ impl Fattn {
         out: &mut [f32],
         sel: Option<&Sel>,
     ) {
+        self.run_block_ex(kv, q, qd, n, pos0, out, sel, None)
+    }
+
+    /// run_block with a model's per-token extras (Extras: a bias by distance and a sink a token). A ring cache
+    /// (KvCache::ring) is read at p % cap; it needs a window, cap in whole pages, and the window and the block within
+    /// cap (so no position the block sees was overwritten by its own writes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_block_ex(
+        &self,
+        kv: &KvCache,
+        q: &[f32],
+        qd: usize,
+        n: usize,
+        pos0: u32,
+        out: &mut [f32],
+        sel: Option<&Sel>,
+        ex: Option<&Extras>,
+    ) {
         let (hd, nh, nkv) = (self.head_dim, self.n_head, self.n_head_kv);
         let group = nh / nkv;
         let pos0 = pos0 as usize;
-        assert!(qd == nh * hd && q.len() >= n * qd && out.len() >= n * qd && pos0 + n <= kv.cap);
+        assert!(qd == nh * hd && q.len() >= n * qd && out.len() >= n * qd);
+        if kv.ring {
+            assert!(self.window > 0 && kv.cap.is_multiple_of(PAGE) && n + self.window <= kv.cap && sel.is_none());
+        } else {
+            assert!(pos0 + n <= kv.cap);
+        }
+        if let Some(e) = ex {
+            assert!(e.sink.len() >= n * nh && e.rel.len() >= n * nh * e.nr && e.relb.len() >= e.ext * e.nr);
+        }
         if n == 0 {
             return;
         }
@@ -846,6 +908,7 @@ impl Fattn {
                 &parts,
                 page,
                 sel,
+                ex,
             );
         };
         let op = SyncPtr::new(out);
@@ -854,7 +917,7 @@ impl Fattn {
             // SAFETY: row (j, h) of out belongs to this call alone
             let o = unsafe { op.slice(j * qd + h * hd, hd) };
             // SAFETY: the first stage is complete, so the partials are only read from here on
-            unsafe { self.combine(&parts, (pos0 + j) / PAGE + 1 - first_page, j, h, o) };
+            unsafe { self.combine(&parts, (pos0 + j) / PAGE + 1 - first_page, j, h, o, ex) };
         };
         let rows = n * nh;
         if crate::pool::waits_ok() {
@@ -886,12 +949,15 @@ impl Fattn {
     /// The second stage for one (token j, query head h): the pages 0..pages of its partials combined in page order.
     /// With M the largest of their scores, each page counts with e = expf(m - M): the weight sums add up as fma(e, sum,
     /// total), and the value sums as fma(e, acc[i], o[i]); then each o[i] is divided by the total. A row that saw
-    /// nothing (every page empty) is 0.
+    /// nothing (every page empty) is 0. The sink is the token's own (Extras) when given, else the head's (gpt-oss).
     ///
     /// # Safety
     /// The partials of (j, h) must all be written, and nothing may write them during the call.
-    unsafe fn combine(&self, parts: &Partials, pages: usize, j: usize, h: usize, o: &mut [f32]) {
-        let sink = self.sinks.as_ref().map(|s| s[h]);
+    unsafe fn combine(&self, parts: &Partials, pages: usize, j: usize, h: usize, o: &mut [f32], ex: Option<&Extras>) {
+        let sink = match ex {
+            Some(e) => Some(e.sink[j * self.n_head + h]),
+            None => self.sinks.as_ref().map(|s| s[h]),
+        };
         let mut top = sink.unwrap_or(f32::NEG_INFINITY);
         for p in 0..pages {
             let m = unsafe { parts.stat(p, j, h)[0] };
@@ -941,6 +1007,7 @@ impl Fattn {
         parts: &Partials,
         slot_page: usize,
         sel: Option<&Sel>,
+        ex: Option<&Extras>,
     ) {
         let (hd, group) = (self.head_dim, self.n_head / self.n_head_kv);
         // SAFETY (both): the slots (j, g) of this item's (KV head, page) are its own partials and no other item's
@@ -971,7 +1038,9 @@ impl Fattn {
             let h = kvh * group + g;
             &q[j * qd + h * hd..j * qd + (h + 1) * hd]
         };
-        let base = kvh * kv.cap + page_lo;
+        // the page's first row in the cache (a ring cache keeps position p at p % cap; a page never wraps, as cap is
+        // whole pages)
+        let base = kvh * kv.cap + kv.slot(page_lo);
         // for each slot s: the mask, the largest visible score, the weights and their sum, then times the values'
         // scales (row holds the slot's scores, PAGE wide)
         let post = |s: usize, row: &mut [f32]| {
@@ -985,6 +1054,16 @@ impl Fattn {
                 row[..len].fill(0.0);
                 return;
             };
+            // the token's bias by distance (Extras) on the positions it sees within ext of it
+            if let Some(e) = ex {
+                let (pos, h) = (pos0 + j, kvh * group + g);
+                for (i, x) in row.iter_mut().enumerate().take(to).skip(from) {
+                    let d = pos - (page_lo + i);
+                    if d < e.ext {
+                        *x += e.bias(self.n_head, j, h, d);
+                    }
+                }
+            }
             row[..from].fill(f32::NEG_INFINITY);
             // with a selection, the positions of the pools the token did not pick weigh nothing, and a page with none
             // picked contributes nothing at all (the scores were computed for every row; a masked one gets a weight
@@ -1017,7 +1096,10 @@ impl Fattn {
         // is never read (they go to the fast kernels straight from int8), so an empty kf skips it.
         static MIN: std::sync::LazyLock<usize> =
             std::sync::LazyLock::new(|| crate::switches::num("TORC_ATTN_F32_MIN").unwrap_or(64));
-        let f32c = slot_count >= (*MIN).max(9) && f32_on();
+        // an f32 cache needs no copy: its rows go to the kernels as they are (Row for f32), on every path below but the
+        // tiled one (whose tiles would only copy them)
+        let f32_cache = kv.fmt() == crate::attn::KvFmt::F32;
+        let f32c = !f32_cache && slot_count >= (*MIN).max(9) && f32_on();
         let fast_scores_here = fast_on() && fast_fits(kv, hd);
         // ARM i8mm: with the fast scores and enough slots for the pack to pay (it serves every batch of this
         // item), the page goes to matrix order once and the scores run through fast::scores_packed — the same
@@ -1036,7 +1118,7 @@ impl Fattn {
         // partials, with each slot's chain carried from tile to tile. The scores are per position and the values are
         // chained in position order, so the bits are the same
         #[cfg(target_arch = "aarch64")]
-        if !f32c && slot_count >= tile_min() && f32_on() && tile_on() {
+        if !f32c && !f32_cache && slot_count >= tile_min() && f32_on() && tile_on() {
             const TP: usize = 32;
             let mut st = crate::scratch::buf::<f32>("fattn.st", slot_count * PAGE);
             let mut tf = crate::scratch::buf::<f32>("fattn.tf", TP * hd);
@@ -1425,7 +1507,10 @@ mod portable {
     /// Eight numbers of a cache row (keys, or values when `v`) at `at`, as f32 (exact).
     #[inline(always)]
     pub(super) fn load8(kv: &KvCache, v: bool, at: usize) -> [f32; 8] {
-        if kv.k16.is_empty() {
+        if !kv.k32.is_empty() {
+            let b = if v { &kv.v32 } else { &kv.k32 };
+            std::array::from_fn(|l| b[at + l])
+        } else if kv.k16.is_empty() {
             let b = if v { &kv.v } else { &kv.k };
             std::array::from_fn(|l| b[at + l] as f32)
         } else {
@@ -1556,7 +1641,12 @@ mod neon {
         let (at, n) = (base * hd, nt * hd);
         // SAFETY: conv does its own bounds checks
         unsafe {
-            if kv.k16.is_empty() {
+            if !kv.k32.is_empty() {
+                if !kf.is_empty() {
+                    conv(&kv.k32[at..at + n], kf);
+                }
+                conv(&kv.v32[at..at + n], vf);
+            } else if kv.k16.is_empty() {
                 if !kf.is_empty() {
                     conv(&kv.k[at..at + n], kf);
                 }
@@ -1588,6 +1678,7 @@ mod neon {
         // SAFETY: conv does its own bounds checks
         unsafe {
             match (kv.k16.is_empty(), v) {
+                _ if !kv.k32.is_empty() => conv(if v { &kv.v32[at..at + n] } else { &kv.k32[at..at + n] }, out),
                 (true, false) => conv(&kv.k[at..at + n], out),
                 (true, true) => conv(&kv.v[at..at + n], out),
                 (false, false) => conv(&kv.k16[at..at + n], out),
@@ -1846,7 +1937,10 @@ mod neon {
         // (8 slots as two halves of 4). Each (position, slot) uses the same lanes and order, so the bits are the same
         static ROWS2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switches::on("TORC_ATTN_ROWS2"));
         unsafe {
-            if kv.k16.is_empty() {
+            if !kv.k32.is_empty() {
+                assert!(kv.k32.len() >= at + nt * hd);
+                scores_rows::<NS, f32>(kv.k32.as_ptr().add(at), ks, nt, hd, scale, qp, sc.as_mut_ptr());
+            } else if kv.k16.is_empty() {
                 assert!(kv.k.len() >= at + nt * hd);
                 let k = kv.k.as_ptr().add(at);
                 if *ROWS2 && NS.is_multiple_of(4) {
@@ -1950,7 +2044,10 @@ mod neon {
         let op = out.map(|o| o.as_mut_ptr());
         // SAFETY: rows base..base + nt, the weights and the output rows are in bounds (checked)
         unsafe {
-            if kv.v16.is_empty() {
+            if !kv.v32.is_empty() {
+                assert!(kv.v32.len() >= at + nt * hd);
+                values_rows_from::<NS, f32, true>(kv.v32.as_ptr().add(at), nt, hd, w.as_ptr(), op);
+            } else if kv.v16.is_empty() {
                 assert!(kv.v.len() >= at + nt * hd);
                 values_rows_from::<NS, i8, true>(kv.v.as_ptr().add(at), nt, hd, w.as_ptr(), op);
             } else {
@@ -1975,7 +2072,10 @@ mod neon {
         let op = out.map(|o| o.as_mut_ptr());
         // SAFETY: rows base..base + nt, the weights and the output rows are in bounds (checked)
         unsafe {
-            if kv.v16.is_empty() {
+            if !kv.v32.is_empty() {
+                assert!(kv.v32.len() >= at + nt * hd);
+                values_rows::<NS, f32>(kv.v32.as_ptr().add(at), nt, hd, w.as_ptr(), op);
+            } else if kv.v16.is_empty() {
                 assert!(kv.v.len() >= at + nt * hd);
                 values_rows::<NS, i8>(kv.v.as_ptr().add(at), nt, hd, w.as_ptr(), op);
             } else {
@@ -2115,7 +2215,12 @@ mod x86 {
         let (at, n) = (base * hd, nt * hd);
         // SAFETY: conv does its own bounds checks
         unsafe {
-            if kv.k16.is_empty() {
+            if !kv.k32.is_empty() {
+                if !kf.is_empty() {
+                    conv(&kv.k32[at..at + n], kf);
+                }
+                conv(&kv.v32[at..at + n], vf);
+            } else if kv.k16.is_empty() {
                 if !kf.is_empty() {
                     conv(&kv.k[at..at + n], kf);
                 }
@@ -2290,7 +2395,10 @@ mod x86 {
         let qp = qs.map(|q| q.as_ptr());
         // SAFETY: rows base..base + nt of the cache, hd numbers each, and the query rows are in bounds (checked)
         unsafe {
-            if kv.k16.is_empty() {
+            if !kv.k32.is_empty() {
+                assert!(kv.k32.len() >= at + nt * hd);
+                scores_rows::<NS, f32>(kv.k32.as_ptr().add(at), ks, nt, hd, scale, qp, sc.as_mut_ptr());
+            } else if kv.k16.is_empty() {
                 assert!(kv.k.len() >= at + nt * hd);
                 scores_rows::<NS, i8>(kv.k.as_ptr().add(at), ks, nt, hd, scale, qp, sc.as_mut_ptr());
             } else {
@@ -2360,7 +2468,10 @@ mod x86 {
         let op = out.map(|o| o.as_mut_ptr());
         // SAFETY: rows base..base + nt, the weights and the output rows are in bounds (checked)
         unsafe {
-            if kv.v16.is_empty() {
+            if !kv.v32.is_empty() {
+                assert!(kv.v32.len() >= at + nt * hd);
+                values_rows_from::<NS, f32, true>(kv.v32.as_ptr().add(at), nt, hd, w.as_ptr(), op);
+            } else if kv.v16.is_empty() {
                 assert!(kv.v.len() >= at + nt * hd);
                 values_rows_from::<NS, i8, true>(kv.v.as_ptr().add(at), nt, hd, w.as_ptr(), op);
             } else {
@@ -2385,7 +2496,10 @@ mod x86 {
         let op = out.map(|o| o.as_mut_ptr());
         // SAFETY: rows base..base + nt, the weights and the output rows are in bounds (checked)
         unsafe {
-            if kv.v16.is_empty() {
+            if !kv.v32.is_empty() {
+                assert!(kv.v32.len() >= at + nt * hd);
+                values_rows::<NS, f32>(kv.v32.as_ptr().add(at), nt, hd, w.as_ptr(), op);
+            } else if kv.v16.is_empty() {
                 assert!(kv.v.len() >= at + nt * hd);
                 values_rows::<NS, i8>(kv.v.as_ptr().add(at), nt, hd, w.as_ptr(), op);
             } else {
@@ -2765,6 +2879,131 @@ mod tests {
             let worst = out.iter().zip(&r).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             let scale = r.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             assert!(worst <= 1e-5 * scale.max(1e-3), "nh {nh} nkv {nkv} hd {hd} win {win} n {n}: {worst} of {scale}");
+        }
+    }
+
+    /// An f32 cache (KvFmt::F32) of cap positions with every position below `fill` written (random rows); with `ring`
+    /// it keeps only the last cap of them, written in order through put_row as a model writes them.
+    fn cache_f32(s: &mut u64, nkv: usize, hd: usize, cap: usize, fill: usize, ring: bool) -> (KvCache, Vec<f32>) {
+        let mut kv = KvCache::with_fmt(nkv, hd, cap, crate::attn::KvFmt::F32);
+        kv.ring = ring;
+        // every position's rows (the same random numbers whatever the cache keeps), head by head
+        let rows: Vec<f32> = (0..fill * nkv * 2 * hd).map(|_| 2.0 * rnd(s)).collect();
+        for p in 0..fill {
+            for g in 0..nkv {
+                let at = (p * nkv + g) * 2 * hd;
+                kv.put_row(g, p, hd, &rows[at..at + hd], &rows[at + hd..at + 2 * hd]);
+            }
+        }
+        (kv, rows)
+    }
+
+    /// The definition with Inkling's extras in f64, on the rows as written (cache_f32's): score = q.k scale + the
+    /// bias by distance below ext, and the token's sink as a logit beside them.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_ex(f: &Fattn, rows: &[f32], nkv: usize, q: &[f32], n: usize, pos0: usize, ex: &Extras) -> Vec<f32> {
+        let (hd, g, qd, nh) = (f.head_dim, f.n_head / f.n_head_kv, f.n_head * f.head_dim, f.n_head);
+        let row = |p: usize, kh: usize, v: bool| {
+            let at = (p * nkv + kh) * 2 * hd + if v { hd } else { 0 };
+            &rows[at..at + hd]
+        };
+        let lo = |p: usize| if f.window > 0 { (p + 1).saturating_sub(f.window) } else { 0 };
+        let mut out = vec![0.0f32; n * qd];
+        for t in 0..n {
+            let p = pos0 + t;
+            for h in 0..nh {
+                let kh = h / g;
+                let qv = &q[t * qd + h * hd..t * qd + (h + 1) * hd];
+                let sc: Vec<f64> = (lo(p)..=p)
+                    .map(|j| {
+                        let d = p - j;
+                        let b = if d < ex.ext {
+                            (0..ex.nr)
+                                .map(|i| ex.rel[(t * nh + h) * ex.nr + i] as f64 * ex.relb[d * ex.nr + i] as f64)
+                                .sum::<f64>()
+                        } else {
+                            0.0
+                        };
+                        qv.iter().zip(row(j, kh, false)).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>()
+                            * f.scale as f64
+                            + b
+                    })
+                    .collect();
+                let sink = ex.sink[t * nh + h] as f64;
+                let m = sc.iter().cloned().fold(sink, f64::max);
+                let z: f64 = sc.iter().map(|s| (s - m).exp()).sum::<f64>() + (sink - m).exp();
+                let o = &mut out[t * qd + h * hd..t * qd + (h + 1) * hd];
+                for (k, j) in (lo(p)..=p).enumerate() {
+                    let w = (sc[k] - m).exp() / z;
+                    for (d, &v) in row(j, kh, true).iter().enumerate() {
+                        o[d] += (w * v as f64) as f32;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// TORC_KV=f32 with Inkling's extras: an f32 cache, a bias by distance and a sink a token, against the definition
+    /// in f64; each token alone gives the bits it has in the block; and a ring cache (window layers) gives the bits of
+    /// a cache that keeps every position.
+    #[test]
+    fn f32_cache_with_extras_and_ring() {
+        let _one = one_caller();
+        let mut s = 0x1a2b_3c4d_5e6f_7081u64;
+        // (heads, KV heads, head dim, window, n, pos0, nr, ext): Inkling's GQA of 3, a window with and without, the
+        // bias reaching past the window and stopping short of it, a bias vector with a tail below eight
+        for &(nh, nkv, hd, win, n, pos0, nr, ext) in &[
+            (6usize, 2usize, 64usize, 0usize, 5usize, 700usize, 16usize, 300usize),
+            (6, 2, 64, 300, 9, 2900, 12, 512),
+            (6, 2, 64, 300, 40, 2000, 16, 100),
+            (12, 4, 128, 256, 1, 3333, 32, 1024),
+            (3, 1, 32, 0, 70, 0, 8, 64),
+        ] {
+            let qd = nh * hd;
+            let fill = pos0 + n;
+            let (full, rows) = cache_f32(&mut s, nkv, hd, fill + 3, fill, false);
+            let q: Vec<f32> = (0..n * qd).map(|_| rnd(&mut s)).collect();
+            let rel: Vec<f32> = (0..n * nh * nr).map(|_| rnd(&mut s)).collect();
+            let relb: Vec<f32> = (0..ext * nr).map(|_| 0.3 * rnd(&mut s)).collect();
+            let sink: Vec<f32> = (0..n * nh).map(|_| 2.0 * rnd(&mut s)).collect();
+            let ex = Extras { rel: &rel, relb: &relb, nr, ext, sink: &sink };
+            let f = Fattn::new(nh, nkv, hd, Some(0.09), win);
+            let mut out = vec![0.0f32; n * qd];
+            f.run_block_ex(&full, &q, qd, n, pos0 as u32, &mut out, None, Some(&ex));
+            let r = reference_ex(&f, &rows, nkv, &q, n, pos0, &ex);
+            let worst = out.iter().zip(&r).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let scale = r.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            assert!(worst <= 1e-5 * scale.max(1e-3), "nh {nh} hd {hd} win {win} n {n}: {worst} of {scale}");
+            for t in 0..n {
+                let ex1 = Extras {
+                    rel: &rel[t * nh * nr..(t + 1) * nh * nr],
+                    relb: &relb,
+                    nr,
+                    ext,
+                    sink: &sink[t * nh..(t + 1) * nh],
+                };
+                let mut one = vec![0.0f32; qd];
+                f.run_block_ex(&full, &q[t * qd..(t + 1) * qd], qd, 1, (pos0 + t) as u32, &mut one, None, Some(&ex1));
+                let same = one.iter().zip(&out[t * qd..(t + 1) * qd]).all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "nh {nh} hd {hd} win {win} n {n}: token {t} differs alone");
+            }
+            if win > 0 {
+                // a ring of the fewest whole pages that hold the window and the block
+                let cap = (win + n).div_ceil(PAGE) * PAGE;
+                let (ring, _) = cache_f32(&mut s, nkv, hd, cap, 0, true);
+                let mut ring = ring;
+                for p in 0..fill {
+                    for g in 0..nkv {
+                        let at = (p * nkv + g) * 2 * hd;
+                        ring.put_row(g, p, hd, &rows[at..at + hd], &rows[at + hd..at + 2 * hd]);
+                    }
+                }
+                let mut rout = vec![0.0f32; n * qd];
+                f.run_block_ex(&ring, &q, qd, n, pos0 as u32, &mut rout, None, Some(&ex));
+                let same = rout.iter().zip(&out).all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "nh {nh} hd {hd} win {win} n {n}: the ring of {cap} differs from the whole cache");
+            }
         }
     }
 
@@ -3418,7 +3657,7 @@ mod tests {
                 let kv = &kvs[r % layers];
                 for kvh in 0..nkv {
                     for c in 0..span {
-                        f.item(kv, qf, qd, 0, n, pos0, kvh, c, 0, group, &parts, c, None);
+                        f.item(kv, qf, qd, 0, n, pos0, kvh, c, 0, group, &parts, c, None, None);
                     }
                 }
             }
