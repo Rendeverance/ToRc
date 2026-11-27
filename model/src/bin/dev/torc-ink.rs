@@ -200,6 +200,30 @@ fn main() {
             String::from_utf8_lossy(&text)
         );
     }
+    // TORC_NPU_PROFILE_OUT=file: the experts this run used, as a usage file for TORC_NPU_PROFILE (the NPU's hot set)
+    model::npu::write_profile(m.h.n_layer as u32, m.h.n_expert as u32);
+    // vbench=1,2,4,..: what checking drafts would cost. After the prompt (and any writing), a forward of N tokens at
+    // the next positions, all their logits out, 16 times for each N; ms a call against N = 1 (timing only: the state
+    // after it is not the text's)
+    if let Some(list) = opt("vbench") {
+        let p0 = (ids.len() + gen_n) as u32;
+        let mut base = 0.0f64;
+        for nv_s in list.split(',') {
+            let Ok(k) = nv_s.parse::<usize>() else { continue };
+            let toks: Vec<u32> = ids.iter().copied().cycle().take(k).collect();
+            let mut lg = vec![0.0f32; k * nv];
+            m.forward(&toks, p0, &mut lg, k > 1).unwrap_or_else(|e| fail(e));
+            let t = Instant::now();
+            for _ in 0..16 {
+                m.forward(&toks, p0, &mut lg, k > 1).unwrap_or_else(|e| fail(e));
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / 16.0;
+            if k == 1 {
+                base = ms;
+            }
+            println!("vbench {k} tokens at position {p0}: {ms:.1} ms a call ({:.2}x one token)", ms / base.max(1e-9));
+        }
+    }
     if model::switches::get("TORC_PROF").is_some_and(|v| v != "0") {
         use model::models::inkling::inkling::{PHASES, PROF};
         let ms = |i: usize| PROF[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;

@@ -39,6 +39,11 @@ struct Params { n: u32, pos0: u32, cap: u32, scale: f32, nh: u32, ns: u32, tps: 
 // every position seen)
 /*QSA*/@group(0) @binding(10) var<storage, read> sel: array<u32>;
 /*QSA*/@group(0) @binding(11) var<storage, read> nv: array<u32>;
+// Inkling (lines starting /*INK*/): each unmasked score also gets its distance bias, rel[token][head] . relb[d] for
+// d = pos - key < 1024, less the query's sink snq[token][head] (and the sink logit is a zero: sk is zeros)
+/*INK*/@group(0) @binding(12) var<storage, read> rel: array<f32>;   // [n][nh][16]
+/*INK*/@group(0) @binding(13) var<storage, read> relb: array<f32>;  // [1024][16]
+/*INK*/@group(0) @binding(14) var<storage, read> snq: array<f32>;   // [n][nh]
 
 const TQ: u32 = 64u / GP;
 const ROWS: u32 = TQ * GP;
@@ -157,6 +162,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /*QSA*/                 if (((sel[b / 4u] >> ((b % 4u) * 8u)) & 0xffu) == 0u) { r[i] = -1e30; }
 /*QSA*/             }
 /*QSA*/         }
+/*INK*/         else {
+/*INK*/             let jj = j0 + row / GP;
+/*INK*/             let hh = g * G + row % GP;
+/*INK*/             let d = pos - t;
+/*INK*/             var b = 0.0;
+/*INK*/             if (d < 1024u) {
+/*INK*/                 let ro = (jj * p.nh + hh) * 16u;
+/*INK*/                 for (var e = 0u; e < 16u; e++) { b += relb[d * 16u + e] * rel[ro + e]; }
+/*INK*/             }
+/*INK*/             r[i] += b - snq[jj * p.nh + hh];
+/*INK*/         }
             }
             pt[(tx * 4u + c) * 16u + ty] = r;
         }

@@ -209,6 +209,14 @@ struct Pass {
     v: Vec<f32>,
     cap: usize,
     hist: Vec<f32>,
+    /// TORC_GPU_ATTN=1 (gpu builds): the same keys and values at 16 bits with a scale a row, as the GPU tier takes
+    /// them (gpu::run_block_ink), kept beside the f32 ones
+    gkv: Option<crate::attn::KvCache>,
+}
+
+/// Whether prompt blocks' attention may go to the GPU tier (a gpu build with TORC_GPU_ATTN=1).
+fn gpu_attn() -> bool {
+    cfg!(feature = "gpu") && crate::switches::on("TORC_GPU_ATTN")
 }
 
 /// The time spent in each phase of forward, summed over calls (TORC_PROF=1).
@@ -263,6 +271,108 @@ fn rms(out: &mut [f32], x: &[f32], eps: f32) {
         *o = v * scale;
     }
 }
+
+/// out[e] += ws[i] x (key head g's value row at position lo + i)[e] for i in order: a query's attention output from its
+/// weights. VS numbers of out at a time stay in registers over all the positions (so out is loaded and stored once, not
+/// once a position); each number takes the same fused steps in the same order as a loop over the positions outside,
+/// so the bits are the same.
+fn value_sums(out: &mut [f32], ws: &[f32], lo: usize, cv: &[f32], g: usize, cap: usize, hd: usize) {
+    const VS: usize = 32;
+    if !hd.is_multiple_of(VS) {
+        for (i, &wgt) in ws.iter().enumerate() {
+            let p = lo + i;
+            let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+            for (a, b) in out.iter_mut().zip(v) {
+                *a = wgt.mul_add(*b, *a);
+            }
+        }
+        return;
+    }
+    for c in (0..hd).step_by(VS) {
+        let mut acc = [0.0f32; VS];
+        acc.copy_from_slice(&out[c..c + VS]);
+        for (i, &wgt) in ws.iter().enumerate() {
+            let p = lo + i;
+            let at = (g * cap + p % cap) * hd + c;
+            let v: &[f32; VS] = cv[at..at + VS].try_into().unwrap();
+            for k in 0..VS {
+                acc[k] = wgt.mul_add(v[k], acc[k]);
+            }
+        }
+        out[c..c + VS].copy_from_slice(&acc);
+    }
+}
+
+/// value_sums for three heads with the same positions (a token's heads of one key head): out holds their three rows
+/// of hd, and each value row is read once for the three. Each number takes the same steps as in value_sums. Three
+/// named accumulators (not an array of them), so they stay in registers.
+fn value_sums3(out: &mut [f32], ws: [&[f32]; 3], lo: usize, cv: &[f32], g: usize, cap: usize, hd: usize) {
+    const VS: usize = 16;
+    let len = ws[0].len();
+    let (w0, w1, w2) = (&ws[0][..len], &ws[1][..len], &ws[2][..len]);
+    for c in (0..hd).step_by(VS) {
+        let mut a0: [f32; VS] = out[c..c + VS].try_into().unwrap();
+        let mut a1: [f32; VS] = out[hd + c..hd + c + VS].try_into().unwrap();
+        let mut a2: [f32; VS] = out[2 * hd + c..2 * hd + c + VS].try_into().unwrap();
+        for i in 0..len {
+            let p = lo + i;
+            let at = (g * cap + p % cap) * hd + c;
+            let v: &[f32; VS] = cv[at..at + VS].try_into().unwrap();
+            let (x0, x1, x2) = (w0[i], w1[i], w2[i]);
+            for k in 0..VS {
+                a0[k] = x0.mul_add(v[k], a0[k]);
+                a1[k] = x1.mul_add(v[k], a1[k]);
+                a2[k] = x2.mul_add(v[k], a2[k]);
+            }
+        }
+        out[c..c + VS].copy_from_slice(&a0);
+        out[hd + c..hd + c + VS].copy_from_slice(&a1);
+        out[2 * hd + c..2 * hd + c + VS].copy_from_slice(&a2);
+    }
+}
+
+/// dot's lane sum: the 16 lanes added in pairs (8 apart, then 4, 2, 1), as dot ends.
+#[inline(always)]
+fn lanes16(mut ac: [f32; 16]) -> f32 {
+    let mut w = 16;
+    while w > 1 {
+        w /= 2;
+        for i in 0..w {
+            ac[i] += ac[i + w];
+        }
+    }
+    ac[0]
+}
+
+/// dot for three rows against the same row k: each result the same steps in the same order as dot(a[x], k) (lane i
+/// takes every 16th pair from i, then the lanes are added in pairs), with each part of k read once for the three.
+/// Three named accumulators, so they stay in registers.
+fn dot3(a: [&[f32]; 3], k: &[f32]) -> [f32; 3] {
+    let n = k.len();
+    let (q0, q1, q2) = (&a[0][..n], &a[1][..n], &a[2][..n]);
+    let (mut a0, mut a1, mut a2) = ([0.0f32; 16], [0.0f32; 16], [0.0f32; 16]);
+    let n16 = n / 16 * 16;
+    for c in (0..n16).step_by(16) {
+        let kc: &[f32; 16] = k[c..c + 16].try_into().unwrap();
+        let r0: &[f32; 16] = q0[c..c + 16].try_into().unwrap();
+        let r1: &[f32; 16] = q1[c..c + 16].try_into().unwrap();
+        let r2: &[f32; 16] = q2[c..c + 16].try_into().unwrap();
+        for i in 0..16 {
+            a0[i] = r0[i].mul_add(kc[i], a0[i]);
+            a1[i] = r1[i].mul_add(kc[i], a1[i]);
+            a2[i] = r2[i].mul_add(kc[i], a2[i]);
+        }
+    }
+    for i in 0..n - n16 {
+        a0[i] = q0[n16 + i].mul_add(k[n16 + i], a0[i]);
+        a1[i] = q1[n16 + i].mul_add(k[n16 + i], a1[i]);
+        a2[i] = q2[n16 + i].mul_add(k[n16 + i], a2[i]);
+    }
+    [lanes16(a0), lanes16(a1), lanes16(a2)]
+}
+
+/// Whether the NPU tier runs Inkling's SITU feed-forwards (set at load), so its hot experts may go there.
+static SITU_NPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The product of two rows, summed in 16 lanes in a fixed order (so the bits do not depend on the machine's vector
 /// width): lane i takes every 16th pair from i, then the lanes are added in pairs.
@@ -428,9 +538,6 @@ impl Ink {
         }
         let w = Weights::load(path)?;
         let h = InkHp::from_meta(&w.file.metadata)?;
-        // TORC_NPU=1: the dense products of big prompt blocks on the NPU (attention's q, gate, k, v and output; no
-        // hot experts yet), uploaded once for every pass that uses them; off, nothing changes
-        crate::npu::load(&w, h.n_layer as u32, &[]);
         crate::pipe::set_ident(
             &w.file.header.model_id,
             w.file.header.file_bytes,
@@ -516,12 +623,27 @@ impl Ink {
         let pass = (0..h.n_pass)
             .map(|_| {
                 let cap = n_ctx as usize;
-                Pass { k: vec![0.0; cap * kvd], v: vec![0.0; cap * kvd], cap, hist: vec![0.0; 3 * (2 * kvd + 2 * dm)] }
+                Pass {
+                    k: vec![0.0; cap * kvd],
+                    v: vec![0.0; cap * kvd],
+                    cap,
+                    hist: vec![0.0; 3 * (2 * kvd + 2 * dm)],
+                    gkv: gpu_attn().then(|| crate::attn::KvCache::with(h.n_head_kv, h.head_dim, cap, true)),
+                }
             })
             .collect();
         let tok_norm = w.need("token_embd_norm.weight")?.f32s()?;
         let out_norm = w.need("output_norm.weight")?.f32s()?;
         let out_query = w.need("output_res_query.weight")?.f32s()?;
+        // TORC_NPU=1: the dense products of big prompt blocks on the NPU (attention's q, gate, k, v and output),
+        // uploaded once for every pass that uses them, and with a usage profile (TORC_NPU_PROFILE, or this machine's
+        // own) each layer's most used experts too, whose feed-forwards the NPU runs with SITU; off, nothing changes
+        crate::npu::load(&w, h.n_layer as u32, &layers.iter().map(|ly: &ILayer| ly.group).collect::<Vec<_>>());
+        if crate::npu::up() {
+            let ok = crate::npu::set_situ(h.situ_beta, h.situ_lb);
+            SITU_NPU.store(ok, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("npu: SITU feed-forwards {}", if ok { "on" } else { "not available: no experts there" });
+        }
         Ok(Ink { h, w, layers, pass, tok_norm, out_norm, out_query, n_ctx })
     }
 
@@ -771,6 +893,9 @@ impl Ink {
             let (qp, rp) = (SyncPtr::new(&mut q), SyncPtr::new(&mut rel));
             let (kp, vp) = (SyncPtr::new(&mut kk), SyncPtr::new(&mut vv));
             let (ck, cv) = (SyncPtr::new(&mut st.k), SyncPtr::new(&mut st.v));
+            let gk = st.gkv.as_mut().map(|g| {
+                (SyncPtr::new(&mut g.k16), SyncPtr::new(&mut g.v16), SyncPtr::new(&mut g.k_scale), SyncPtr::new(&mut g.v_scale))
+            });
             each(n, &|t| {
                 let pos = pos0 as usize + t;
                 // the full-attention layers' queries grow slowly with the position
@@ -798,6 +923,14 @@ impl Ink {
                     unsafe {
                         ck.slice(slot, hd).copy_from_slice(&kt[g * hd..(g + 1) * hd]);
                         cv.slice(slot, hd).copy_from_slice(&vt[g * hd..(g + 1) * hd]);
+                    }
+                    if let Some((k16, v16, ks, vs)) = gk {
+                        let r = g * cap + pos % cap;
+                        // SAFETY: as above, the position's rows of the 16-bit copy
+                        unsafe {
+                            *ks.at(r) = crate::attn::quant16(&kt[g * hd..(g + 1) * hd], k16.slice(slot, hd));
+                            *vs.at(r) = crate::attn::quant16(&vt[g * hd..(g + 1) * hd], v16.slice(slot, hd));
+                        }
                     }
                 }
             });
@@ -846,6 +979,16 @@ impl Ink {
                     for (i, p) in (lo..=pos).enumerate() {
                         let d = pos - p;
                         let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+                        if per == 3 && att3() & 4 != 0 {
+                            let qr = |x: usize| &q[(h0 + x) * hd..(h0 + x + 1) * hd];
+                            let ds = dot3([qr(0), qr(1), qr(2)], k);
+                            for (j, dv) in ds.iter().enumerate() {
+                                let hh = h0 + j;
+                                let b = if d < ext { bias[j * ext + d] } else { 0.0 };
+                                sc[j * span + i] = dv * scale + (b - sink[hh]);
+                            }
+                            continue;
+                        }
                         for j in 0..per {
                             let hh = h0 + j;
                             let b = if d < ext { bias[j * ext + d] } else { 0.0 };
@@ -868,6 +1011,8 @@ impl Ink {
                     }
                     // SAFETY: item g owns heads h0..h0 + per of the token's row of att
                     let og = unsafe { ap.slice(h0 * hd, per * hd) };
+                    // each value row read once for the item's `per` heads (value_sums, a head at a time with its
+                    // output in registers, read each row `per` times: box 1 server writing at 8k 13.8 -> 12.7, 27 Nov)
                     for (i, p) in (lo..=pos).enumerate() {
                         let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
                         for j in 0..per {
@@ -882,9 +1027,13 @@ impl Ink {
                     }
                 });
             } else {
-                each(tiles * groups, &|it| {
+                let _ = tiles;
+                // the tile items for the block's tokens a..b (a a multiple of ATT_QT), writing through op (token a's row
+                // of att first), with the output's gate when `gated` (the GPU's tokens come back without it)
+                let run_tiles = |a: usize, b: usize, op: SyncPtr<f32>, gated: bool| {
+                each((b - a).div_ceil(ATT_QT) * groups, &|it| {
                     let (tile, h0) = (it / groups, (it % groups) * hpi);
-                    let (t0, t1) = (tile * ATT_QT, ((tile + 1) * ATT_QT).min(n));
+                    let (t0, t1) = (a + tile * ATT_QT, (a + (tile + 1) * ATT_QT).min(b));
                     let g = h0 / per;
                     // the item's queries: (token, head) for t0..t1 and h0..h0 + hpi, query j = (t - t0) * hpi + (hh - h0)
                     let nq = (t1 - t0) * hpi;
@@ -909,6 +1058,24 @@ impl Ink {
                     }
                     for p in span_lo..=span_hi {
                         let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+                        if hpi == 3 && att3() & 1 != 0 {
+                            // a token's three heads share the key row (dot3: each the same steps as dot)
+                            for t in t0..t1 {
+                                let pos = pos0 as usize + t;
+                                if p < lo_of(t) || p > pos {
+                                    continue;
+                                }
+                                let d = pos - p;
+                                let qr = |x: usize| &q[t * qd + (h0 + x) * hd..t * qd + (h0 + x + 1) * hd];
+                                let ds = dot3([qr(0), qr(1), qr(2)], k);
+                                for (x, dv) in ds.iter().enumerate() {
+                                    let (j, hh) = ((t - t0) * 3 + x, h0 + x);
+                                    let b = if d < h.extent { bias[j * h.extent + d] } else { 0.0 };
+                                    sc[j * width + (p - span_lo)] = dv * scale + (b - sink[t * nh + hh]);
+                                }
+                            }
+                            continue;
+                        }
                         for j in 0..nq {
                             let (t, hh) = (tok(j), head(j));
                             let pos = pos0 as usize + t;
@@ -938,32 +1105,90 @@ impl Ink {
                         }
                         sums[j] = sum;
                     }
-                    // the values, each row read once for the item; each query's sums stay in position order
-                    for p in span_lo..=span_hi {
-                        let v = &cv[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+                    // the values: each query's weights (score / sum, as before), then its output VS numbers at a time
+                    // held in registers over all its positions, in position order (the same sums), stored once (the
+                    // output row was loaded and stored again for every position: box 1, 27 Nov, a third of a prompt
+                    // block's attention)
+                    for j in 0..nq {
+                        let t = tok(j);
+                        let (lo, pos) = (lo_of(t), pos0 as usize + t);
+                        let s = sums[j];
+                        for w in &mut sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)] {
+                            *w /= s;
+                        }
+                    }
+                    if hpi == 3 && hd.is_multiple_of(16) && att3() & 2 != 0 {
+                        // a token's three heads have the same keys, so each value row is read once for them
+                        for t in t0..t1 {
+                            let (lo, pos) = (lo_of(t), pos0 as usize + t);
+                            let j = (t - t0) * 3;
+                            let ws = |x: usize| {
+                                &sc[(j + x) * width + (lo - span_lo)..(j + x) * width + (pos + 1 - span_lo)]
+                            };
+                            // SAFETY: item it owns heads h0..h0 + 3 of token t's row of att
+                            let o3 = unsafe { op.slice((t - a) * qd + h0 * hd, 3 * hd) };
+                            value_sums3(o3, [ws(0), ws(1), ws(2)], lo, cv, g, cap, hd);
+                        }
+                    } else {
                         for j in 0..nq {
                             let (t, hh) = (tok(j), head(j));
-                            if p < lo_of(t) || p > pos0 as usize + t {
-                                continue;
-                            }
-                            let wgt = sc[j * width + (p - span_lo)] / sums[j];
+                            let (lo, pos) = (lo_of(t), pos0 as usize + t);
                             // SAFETY: item it owns heads h0..h0 + hpi of tokens t0..t1's rows of att
-                            let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
-                            for (a, b) in oh.iter_mut().zip(v) {
-                                *a = wgt.mul_add(*b, *a);
-                            }
+                            let oh = unsafe { op.slice((t - a) * qd + hh * hd, hd) };
+                            let ws = &sc[j * width + (lo - span_lo)..j * width + (pos + 1 - span_lo)];
+                            value_sums(oh, ws, lo, cv, g, cap, hd);
                         }
                     }
                     // the output's gate
-                    for j in 0..nq {
+                    for j in (0..nq).filter(|_| gated) {
                         let (t, hh) = (tok(j), head(j));
                         // SAFETY: as above
-                        let oh = unsafe { ap.slice(t * qd + hh * hd, hd) };
+                        let oh = unsafe { op.slice((t - a) * qd + hh * hd, hd) };
                         for (a, g) in oh.iter_mut().zip(&gate[t * qd + hh * hd..t * qd + (hh + 1) * hd]) {
                             *a *= 1.0 / (1.0 + (-g).exp());
                         }
                     }
                 });
+                };
+                // TORC_GPU_ATTN=1: the GPU takes the block's first tokens (its scores with the same bias by distance
+                // and sink, from the 16-bit copy; not bit-identical) while the tile items do the rest here
+                #[cfg(feature = "gpu")]
+                let on_gpu = match st.gkv.as_ref() {
+                    Some(gkv) => {
+                        let ink = crate::gpu::InkExtras { rel: &rel, relb: &ly.rel_bias, snq: &sink };
+                        let w = if swa { h.window } else { 0 };
+                        crate::gpu::run_block_ink(
+                            gkv,
+                            (nh, nkv, hd, scale, w),
+                            &ink,
+                            &q,
+                            qd,
+                            n,
+                            pos0 as usize,
+                            &mut att,
+                            &mut |a, b, o: &mut [f32]| run_tiles(a, b, SyncPtr::new(o), false),
+                        )
+                    }
+                    None => None,
+                };
+                #[cfg(not(feature = "gpu"))]
+                let on_gpu: Option<usize> = None;
+                match on_gpu {
+                    Some(hi) => {
+                        if let Some(gkv) = st.gkv.as_mut() {
+                            gkv.gpu_lo = hi;
+                        }
+                        let gp = SyncPtr::new(&mut att);
+                        each(n, &|t| {
+                            // SAFETY: item t owns token t's row of att
+                            let o = unsafe { gp.slice(t * qd, qd) };
+                            for (a, g) in o.iter_mut().zip(&gate[t * qd..(t + 1) * qd]) {
+                                *a *= 1.0 / (1.0 + (-g).exp());
+                            }
+                        });
+                    }
+                    None => run_tiles(0, n, ap, true),
+                }
             }
         }
         lap.lap(4);
@@ -1037,6 +1262,7 @@ impl Ink {
                 unsafe { cp.slice(t, 1)[0] = lg.iter().map(|&(e, _, p)| (e, p / sum * h.w_scale)).collect() };
             });
         }
+        crate::npu::record(lw as u32, &choice);
         lap.lap(6);
         let mut users: Vec<Vec<usize>> = vec![Vec::new(); h.n_expert];
         for (t, c) in choice.iter().enumerate() {
@@ -1100,8 +1326,49 @@ impl Ink {
                 ys[0].push((c.0, c.1, y[i * dm..(i + 1) * dm].to_vec()));
             }
         }
+        // the layer's hot experts with enough tokens go to the NPU (its graph, SITU in f32), started before the CPU
+        // takes the rest and collected after (TORC_NPU_HOT_MIN tokens at least; rows padded to 32s, at least 64)
+        let hot = if n > 1 && SITU_NPU.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::npu::hot(lw as u32, n)
+        } else {
+            Vec::new()
+        };
+        let hot_min: usize = crate::switches::num("TORC_NPU_HOT_MIN").unwrap_or(1);
+        // (expert, NPU ids, first staging row, rows)
+        let mut on_npu: Vec<(usize, [i32; 3], usize, usize)> = Vec::new();
+        let mut hot_rows = 0;
+        for &(e, ids) in hot.iter().filter(|h| users[h.0].len() >= hot_min).take(64) {
+            let pad = users[e].len().div_ceil(32).max(2) * 32;
+            on_npu.push((e, ids, hot_rows, pad));
+            hot_rows += pad;
+        }
+        let mut hot_x = vec![0.0f32; hot_rows * dm];
+        let mut hot_y = vec![0.0f32; hot_rows * dm];
+        for &(e, _, r0, _) in &on_npu {
+            for (r, &t) in users[e].iter().enumerate() {
+                hot_x[(r0 + r) * dm..(r0 + r + 1) * dm].copy_from_slice(&xn[t * dm..(t + 1) * dm]);
+            }
+        }
+        let groups: Vec<crate::npu::Ffn> = on_npu
+            .iter()
+            .map(|&(_, ids, r0, pad)| crate::npu::Ffn {
+                ids,
+                x: hot_x[r0 * dm..].as_ptr(),
+                n: pad,
+                y: hot_y[r0 * dm..].as_mut_ptr(),
+            })
+            .collect();
+        // SAFETY: hot_x holds every group's rows (begin copies them in) and hot_y their outputs, untouched until
+        // finish below
+        let started = !groups.is_empty() && unsafe { crate::npu::begin_ffns(&groups, dm) };
+        let mut skip = vec![false; h.n_expert];
+        if started {
+            for &(e, ..) in &on_npu {
+                skip[e] = true;
+            }
+        }
         for (e, toks) in users.iter().enumerate() {
-            if toks.is_empty() || n == 1 {
+            if toks.is_empty() || n == 1 || skip[e] {
                 continue;
             }
             let m = toks.len();
@@ -1145,6 +1412,18 @@ impl Ink {
                 ys[t].push((e, wgt, y[i * dm..(i + 1) * dm].to_vec()));
             }
         }
+        if started {
+            if crate::npu::finish() {
+                for &(e, _, r0, _) in &on_npu {
+                    for (r, &t) in users[e].iter().enumerate() {
+                        let wgt = choice[t].iter().find(|c| c.0 == e).map_or(0.0, |c| c.1);
+                        ys[t].push((e, wgt, hot_y[(r0 + r) * dm..(r0 + r + 1) * dm].to_vec()));
+                    }
+                }
+            } else {
+                return err("npu: the hot experts' graph failed");
+            }
+        }
         lap.lap(7);
         let mut moe = vec![0.0f32; n * dm];
         for (t, list) in ys.iter_mut().enumerate() {
@@ -1164,4 +1443,17 @@ impl Ink {
         lap.lap(8);
         Ok(())
     }
+}
+
+/// TORC_ATT3: which three-head attention kernels run (the same bits either way), bits 1 a prompt block's scores
+/// (dot3), 2 its value sums (value_sums3), 4 one token's scores (dot3). Default by what measured faster (27 Nov, 4.3k
+/// prompt's attention): ARM all (box 1: scores 23.6 -> 18.9 s, value sums -> 19.3 s, one token level); x86 the value
+/// sums alone (13900K: dot3 14.3 -> 17.1 s, value sums -> 13.5 s; the 12600K gained from both, the 13900K did not)
+fn att3() -> u32 {
+    static A: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        crate::switches::get("TORC_ATT3")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if cfg!(target_arch = "aarch64") { 7 } else { 2 })
+    })
 }
