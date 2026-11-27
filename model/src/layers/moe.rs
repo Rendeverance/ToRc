@@ -1822,6 +1822,20 @@ pub(crate) fn mats_of<'a>(pack: &'a [u8], shape: &format::Pack) -> [Mat<'a>; 3] 
 /// activations (quantised as ggml does when `hc` is set), then down, with each pair's output going into its row (g0 +
 /// i) of dall (dm wide).
 pub(crate) fn run_ejobs(hc: bool, gelu: bool, jobs: &[EJob], xq: Q8s, nb: usize, dm: usize, dall: &mut [f32]) {
+    run_ejobs_with(hc, |g, u| crate::act::glu(gelu, g, u), jobs, xq, nb, dm, dall)
+}
+
+/// run_ejobs with the hidden activation act(gate, up) of the caller's (Inkling's SITU); run_ejobs passes the GLU, so
+/// its callers make the same calls as before.
+pub(crate) fn run_ejobs_with<A: Fn(f32, f32) -> f32 + Sync>(
+    hc: bool,
+    act: A,
+    jobs: &[EJob],
+    xq: Q8s,
+    nb: usize,
+    dm: usize,
+    dall: &mut [f32],
+) {
     let mut np = 0;
     let p0: Vec<usize> = jobs
         .iter()
@@ -1921,7 +1935,7 @@ pub(crate) fn run_ejobs(hc: bool, gelu: bool, jobs: &[EJob], xq: Q8s, nb: usize,
                 (&gu[p * 2 * ffmax..p * 2 * ffmax + ff], &gu[p * 2 * ffmax + ffmax..p * 2 * ffmax + ffmax + ff]);
             let mut h = vec![0.0f32; fq];
             for r in 0..ff {
-                h[r] = crate::act::glu(gelu, gt[r], up[r]);
+                h[r] = act(gt[r], up[r]);
             }
             // SAFETY: pair p owns blocks hoff[p]..hoff[p + 1]
             let q = unsafe { hp.slice(hoff[p], fq / QK) };

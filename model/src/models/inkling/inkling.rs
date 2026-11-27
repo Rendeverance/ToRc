@@ -1487,8 +1487,45 @@ impl Ink {
                 skip[e] = true;
             }
         }
+        // a block's experts (those not on the NPU) as one wave, as the shared MoE layer runs them (moe::run_ejobs):
+        // every expert's gate and up chunks in one sweep of the pool, then every token's SITU, then every down chunk,
+        // instead of an expert at a time with three fork-joins each (13900K, 4.3k prompt, 27 Nov: the experts ~33 s
+        // of 79 at ~350 G multiply-adds a second). The same products and the same SITU, so the same bits.
+        // TORC_INK_WAVE=0 keeps an expert at a time.
+        let wave = n > 1 && !crate::switches::is("TORC_INK_WAVE", "0");
+        if wave {
+            let ids: Vec<u32> =
+                (0..h.n_expert).filter(|&e| !users[e].is_empty() && !skip[e]).map(|e| e as u32).collect();
+            if !ids.is_empty() {
+                let packs = self.w.experts_of(lw, ly.group, &ids)?;
+                let xq = quant(&xn, n, dm);
+                let mut jobs = Vec::with_capacity(ids.len());
+                let mut g0 = 0;
+                for (i, &e) in ids.iter().enumerate() {
+                    let (pk, pack) = packs[i];
+                    let toks = users[e as usize].clone();
+                    let k = toks.len();
+                    jobs.push(crate::moe::EJob { mats: crate::moe::mats_of(pk, pack), toks, g0 });
+                    g0 += k;
+                }
+                let mut dall = vec![0.0f32; g0 * dm];
+                let (beta, lb) = (h.situ_beta, h.situ_lb);
+                let situ = |gt: f32, ut: f32| {
+                    let act = beta * (gt / beta).tanh() * (1.0 / (1.0 + (-gt).exp()));
+                    act * if lb > 0.0 { lb * (ut / lb).tanh() } else { ut }
+                };
+                crate::moe::run_ejobs_with(false, situ, &jobs, xq.view(), dm / QK, dm, &mut dall);
+                for (j, &e) in jobs.iter().zip(&ids) {
+                    let e = e as usize;
+                    for (i, &t) in j.toks.iter().enumerate() {
+                        let wgt = choice[t].iter().find(|c| c.0 == e).map_or(0.0, |c| c.1);
+                        ys[t].push((e, wgt, dall[(j.g0 + i) * dm..(j.g0 + i + 1) * dm].to_vec()));
+                    }
+                }
+            }
+        }
         for (e, toks) in users.iter().enumerate() {
-            if toks.is_empty() || n == 1 || skip[e] {
+            if toks.is_empty() || n == 1 || skip[e] || wave {
                 continue;
             }
             let m = toks.len();
