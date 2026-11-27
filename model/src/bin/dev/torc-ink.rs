@@ -10,11 +10,22 @@ use model::ops::argmax;
 use std::time::Instant;
 
 fn read_f32(path: &str) -> Vec<f32> {
-    let b = std::fs::read(path).unwrap_or_else(|e| {
+    // read in pieces: the whole file as bytes beside its floats doubled an 8k prompt's 6.9 GB
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
         std::process::exit(2)
     });
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    let mut left = f.metadata().map(|m| m.len() as usize).unwrap_or(0) / 4 * 4;
+    let mut out = Vec::with_capacity(left / 4);
+    let mut buf = vec![0u8; 1 << 20];
+    while left > 0 {
+        let k = left.min(buf.len());
+        f.read_exact(&mut buf[..k]).unwrap();
+        out.extend(buf[..k].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+        left -= k;
+    }
+    out
 }
 
 /// Two runs' logits compared position by position: how many positions differ in any bit, how many pick another
@@ -158,8 +169,13 @@ fn main() {
     let how = if first > 0 { format!("in blocks of {first}") } else { "one at a time".to_string() };
     println!("read {} tokens {how} in {s:.2} s ({:.2} tok/s)", ids.len(), ids.len() as f64 / s);
     if let Some(f) = opt("dump") {
-        let b: Vec<u8> = all.iter().flat_map(|v| v.to_le_bytes()).collect();
-        std::fs::write(&f, b).unwrap();
+        // streamed: a byte copy of an 8k prompt's logits (6.9 GB) beside them ran a 32 GB box out of memory
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&f).unwrap());
+        for v in &all {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        w.flush().unwrap();
         println!("logits written to {f}");
     }
     if let Some(f) = opt("ref") {
