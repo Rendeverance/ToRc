@@ -31,6 +31,10 @@ use kernels::{Q8, QK, ops as kops};
 /// The most tokens one call of forward takes.
 pub const BLOCK_MAX: usize = 1024;
 
+/// Positions a sliding-window pass's ring keeps past its window and one block: how far a conversation can run on
+/// from a mark before going back to that mark means reading the prompt again (Ink::ring_lost).
+const RING_SLACK: usize = 4096;
+
 #[derive(Clone, Debug)]
 pub struct InkHp {
     /// the layers of weights, and the layer passes a token makes
@@ -242,6 +246,9 @@ pub struct Ink {
     out_norm: Vec<f32>,
     out_query: Vec<f32>,
     pub n_ctx: u32,
+    /// the sliding-window passes' cache length when they keep a ring of their last positions (None: every pass
+    /// keeps the whole context)
+    ring: Option<usize>,
 }
 
 /// What a token block's passes carry from one layer pass to the next (forward_range): the stream, the earlier
@@ -735,10 +742,22 @@ impl Ink {
             }
             layers.push(ly);
         }
-        // a layer pass's state: the passes after the first come after the layers, a looped stretch at a time
+        // a layer pass's state: the passes after the first come after the layers, a looped stretch at a time. A
+        // sliding-window pass reads only its last `window` positions, so it keeps a ring of window + a block +
+        // RING_SLACK of them (the cache is indexed by position modulo its length everywhere), not the whole context:
+        // at 32k positions the 40 such passes would otherwise hold 10.7 GB. TORC_INK_RING=0 keeps every position;
+        // so does the GPU tier, whose 16-bit copy shares the index
+        let ring = (!crate::switches::is("TORC_INK_RING", "0") && !gpu_attn())
+            .then_some(h.window + BLOCK_MAX + RING_SLACK)
+            .filter(|&c| c < n_ctx as usize);
+        let span = h.loop_end - h.loop_start;
         let pass = (0..h.n_pass)
-            .map(|_| {
-                let cap = n_ctx as usize;
+            .map(|s| {
+                let l = if s < h.n_layer { s } else { h.loop_start + (s - h.n_layer) % span };
+                let cap = match ring {
+                    Some(c) if h.swa[l] => c,
+                    _ => n_ctx as usize,
+                };
                 Pass {
                     k: vec![0.0; cap * kvd],
                     v: vec![0.0; cap * kvd],
@@ -760,7 +779,14 @@ impl Ink {
             SITU_NPU.store(ok, std::sync::atomic::Ordering::Relaxed);
             eprintln!("npu: SITU feed-forwards {}", if ok { "on" } else { "not available: no experts there" });
         }
-        Ok(Ink { h, w, layers, pass, tok_norm, out_norm, out_query, n_ctx })
+        Ok(Ink { h, w, layers, pass, tok_norm, out_norm, out_query, n_ctx, ring })
+    }
+
+    /// Whether positions written up to `upto` have overwritten what going back to a mark after `p` tokens would read:
+    /// the sliding-window passes' ring holds each position until `cap` later ones, and reading on from p needs the
+    /// window before it. Always false when every pass keeps the whole context.
+    pub fn ring_lost(&self, p: usize, upto: usize) -> bool {
+        self.ring.is_some_and(|cap| upto + self.h.window >= p + 1 + cap)
     }
 
     pub fn n_vocab(&self) -> usize {

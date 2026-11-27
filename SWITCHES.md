@@ -41,6 +41,7 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_ATT1_SPLIT` | development | Inkling: depth from which one-token attention on a full layer is spread over every core (default 2048; same bits) |
 | `TORC_LARGE_LAYERS` | setting | `a-b`: TORC_EXPERTS_LARGE copies only layers a..b (a two-machine Inkling's share; the rest stay untouched in the mapping) |
 | `TORC_INK_WAVE` | development | Inkling: `0` runs a prompt block's experts one at a time instead of as one wave (same bits) |
+| `TORC_INK_RING` | development | Inkling: `0` keeps every position in the sliding-window layers' cache; by default they keep a ring of their window plus 5,120 positions (same bits; going back to a saved mark further than that reads the prompt again). Off with `TORC_GPU_ATTN` |
 | `TORC_GEMM_MIN`, `TORC_PACKED_MIN`, `TORC_GEMM_IQ4` | development | from how many vectors the packed matrix kernels take over; `TORC_GEMM_IQ4=0` keeps x86 IQ4_NL on the row kernels |
 | `TORC_MULTI`, `TORC_GROUPED`, `TORC_GROUPED_MAX` | development | multi-vector and grouped expert products |
 | `TORC_RC`, `TORC_RC_WIDE` | development | rows per task in the row-split products |

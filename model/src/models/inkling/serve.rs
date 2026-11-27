@@ -64,6 +64,11 @@ impl Engine {
     /// A block through the model (both machines when piped), with the last row's logits into `last` when given; a
     /// piped block without them does not wait for the worker.
     fn fwd(&mut self, toks: &[u32], pos: u32, last: Option<&mut [f32]>) -> format::Result<()> {
+        // a mark whose window the sliding-window passes' ring is about to overwrite can't be gone back to any more
+        // (on two machines the worker's ring is the same length, so the same marks go there too)
+        let upto = pos as usize + toks.len() - 1;
+        let m = &self.m;
+        self.marks.retain(|(p, _, _)| !m.ring_lost(*p, upto));
         match (self.pipe.as_mut(), last) {
             (Some(pp), l) => pp.forward(&mut self.m, toks, pos, l),
             (None, Some(l)) => self.m.forward(toks, pos, l, false),
