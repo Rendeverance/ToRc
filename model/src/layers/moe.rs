@@ -109,7 +109,7 @@ pub fn dot_rows(ty: u32, w: &[u8], rb: usize, x: Q8s, y: &mut [f32]) {
         static IQ: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::arch::is_aarch64_feature_detected!("dotprod"));
         if ty == 20 && *IQ {
-            // TORC_IQ4_ROWS=4 (or 1): that many rows a pass instead of 2 (an experiment; every row keeps
+            // TORC_IQ4_ROWS=4 (or 1): that many rows a pass instead of 2 (a development switch; every row keeps
             // iq4nl_dot's steps, so the same bits)
             static R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
                 crate::switches::num::<usize>("TORC_IQ4_ROWS").filter(|r| [1, 2, 4].contains(r)).unwrap_or(2)
