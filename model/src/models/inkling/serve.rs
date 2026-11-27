@@ -231,6 +231,11 @@ pub fn open(path: &str, ctx: usize, name: Option<String>) -> Box<dyn Serve> {
             eprintln!("{}", er.0);
             std::process::exit(1)
         });
+        // two machines read in blocks of 256 unless TORC_BLOCK says otherwise: twice the blocks to overlap, and on
+        // the boxes it read faster at every length (27 Nov: 256 v 512 short 101.5 v 78.4, 8k 111.5 v 105.2)
+        if e.pipe.is_some() && !crate::switches::given("TORC_BLOCK") {
+            e.block = 256;
+        }
         let mut last = vec![0.0f32; nv];
         let _ = e.fwd(&[0u32; 16], 0, Some(&mut last));
         let _ = e.fwd(&[0], 16, Some(&mut last));

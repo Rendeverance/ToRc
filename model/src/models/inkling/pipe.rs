@@ -6,7 +6,7 @@
 //! on whichever machine runs it, so the bits are the same as on one machine. Each machine keeps the keys, values and
 //! convolution state of its own passes.
 //!
-//! Worker: `torc-ink <model> serve=<port>` (ctx=). Main: TORC_INK_PIPE=host:port, TORC_INK_SPLIT=S (default half the
+//! Worker: `torc-ink <model> serve=<port>` (ctx=). Main: TORC_INK_PIPE=host:port, TORC_INK_SPLIT=S (default 13 of every 24
 //! passes), TORC_INK_PIPE_TOPK=K (a token's K largest logits only). A request is MAGIC, op, then the op's words: RUN
 //! pos0, n, S, want (0: no logits, 1: the last row's, 2 + K: its K largest as (index, value) pairs), the
 //! carry's length and its f32s; STATE_GET; STATE_SET with the length and the f32s; HELLO with the main machine's
@@ -78,7 +78,10 @@ impl Pipe {
     pub fn from_env(m: &Ink) -> Result<Option<Pipe>> {
         let Some(addr) = crate::switches::get("TORC_INK_PIPE") else { return Ok(None) };
         let total = m.n_calls();
-        let split = crate::switches::num::<usize>("TORC_INK_SPLIT").filter(|&s| s > 0 && s < total).unwrap_or(total / 2);
+        // by default the main machine takes 13 of every 24 passes: the later half holds the heavier layers (the
+        // last layers' experts are Q8_0), and 26 of 48 read fastest on the boxes (27 Nov: 4.3k 121.7 tok/s, 24: 118.5,
+        // 28: 113.5)
+        let split = crate::switches::num::<usize>("TORC_INK_SPLIT").filter(|&s| s > 0 && s < total).unwrap_or(total * 13 / 24);
         let st = io(TcpStream::connect(&addr))?;
         io(st.set_nodelay(true))?;
         let topk = crate::switches::num::<usize>("TORC_INK_PIPE_TOPK").unwrap_or(0);
