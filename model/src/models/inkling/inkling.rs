@@ -331,6 +331,43 @@ fn value_sums3(out: &mut [f32], ws: [&[f32]; 3], lo: usize, cv: &[f32], g: usize
     }
 }
 
+/// TORC_ATT1_SPLIT: from how many positions one token's attention in a pass spreads over the whole pool (att1's deep
+/// path; the same bits). Default 2048: only the full-attention passes past that depth (the sliding windows are 1024).
+fn att1_split() -> usize {
+    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *S.get_or_init(|| crate::switches::num("TORC_ATT1_SPLIT").unwrap_or(2048))
+}
+
+/// Three heads' value sums over columns c0.. of a key head (the deep one-token path): out[x][e] += ws[x][i] x value
+/// row (lo + i)[c0 + e], i in order, 16 columns at a time held in registers, as value_sums3 does for all columns.
+#[allow(clippy::too_many_arguments)]
+fn value_cols3(out: [&mut [f32]; 3], ws: [&[f32]; 3], lo: usize, cv: &[f32], g: usize, cap: usize, hd: usize, c0: usize) {
+    const VS: usize = 16;
+    let len = ws[0].len();
+    let (w0, w1, w2) = (&ws[0][..len], &ws[1][..len], &ws[2][..len]);
+    let [o0, o1, o2] = out;
+    let width = o0.len();
+    for c in (0..width).step_by(VS) {
+        let mut a0: [f32; VS] = o0[c..c + VS].try_into().unwrap();
+        let mut a1: [f32; VS] = o1[c..c + VS].try_into().unwrap();
+        let mut a2: [f32; VS] = o2[c..c + VS].try_into().unwrap();
+        for i in 0..len {
+            let p = lo + i;
+            let at = (g * cap + p % cap) * hd + c0 + c;
+            let v: &[f32; VS] = cv[at..at + VS].try_into().unwrap();
+            let (x0, x1, x2) = (w0[i], w1[i], w2[i]);
+            for k in 0..VS {
+                a0[k] = x0.mul_add(v[k], a0[k]);
+                a1[k] = x1.mul_add(v[k], a1[k]);
+                a2[k] = x2.mul_add(v[k], a2[k]);
+            }
+        }
+        o0[c..c + VS].copy_from_slice(&a0);
+        o1[c..c + VS].copy_from_slice(&a1);
+        o2[c..c + VS].copy_from_slice(&a2);
+    }
+}
+
 /// dot's lane sum: the 16 lanes added in pairs (8 apart, then 4, 2, 1), as dot ends.
 #[inline(always)]
 fn lanes16(mut ac: [f32; 16]) -> f32 {
@@ -966,6 +1003,88 @@ impl Ink {
                 let span = pos + 1 - lo;
                 // the distances this token sees are 0..span, so only those rows of the bias table (the same numbers)
                 let ext = h.extent.min(span);
+                if per == 3 && hd.is_multiple_of(64) && span >= att1_split() {
+                    // a deep full-attention pass: the whole pool in three stages (one item a key head left a 12-core
+                    // box a third idle, and at depth this is most of a token's attention), each number the same steps
+                    // in the same order as below: 1. scores, a key head over a run of positions (dot3); 2. a query
+                    // head's softmax and weights (score / sum); 3. value sums and the gate, a key head's three heads
+                    // over a quarter of the columns, every position in order
+                    let threads = crate::pool::get().threads.max(1);
+                    let runs = (2 * threads).div_ceil(nkv).clamp(1, span.div_ceil(256));
+                    let run = span.div_ceil(runs);
+                    const SLICES: usize = 4;
+                    let sw = hd / SLICES;
+                    let mut sc = vec![0.0f32; nh * span];
+                    let mut sums = vec![0.0f32; nh];
+                    let (sp, mp) = (SyncPtr::new(&mut sc), SyncPtr::new(&mut sums));
+                    let scores = |it: usize| {
+                        let (g, r) = (it / runs, it % runs);
+                        let (i0, i1) = (r * run, ((r + 1) * run).min(span));
+                        if i0 >= i1 {
+                            return;
+                        }
+                        let h0 = g * 3;
+                        // this run's distances: span - i1 .. span - i0 (those below ext have a bias)
+                        let (dlo, dhi) = (span - i1, (span - i0).min(ext));
+                        let bw = dhi.saturating_sub(dlo);
+                        let mut bias = vec![0.0f32; 3 * bw];
+                        for j in 0..3 {
+                            let rh = &rel[(h0 + j) * nr..(h0 + j + 1) * nr];
+                            for (e, b) in bias[j * bw..(j + 1) * bw].iter_mut().enumerate() {
+                                let d = dlo + e;
+                                *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
+                            }
+                        }
+                        let qr = |x: usize| &q[(h0 + x) * hd..(h0 + x + 1) * hd];
+                        for i in i0..i1 {
+                            let p = lo + i;
+                            let d = pos - p;
+                            let k = &ck[(g * cap + p % cap) * hd..(g * cap + p % cap + 1) * hd];
+                            let ds = dot3([qr(0), qr(1), qr(2)], k);
+                            for (j, dv) in ds.iter().enumerate() {
+                                let hh = h0 + j;
+                                let b = if d < ext { bias[j * bw + d - dlo] } else { 0.0 };
+                                // SAFETY: item (g, r) owns positions i0..i1 of heads h0..h0 + 3
+                                unsafe { *sp.at(hh * span + i) = dv * scale + (b - sink[hh]) };
+                            }
+                        }
+                    };
+                    let softmax = |hh: usize| {
+                        // SAFETY: item hh owns head hh's scores and sum
+                        let row = unsafe { sp.slice(hh * span, span) };
+                        let mut mx = 0.0f32;
+                        for &v in row.iter() {
+                            mx = mx.max(v);
+                        }
+                        let mut sum = (-mx).exp();
+                        for v in row.iter_mut() {
+                            *v = (*v - mx).exp();
+                            sum += *v;
+                        }
+                        for v in row.iter_mut() {
+                            *v /= sum;
+                        }
+                        unsafe { *mp.at(hh) = sum };
+                    };
+                    let values = |it: usize| {
+                        let (g, sl) = (it / SLICES, it % SLICES);
+                        let (h0, c0) = (g * 3, sl * sw);
+                        // SAFETY: the weights are done (stage 2); item (g, sl) owns columns c0..c0 + sw of heads
+                        // h0..h0 + 3 of the token's row of att
+                        let ws = unsafe { std::slice::from_raw_parts(sp.at(0), nh * span) };
+                        let w = |x: usize| &ws[(h0 + x) * span..(h0 + x + 1) * span];
+                        let o = |x: usize| unsafe { ap.slice((h0 + x) * hd + c0, sw) };
+                        value_cols3([o(0), o(1), o(2)], [w(0), w(1), w(2)], lo, cv, g, cap, hd, c0);
+                        for x in 0..3 {
+                            let gr = &gate[(h0 + x) * hd + c0..(h0 + x) * hd + c0 + sw];
+                            for (a, gt) in o(x).iter_mut().zip(gr) {
+                                *a *= 1.0 / (1.0 + (-gt).exp());
+                            }
+                        }
+                    };
+                    crate::pool::par_stages(&[(nkv * runs, &scores), (nh, &softmax), (nkv * SLICES, &values)]);
+                    let _ = &sums;
+                } else {
                 each(nkv, &|g| {
                     let h0 = g * per;
                     let mut bias = vec![0.0f32; per * ext];
@@ -1026,6 +1145,7 @@ impl Ink {
                         *a *= 1.0 / (1.0 + (-gt).exp());
                     }
                 });
+                }
             } else {
                 let _ = tiles;
                 // the tile items for the block's tokens a..b (a a multiple of ATT_QT), writing through op (token a's row

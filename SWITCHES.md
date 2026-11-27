@@ -38,6 +38,7 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_BLOCK_LONG` | setting | block size for long prompts |
 | `TORC_CHECKPOINT`, `TORC_CHECKPOINT_MIN` | development: `TORC_CHECKPOINT`; the rest setting | state checkpoints while reading a prompt (retry granularity; the fewest tokens worth one) |
 | `TORC_ATT3` | development | Inkling: which three-head attention kernels run (bits 1 prompt scores, 2 prompt value sums, 4 one-token scores; ARM 7, x86 2) |
+| `TORC_ATT1_SPLIT` | development | Inkling: depth from which one-token attention on a full layer is spread over every core (default 2048; same bits) |
 | `TORC_GEMM_MIN`, `TORC_PACKED_MIN`, `TORC_GEMM_IQ4` | development | from how many vectors the packed matrix kernels take over; `TORC_GEMM_IQ4=0` keeps x86 IQ4_NL on the row kernels |
 | `TORC_MULTI`, `TORC_GROUPED`, `TORC_GROUPED_MAX` | development | multi-vector and grouped expert products |
 | `TORC_RC`, `TORC_RC_WIDE` | development | rows per task in the row-split products |
