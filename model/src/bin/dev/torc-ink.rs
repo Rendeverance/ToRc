@@ -1,16 +1,16 @@
-//! torc-ink <model> [text=PROMPT | toks=tokens.int32] [n=N] [gen=G] [block=B] [first=B] [ref=logits.f32] [dump=logits.f32]
-//! [ctx=N]: runs Inkling 2 Mini (inkling.rs). The prompt's tokens (text= goes through the model's tokeniser as it
-//! stands, special tokens read; toks= is a file of token ids; n= takes the first N) are read one at a time, and the
-//! token each position would pick is printed. ref= compares the logits of every position against a float32 file of
-//! n x n_vocab (from llama.cpp, say); dump= writes ours. block=B reads the same tokens again B at a time and checks
-//! that against the first pass: any bit that differs exits 1. gen=G then writes G tokens greedily.
+//! torc-ink <model> [text=PROMPT | toks=tokens.int32] [n=N] [gen=G] [block=B] [first=B] [ref=logits.f32]
+//! [dump=logits.f32] [ctx=N]: runs Inkling 2 Mini (inkling.rs). The prompt's tokens (text= goes through the model's
+//! tokeniser as it stands, special tokens read; toks= is a file of token ids; n= takes the first N) are read one at a
+//! time, and the token each position would pick is printed. ref= compares the logits of every position against a
+//! float32 file of n x n_vocab (from llama.cpp, say); dump= writes ours. block=B reads the same tokens again B at a
+//! time and checks that against the first pass: any bit that differs exits 1. gen=G then writes G tokens greedily.
 
 use model::models::inkling::inkling::Ink;
 use model::ops::argmax;
 use std::time::Instant;
 
 fn read_f32(path: &str) -> Vec<f32> {
-    // read in pieces: the whole file as bytes beside its floats doubled an 8k prompt's 6.9 GB
+    // read in pieces: the whole file as bytes beside its floats would double the memory a long prompt needs
     use std::io::Read;
     let mut f = std::fs::File::open(path).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
@@ -227,7 +227,7 @@ fn main() {
     let how = if first > 0 { format!("in blocks of {first}") } else { "one at a time".to_string() };
     println!("read {} tokens {how} in {s:.2} s ({:.2} tok/s)", ids.len(), ids.len() as f64 / s);
     if let Some(f) = opt("dump") {
-        // streamed: a byte copy of an 8k prompt's logits (6.9 GB) beside them ran a 32 GB box out of memory
+        // streamed: a long prompt's logits are gigabytes, and a byte copy of them beside the floats would double that
         use std::io::Write;
         let mut w = std::io::BufWriter::new(std::fs::File::create(&f).unwrap());
         for v in &all {

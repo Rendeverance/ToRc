@@ -1,14 +1,12 @@
 //! x86_gemm.rs - packed GEMM for the 32-weight block types (Q4_0, Q8_0, MXFP4, IQ4_NL) against many vectors, with VNNI:
 //! AVX-VNNI, or AVX512-VNNI's form of the same instruction on 256-bit registers (x86mm::vnni).
 //!
-//! The weights of 8 rows are packed once per call into a panel: every 32-weight block of the 8 rows is
-//! transposed so that each dword lane of a register holds one row's four weights, unsigned (Q4_0 as its
-//! nibbles 0..15, Q8_0 plus 128, MXFP4 as its doubled level plus 12, IQ4_NL as its level plus 128), beside the 8
-//! rows' scales as floats. A
-//! register-blocked microkernel then computes 8 rows x MR vectors with its accumulators in registers: per
-//! block, eight `vpdpbusd` leave each row's integer sum in its own lane, the offset (8, 128, 12 or 128 times the
-//! block's activation sum) is taken off, exactly, and one fused multiply-add puts the block on that row's
-//! float accumulator.
+//! The weights of 8 rows are packed once per call into a panel: every 32-weight block of the 8 rows is transposed so
+//! that each dword lane of a register holds one row's four weights, unsigned (Q4_0 as its nibbles 0..15, Q8_0 plus 128,
+//! MXFP4 as its doubled level plus 12, IQ4_NL as its level plus 128), beside the 8 rows' scales as floats. A
+//! register-blocked microkernel then computes 8 rows x MR vectors with its accumulators in registers: per block, eight
+//! `vpdpbusd` leave each row's integer sum in its own lane, the offset (8, 128, 12 or 128 times the block's activation
+//! sum) is taken off, exactly, and one fused multiply-add puts the block on that row's float accumulator.
 //!
 //! The float steps per row and vector are the scalar reference's (`q4_0_dot_scalar`): block position k (0..7)
 //! of every 256 has its own accumulator, acc_k = fma(d_w * d_x, isum, acc_k), blocks in order, and the eight

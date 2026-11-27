@@ -670,8 +670,11 @@ impl Weights {
             // TORC_LARGE_LAYERS=a-b: only layers a..b (a machine of a two-machine Inkling, which runs only some layers:
             // the others are never touched, so they never come into RAM)
             let only: Option<(u32, u32)> = crate::switches::get("TORC_LARGE_LAYERS").and_then(|v| {
-                let (a, b) = v.split_once('-')?;
-                Some((a.parse().ok()?, b.parse().ok()?))
+                let r = v.split_once('-').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)));
+                if r.is_none() {
+                    eprintln!("TORC_LARGE_LAYERS={v}: not a-b (layers a up to b), so every layer is copied");
+                }
+                r
             });
             for g in 0..w.file.experts.len() {
                 let x = &w.file.experts[g];

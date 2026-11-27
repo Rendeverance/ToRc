@@ -34,7 +34,7 @@ impl Pipe {
         }
         let total = m.n_calls();
         // by default the main machine takes 13 of every 24 passes: the later half holds the heavier layers (the
-        // last layers' experts are Q8_0), and 26 of 48 read fastest on the boxes
+        // last layers' experts are Q8_0)
         let split =
             crate::switches::num::<usize>("TORC_PIPE_SPLIT").filter(|&s| s > 0 && s < total).unwrap_or(total * 13 / 24);
         if sp::client().is_none() {

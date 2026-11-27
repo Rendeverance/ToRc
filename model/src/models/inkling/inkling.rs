@@ -291,7 +291,13 @@ impl Carry {
             return err("carry: too short");
         }
         let k: Vec<usize> = v[..5].iter().map(|f| f.to_bits() as usize).collect();
-        if v.len() != 5 + len * (1 + k[0] + k[1] * (1 + k[2]) + k[3] * (k[4] + 1)) {
+        // the counts come over the link: a sum that overflows is a wrong length, not a wrap
+        let want = (|| {
+            let b = k[1].checked_mul(k[2].checked_add(1)?)?;
+            let c = k[3].checked_mul(k[4].checked_add(1)?)?;
+            1usize.checked_add(k[0])?.checked_add(b)?.checked_add(c)?.checked_mul(len)?.checked_add(5)
+        })();
+        if want != Some(v.len()) {
             return err("carry: wrong length");
         }
         let mut at = 5;
@@ -599,8 +605,16 @@ impl Ink {
         // RING_SLACK of them (the cache is indexed by position modulo its length everywhere), not the whole context:
         // at 32k positions the 40 such passes would otherwise hold 10.7 GB. TORC_INK_RING=0 keeps every position;
         // so does the GPU tier, whose 16-bit copy shares the index
-        let ring = (!crate::switches::is("TORC_INK_RING", "0") && !gpu_attn())
-            .then_some(h.window + BLOCK_MAX + RING_SLACK)
+        // the GPU tier's Inkling kernel is written for this file's shape: 16 numbers a relative vector, a bias table
+        // 1024 back
+        let card = gpu_attn() && h.n_rel == 16 && h.extent == 1024;
+        if gpu_attn() && !card {
+            eprintln!(
+                "TORC_GPU_ATTN: this Inkling file's attention shape isn't one the GPU tier runs; the CPU does it"
+            );
+        }
+        let ring = (!crate::switches::is("TORC_INK_RING", "0") && !card)
+            .then_some((h.window + BLOCK_MAX + RING_SLACK).next_multiple_of(256))
             .filter(|&c| c < n_ctx as usize);
         // the cache's format: TORC_KV, else int8 with a scale a row (a quarter of f32's bytes to read for each token
         // written, which is most of writing at depth, for about the drift f32 shows). With TORC_GPU_ATTN the card
@@ -619,7 +633,7 @@ impl Ink {
                 Pass {
                     cap,
                     hist: vec![0.0; 3 * (2 * kvd + 2 * dm)],
-                    gkv: gpu_attn().then(|| crate::attn::KvCache::with(h.n_head_kv, h.head_dim, cap, true)),
+                    gkv: card.then(|| crate::attn::KvCache::with(h.n_head_kv, h.head_dim, cap, true)),
                     kc,
                 }
             })
@@ -682,7 +696,7 @@ impl Ink {
         let h = &self.h;
         let span = h.loop_end - h.loop_start;
         let l = if s < h.n_layer { s } else { h.loop_start + (s - h.n_layer) % span };
-        (if h.swa[l] { npos.saturating_sub(h.window) } else { 0 })..npos
+        (if h.swa[l] { (npos + 1).saturating_sub(h.window) } else { 0 })..npos
     }
 
     /// A chat's state after `npos` tokens, for a saved chat on disk (chat/saved.rs): `conv` (the convolution state at
@@ -715,8 +729,8 @@ impl Ink {
         self.pass[s].kc.row_bytes(self.h.head_dim)
     }
 
-    /// Puts state_bytes_at back: the convolution state, and the keys and values at their positions. Fails, leaving
-    /// the state partly written, if the bytes are not this model's at this context.
+    /// Puts state_bytes_at back: the convolution state, and the keys and values at their positions. Fails, writing
+    /// nothing, if the bytes are not this model's at this context (every check comes before the first write).
     pub fn set_state_bytes_at(&mut self, npos: usize, b: &[u8]) -> Result<()> {
         let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
         let word = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()) as usize;
@@ -839,7 +853,7 @@ impl Ink {
         let dm = h.d_model;
         let total = self.n_calls();
         if n == 0 || n > BLOCK_MAX || pos0 as usize + n > self.n_ctx as usize || from > to || to > total {
-            return err("a block of 1 to BLOCK_MAX tokens inside the context");
+            return err(format!("a block of 1 to {BLOCK_MAX} tokens inside the context"));
         }
         if pos0 == 0 {
             // a new sequence: the convolution state of the passes this run makes (only those: on a split, the passes

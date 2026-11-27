@@ -1,11 +1,12 @@
 //! saved.rs - saved chats on disk for Gemma 4, gpt-oss and Inkling 2 (their serve.rs). Gemma's and gpt-oss's whole
 //! state is a positional cache, so the cache's first n rows are the state after the prompt's first n tokens, whatever
-//! was read after them; Inkling's also has a convolution state, which its marks keep at each prompt's end (its
-//! serve.rs gives the state from the mark, or none once its ring has gone past it). A chat is saved (markfile) by the rules torc-server uses for the Qwen family: when a request for another
-//! chat comes in and the one being left has had two turns or more, or when no request has come for TORC_IDLE_SAVE
-//! seconds and it has had two turns or a prompt of TORC_IDLE_SAVE_MIN tokens; never under 512 tokens. What is saved is
-//! the chat's last prompt, which the next turn's prompt begins with. A prompt that begins with a saved chat loads it
-//! and reads only the rest, when that is at least 512 tokens less to read than the cache in memory leaves.
+//! was read after them; Inkling's also has a convolution state, which its marks keep at each prompt's end (its serve.rs
+//! gives the state from the mark, or none once its ring has gone past it). A chat is saved (markfile) by the rules
+//! torc-server uses for the Qwen family: when a request for another chat comes in and the one being left has had two
+//! turns or more, or when no request has come for TORC_IDLE_SAVE seconds and it has had two turns or a prompt of
+//! TORC_IDLE_SAVE_MIN tokens; never under 512 tokens. What is saved is the chat's last prompt, which the next turn's
+//! prompt begins with. A prompt that begins with a saved chat loads it and reads only the rest, when that is at least
+//! 512 tokens less to read than the cache in memory leaves.
 
 /// What saving and loading needs from a model.
 pub trait Positional {
