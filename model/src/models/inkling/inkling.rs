@@ -244,6 +244,76 @@ pub struct Ink {
     pub n_ctx: u32,
 }
 
+/// What a token block's passes carry from one layer pass to the next (forward_range): the stream, the earlier
+/// blocks' outputs, from the loop's start its input (stream and blocks) and, from its second pass, the pass before's
+/// blocks and output. Each vector is n x d_model; to_f32 / from_f32 send it between machines.
+#[derive(Clone)]
+pub struct Carry {
+    pub x: Vec<f32>,
+    pub blocks: Vec<Vec<f32>>,
+    pub prelude: Option<(Vec<f32>, Vec<Vec<f32>>)>,
+    pub bank: Option<(Vec<Vec<f32>>, Vec<f32>)>,
+}
+
+impl Carry {
+    /// As words: a header of counts (blocks; prelude present and its blocks; bank present and its blocks) as f32
+    /// bits, then every vector in that order.
+    pub fn to_f32(&self) -> Vec<f32> {
+        let (pn, pb) = self.prelude.as_ref().map_or((0, 0), |p| (1, p.1.len()));
+        let (bn, bb) = self.bank.as_ref().map_or((0, 0), |b| (1, b.0.len()));
+        let mut v: Vec<f32> = [self.blocks.len(), pn, pb, bn, bb].iter().map(|&k| f32::from_bits(k as u32)).collect();
+        v.extend(&self.x);
+        for b in &self.blocks {
+            v.extend(b);
+        }
+        if let Some((px, pbs)) = &self.prelude {
+            v.extend(px);
+            for b in pbs {
+                v.extend(b);
+            }
+        }
+        if let Some((bbs, bo)) = &self.bank {
+            for b in bbs {
+                v.extend(b);
+            }
+            v.extend(bo);
+        }
+        v
+    }
+
+    /// The carry to_f32 made, for vectors of len floats each.
+    pub fn from_f32(v: &[f32], len: usize) -> Result<Carry> {
+        if v.len() < 5 {
+            return err("carry: too short");
+        }
+        let k: Vec<usize> = v[..5].iter().map(|f| f.to_bits() as usize).collect();
+        if v.len() != 5 + len * (1 + k[0] + k[1] * (1 + k[2]) + k[3] * (k[4] + 1)) {
+            return err("carry: wrong length");
+        }
+        let mut at = 5;
+        let mut take = || {
+            let r = v[at..at + len].to_vec();
+            at += len;
+            r
+        };
+        let x = take();
+        let blocks = (0..k[0]).map(|_| take()).collect();
+        let prelude = if k[1] == 1 {
+            let px = take();
+            Some((px, (0..k[2]).map(|_| take()).collect()))
+        } else {
+            None
+        };
+        let bank = if k[3] == 1 {
+            let bbs: Vec<Vec<f32>> = (0..k[4]).map(|_| take()).collect();
+            Some((bbs, take()))
+        } else {
+            None
+        };
+        Ok(Carry { x, blocks, prelude, bank })
+    }
+}
+
 /// Runs f(i) for i in 0..n: on this thread for a single item, else over the pool (each item writes only its own
 /// rows, so the bits are the same either way).
 fn each(n: usize, f: &(dyn Fn(usize) + Sync)) {
@@ -720,61 +790,117 @@ impl Ink {
     /// pos0 - 1, as it is when the sequence is read in order, or put back by set_conv_state): writes the
     /// logits of the last one (or of all n when `all` is set, n x n_vocab) into logits.
     pub fn forward(&mut self, tokens: &[u32], pos0: u32, logits: &mut [f32], all: bool) -> Result<()> {
+        let total = self.n_calls();
+        self.forward_range(tokens, pos0, None, 0, total, Some((logits, all)))?;
+        Ok(())
+    }
+
+    /// The layer passes a token makes, in order: the prelude's layers, the looped layers loop_count times, the rest.
+    pub fn n_calls(&self) -> usize {
+        let h = &self.h;
+        h.loop_start + (h.loop_end - h.loop_start) * h.loop_count + (h.n_layer - h.loop_end)
+    }
+
+    /// Call c of n_calls: (the pass's state index, its layer, its loop pass or None outside the loop).
+    pub fn call(&self, c: usize) -> (usize, usize, Option<usize>) {
+        let h = &self.h;
+        let span = h.loop_end - h.loop_start;
+        if c < h.loop_start {
+            return (c, c, None);
+        }
+        let c2 = c - h.loop_start;
+        if c2 < span * h.loop_count {
+            let (pass, i) = (c2 / span, c2 % span);
+            let l = h.loop_start + i;
+            let s = if pass == 0 { l } else { h.n_layer + (pass - 1) * span + i };
+            return (s, l, Some(pass));
+        }
+        let l = h.loop_end + (c2 - span * h.loop_count);
+        (l, l, None)
+    }
+
+    /// forward over layer passes from..to (of n_calls): from 0 it starts with the embedding, otherwise from `carry`
+    /// (what a run up to `from` returned); at n_calls it ends with the head into `out`. Returns the carry when it stops
+    /// short of the end. Two machines split a token's passes this way (pipe.rs) with the same steps in the same order
+    /// as one machine, so the same bits.
+    pub fn forward_range(
+        &mut self,
+        tokens: &[u32],
+        pos0: u32,
+        carry: Option<Carry>,
+        from: usize,
+        to: usize,
+        out: Option<(&mut [f32], bool)>,
+    ) -> Result<Option<Carry>> {
         let h = self.h.clone();
         let n = tokens.len();
         let _w = (n <= 16).then(crate::pool::Width::decode);
         let dm = h.d_model;
-        if n == 0 || n > BLOCK_MAX || pos0 as usize + n > self.n_ctx as usize {
+        let total = self.n_calls();
+        if n == 0 || n > BLOCK_MAX || pos0 as usize + n > self.n_ctx as usize || from > to || to > total {
             return err("a block of 1 to BLOCK_MAX tokens inside the context");
         }
         if pos0 == 0 {
-            self.reset();
+            // a new sequence: the convolution state of the passes this run makes (only those: on a split, the passes
+            // before `from` have already read this block)
+            for ci in from..to {
+                let s = self.call(ci).0;
+                self.pass[s].hist.fill(0.0);
+            }
         }
-        let mut lap = crate::Laps::start(&PROF);
-        // the embedding (padded rows in the file), normed
         let emb = self.w.need("token_embd.weight")?;
         let (rb, nv) = (emb.row_bytes(), emb.shape().1);
-        let mut x = vec![0.0f32; n * dm];
-        let mut row = vec![0.0f32; emb.shape().0];
-        for (t, &tok) in tokens.iter().enumerate() {
-            if tok as usize >= h.n_vocab {
-                return err("token out of range");
+        let mut c = match carry {
+            Some(c) if from > 0 => c,
+            None if from == 0 => {
+                let mut lap = crate::Laps::start(&PROF);
+                // the embedding (padded rows in the file), normed
+                let mut x = vec![0.0f32; n * dm];
+                let mut row = vec![0.0f32; emb.shape().0];
+                for (t, &tok) in tokens.iter().enumerate() {
+                    if tok as usize >= h.n_vocab {
+                        return err("token out of range");
+                    }
+                    kops::dequantize(emb.t.ty, &emb.data[tok as usize * rb..(tok as usize + 1) * rb], &mut row);
+                    rms_norm(&mut x[t * dm..(t + 1) * dm], &row[..dm], &self.tok_norm, h.eps);
+                }
+                lap.lap(0);
+                Carry { x, blocks: Vec::new(), prelude: None, bank: None }
             }
-            kops::dequantize(emb.t.ty, &emb.data[tok as usize * rb..(tok as usize + 1) * rb], &mut row);
-            rms_norm(&mut x[t * dm..(t + 1) * dm], &row[..dm], &self.tok_norm, h.eps);
-        }
-        let mut blocks: Vec<Vec<f32>> = Vec::new();
-        lap.lap(0);
-        for l in 0..h.loop_start {
-            self.layer(l, l, &mut x, &mut blocks, None, pos0, n)?;
-        }
-        // every pass over the looped layers starts from here; from the second on, with the messages of the one before
-        let (prelude, prelude_blocks) = (x.clone(), blocks.clone());
-        let span = h.loop_end - h.loop_start;
-        for pass in 0..h.loop_count {
-            let mut bank: Option<(Vec<Vec<f32>>, Vec<f32>)> = None;
-            if pass > 0 {
-                // the pass before: its blocks after the first looped one, and its output
-                bank = Some((blocks[prelude_blocks.len() + 1..].to_vec(), std::mem::replace(&mut x, prelude.clone())));
-                blocks = prelude_blocks.clone();
+            _ => return err("forward_range: a carry is needed exactly when starting past the first pass"),
+        };
+        for ci in from..to {
+            let (s, l, pass) = self.call(ci);
+            if let Some(pass) = pass
+                && l == h.loop_start
+            {
+                if pass == 0 {
+                    // every pass over the looped layers starts from here
+                    c.prelude = Some((c.x.clone(), c.blocks.clone()));
+                } else {
+                    // from the second on, with the messages of the one before: its blocks after the first looped one,
+                    // and its output
+                    let (px, pb) = c.prelude.clone().unwrap();
+                    let nb0 = pb.len();
+                    c.bank = Some((c.blocks[nb0 + 1..].to_vec(), std::mem::replace(&mut c.x, px)));
+                    c.blocks = pb;
+                }
             }
-            for l in h.loop_start..h.loop_end {
-                let s = if pass == 0 { l } else { h.n_layer + (pass - 1) * span + (l - h.loop_start) };
-                let msg = match (&bank, &self.layers[l].looped) {
-                    (Some((b, out)), Some(lp)) => Some(mix(b, out, &lp.msg_query, n, dm)),
-                    _ => None,
-                };
-                self.layer(s, l, &mut x, &mut blocks, msg.as_deref(), pos0, n)?;
-            }
+            let msg = match (pass, &c.bank, &self.layers[l].looped) {
+                (Some(p), Some((b, o)), Some(lp)) if p > 0 => Some(mix(b, o, &lp.msg_query, n, dm)),
+                _ => None,
+            };
+            self.layer(s, l, &mut c.x, &mut c.blocks, msg.as_deref(), pos0, n)?;
         }
-        for l in h.loop_end..h.n_layer {
-            self.layer(l, l, &mut x, &mut blocks, None, pos0, n)?;
+        if to < total {
+            return Ok(Some(c));
         }
+        let Some((logits, all)) = out else { return Ok(None) };
         // the output: the mix, the norm, the head, the soft cap
         let mut lap = crate::Laps::start(&PROF);
         let first = if all { 0 } else { n - 1 };
         let m = n - first;
-        let mixed = mix(&blocks, &x, &self.out_query, n, dm);
+        let mixed = mix(&c.blocks, &c.x, &self.out_query, n, dm);
         let mut xo = vec![0.0f32; m * dm];
         for t in first..n {
             rms_norm(
@@ -796,7 +922,7 @@ impl Ink {
             }
         }
         lap.lap(0);
-        Ok(())
+        Ok(None)
     }
 
     /// Layer pass `s` (on layer `l`'s weights) over the block's streams `x`, with the pass before's messages (n x 4

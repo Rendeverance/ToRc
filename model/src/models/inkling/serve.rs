@@ -26,8 +26,10 @@ struct Engine {
     ctx: usize,
     /// the tokens the model has read, in order (its state is the one after them)
     seen: Vec<u32>,
-    /// positions the convolution state is kept for, oldest first: (tokens read, state)
-    marks: Vec<(usize, Vec<f32>)>,
+    /// positions the convolution state is kept for, oldest first: (tokens read, state, the pipeline worker's)
+    marks: Vec<(usize, Vec<f32>, Vec<f32>)>,
+    /// TORC_INK_PIPE: the later layer passes on a second machine (pipe.rs)
+    pipe: Option<super::pipe::Pipe>,
     stops: Vec<u32>,
     name: String,
     /// the prompt is read in blocks of this many tokens (TORC_BLOCK, at most BLOCK_MAX)
@@ -44,13 +46,29 @@ impl Engine {
         if keep == self.seen.len() {
             return Ok(keep);
         }
-        self.marks.retain(|(p, _)| *p <= keep);
+        self.marks.retain(|(p, _, _)| *p <= keep);
         match self.marks.last() {
-            Some((p, state)) => {
+            Some((p, state, ws)) => {
                 self.m.set_conv_state(state)?;
+                if let Some(pp) = self.pipe.as_mut() {
+                    pp.set_state(ws)?;
+                }
                 Ok(*p)
             }
             None => Ok(0),
+        }
+    }
+
+    /// A block through the model (both machines when piped), with the last row's logits into `last` when given; a
+    /// piped block without them does not wait for the worker.
+    fn fwd(&mut self, toks: &[u32], pos: u32, last: Option<&mut [f32]>) -> format::Result<()> {
+        match (self.pipe.as_mut(), last) {
+            (Some(pp), l) => pp.forward(&mut self.m, toks, pos, l),
+            (None, Some(l)) => self.m.forward(toks, pos, l, false),
+            (None, None) => {
+                let mut scratch = vec![0.0f32; self.nv];
+                self.m.forward(toks, pos, &mut scratch, false)
+            }
         }
     }
 }
@@ -82,7 +100,9 @@ impl Serve for Engine {
         let mut p0 = keep;
         while p0 < ids.len() {
             let p1 = (p0 + self.block).min(ids.len());
-            self.m.forward(&ids[p0..p1], p0 as u32, &mut last, false)?;
+            // only the last block's logits are needed (a piped earlier block does not wait for the worker)
+            let ids_b = ids[p0..p1].to_vec();
+            self.fwd(&ids_b, p0 as u32, if p1 == ids.len() { Some(&mut last) } else { None })?;
             p0 = p1;
         }
         let read = ids.len() - keep;
@@ -91,7 +111,11 @@ impl Serve for Engine {
         if self.marks.len() == MARKS {
             self.marks.remove(0);
         }
-        self.marks.push((ids.len(), self.m.conv_state()));
+        let ws = match self.pipe.as_mut() {
+            Some(pp) => pp.state()?,
+            None => Vec::new(),
+        };
+        self.marks.push((ids.len(), self.m.conv_state(), ws));
         let tg = std::time::Instant::now();
         let (mut pend, mut n_out, mut n_think) = (Vec::<u8>::new(), 0usize, 0usize);
         let mut finish = "length";
@@ -122,7 +146,7 @@ impl Serve for Engine {
             if n_out == max || pos + 1 >= self.ctx {
                 break;
             }
-            self.m.forward(&[t], pos as u32, &mut last, false)?;
+            self.fwd(&[t], pos as u32, Some(&mut last))?;
             self.seen.push(t);
             pos += 1;
         }
@@ -196,15 +220,20 @@ pub fn open(path: &str, ctx: usize, name: Option<String>) -> Box<dyn Serve> {
         stops,
         name,
         block: crate::switches::num::<usize>("TORC_BLOCK").filter(|&b| b > 0).unwrap_or(512).min(BLOCK_MAX),
+        pipe: None,
         kept: 0,
         timed: (0, 0.0, 0.0, 0, 0.0),
         replies: 0,
     };
     // a warm-up turn, so the first request does not pay the first-use costs
     {
+        e.pipe = super::pipe::Pipe::from_env(&e.m).unwrap_or_else(|er| {
+            eprintln!("{}", er.0);
+            std::process::exit(1)
+        });
         let mut last = vec![0.0f32; nv];
-        let _ = e.m.forward(&[0u32; 16], 0, &mut last, false);
-        let _ = e.m.forward(&[0], 16, &mut last, false);
+        let _ = e.fwd(&[0u32; 16], 0, Some(&mut last));
+        let _ = e.fwd(&[0], 16, Some(&mut last));
         e.m.reset();
     }
     eprintln!("torc-server: Inkling 2, ctx {ctx}, loaded in {:.1} s (stops {:?})", t0.elapsed().as_secs_f64(), e.stops);

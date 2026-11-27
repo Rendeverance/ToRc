@@ -139,6 +139,35 @@ fn main() {
         kbench(&m, opt("kbench").as_deref() == Some("2"));
         return;
     }
+    // serve=PORT: the second machine of a two-machine pipeline (inkling/pipe.rs)
+    if let Some(port) = opt("serve").and_then(|v| v.parse::<u16>().ok()) {
+        model::models::inkling::pipe::serve(&mut m, port).unwrap_or_else(|e| fail(e));
+        return;
+    }
+    // TORC_INK_PIPE=host:port: passes past TORC_INK_SPLIT on that machine (only the last row's logits come back, the
+    // rest of `all` stays zero); split=S: the same split inside this process, the carry sent through to_f32 and back
+    // (a check that splitting changes no bit)
+    let mut pipe = model::models::inkling::pipe::Pipe::from_env(&m).unwrap_or_else(|e| fail(e));
+    let split: Option<usize> = opt("split").and_then(|v| v.parse().ok());
+    let (dm, total) = (m.h.d_model, m.n_calls());
+    // (piped, a block whose logits are not used does not wait for the worker: `need` false)
+    let mut fwd = |m: &mut Ink, ch: &[u32], p: u32, out: &mut [f32], all: bool, need: bool| -> format::Result<()> {
+        let k = ch.len();
+        if let Some(pp) = pipe.as_mut() {
+            if !need {
+                return pp.forward(m, ch, p, None);
+            }
+            let last = if all { &mut out[(k - 1) * nv..k * nv] } else { &mut out[..nv] };
+            return pp.forward(m, ch, p, Some(last));
+        }
+        if let Some(sp) = split {
+            let c = m.forward_range(ch, p, None, 0, sp, None)?.expect("carry");
+            let c2 = model::models::inkling::inkling::Carry::from_f32(&c.to_f32(), k * dm)?;
+            m.forward_range(ch, p, Some(c2), sp, total, Some((out, all)))?;
+            return Ok(());
+        }
+        m.forward(ch, p, out, all)
+    };
     println!(
         "loaded in {:.1} s: {} layer passes, {} tokens to read: {:?}",
         t0.elapsed().as_secs_f64(),
@@ -155,12 +184,13 @@ fn main() {
     if first > 0 {
         let mut p = 0;
         for ch in ids.chunks(first) {
-            m.forward(ch, p as u32, &mut all[p * nv..(p + ch.len()) * nv], true).unwrap_or_else(|e| fail(e));
+            let need = p + ch.len() == ids.len() || opt("ref").is_some() || opt("dump").is_some();
+            fwd(&mut m, ch, p as u32, &mut all[p * nv..(p + ch.len()) * nv], true, need).unwrap_or_else(|e| fail(e));
             p += ch.len();
         }
     } else {
         for (p, &id) in ids.iter().enumerate() {
-            m.forward(&[id], p as u32, &mut all[p * nv..(p + 1) * nv], false).unwrap_or_else(|e| fail(e));
+            fwd(&mut m, &[id], p as u32, &mut all[p * nv..(p + 1) * nv], false, true).unwrap_or_else(|e| fail(e));
             let top = argmax(&all[p * nv..(p + 1) * nv]) as u32;
             println!("  {p:4}  {id:6} {:?} -> {top:6} {:?}  ({:.3})", show(id), show(top), all[p * nv + top as usize]);
         }
@@ -187,7 +217,7 @@ fn main() {
         let t2 = Instant::now();
         let mut p = 0;
         for ch in ids.chunks(b) {
-            m.forward(ch, p as u32, &mut again[p * nv..(p + ch.len()) * nv], true).unwrap_or_else(|e| fail(e));
+            fwd(&mut m, ch, p as u32, &mut again[p * nv..(p + ch.len()) * nv], true, true).unwrap_or_else(|e| fail(e));
             p += ch.len();
         }
         let s = t2.elapsed().as_secs_f64();
@@ -206,7 +236,7 @@ fn main() {
         let mut text = Vec::new();
         for g in 0..gen_n {
             text.extend(tok.decode(next));
-            m.forward(&[next], (ids.len() + g) as u32, &mut lg, false).unwrap_or_else(|e| fail(e));
+            fwd(&mut m, &[next], (ids.len() + g) as u32, &mut lg, false, true).unwrap_or_else(|e| fail(e));
             next = argmax(&lg) as u32;
         }
         let s = t3.elapsed().as_secs_f64();

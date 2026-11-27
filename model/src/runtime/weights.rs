@@ -667,8 +667,18 @@ impl Weights {
             }
             let (mut n_large, mut bytes) = (0usize, 0usize);
             let mut exl = Vec::with_capacity(w.file.experts.len());
+            // TORC_LARGE_LAYERS=a-b: only layers a..b (a machine of a two-machine Inkling, which runs only some layers:
+            // the others are never touched, so they never come into RAM)
+            let only: Option<(u32, u32)> = crate::switches::get("TORC_LARGE_LAYERS").and_then(|v| {
+                let (a, b) = v.split_once('-')?;
+                Some((a.parse().ok()?, b.parse().ok()?))
+            });
             for g in 0..w.file.experts.len() {
                 let x = &w.file.experts[g];
+                if only.is_some_and(|(a, b)| x.layer < a || x.layer >= b) {
+                    exl.push(None);
+                    continue;
+                }
                 #[cfg(target_arch = "aarch64")]
                 let laid = !w.klay.is_empty() && x.pack.pieces().iter().any(|m| crate::repack::klay_type_on(m.ty));
                 #[cfg(not(target_arch = "aarch64"))]
