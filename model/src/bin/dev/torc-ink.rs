@@ -78,7 +78,12 @@ fn kbench(m: &Ink, spread: bool) {
             apply_group(&mut jobs, xq.view());
         }
         let s = t.elapsed().as_secs_f64();
-        println!("experts gate/up: {:.0} MB in {:.2} ms = {:.1} GB/s", bytes as f64 / 1e6, s * 1e3, bytes as f64 / s / 1e9);
+        println!(
+            "experts gate/up: {:.0} MB in {:.2} ms = {:.1} GB/s",
+            bytes as f64 / 1e6,
+            s * 1e3,
+            bytes as f64 / s / 1e9
+        );
         // attn_q of every layer (Q8_0)
         let (mut bytes, t) = (0usize, Instant::now());
         for l in 0..m.h.n_layer as u32 {
@@ -89,7 +94,12 @@ fn kbench(m: &Ink, spread: bool) {
             apply_group(&mut [(mm, &mut y[..])], xq.view());
         }
         let s = t.elapsed().as_secs_f64();
-        println!("attn_q (Q8_0): {:.0} MB in {:.2} ms = {:.1} GB/s", bytes as f64 / 1e6, s * 1e3, bytes as f64 / s / 1e9);
+        println!(
+            "attn_q (Q8_0): {:.0} MB in {:.2} ms = {:.1} GB/s",
+            bytes as f64 / 1e6,
+            s * 1e3,
+            bytes as f64 / s / 1e9
+        );
     }
 }
 
@@ -109,12 +119,14 @@ fn main() {
     };
     let tok = model::tok::Tokenizer::open(path).unwrap_or_else(|e| fail(e));
     // textfile=F: the prompt's text from a file (an 8k prompt is too long for a command line)
-    let text = opt("text").or_else(|| opt("textfile").map(|f| {
-        std::fs::read_to_string(&f).unwrap_or_else(|e| {
-            eprintln!("{f}: {e}");
-            std::process::exit(2)
+    let text = opt("text").or_else(|| {
+        opt("textfile").map(|f| {
+            std::fs::read_to_string(&f).unwrap_or_else(|e| {
+                eprintln!("{f}: {e}");
+                std::process::exit(2)
+            })
         })
-    }));
+    });
     let mut ids: Vec<u32> = match (text, opt("toks")) {
         (Some(t), _) => tok.encode(&t, true).unwrap_or_else(|e| fail(e)),
         (None, Some(f)) => std::fs::read(&f)
@@ -144,7 +156,7 @@ fn main() {
         model::models::inkling::pipe::serve(&mut m, port).unwrap_or_else(|e| fail(e));
         return;
     }
-    // TORC_INK_PIPE=host:port: passes past TORC_INK_SPLIT on that machine (only the last row's logits come back, the
+    // TORC_PIPE=host:port: passes past TORC_PIPE_SPLIT on that machine (only the last row's logits come back, the
     // rest of `all` stays zero); split=S: the same split inside this process, the carry sent through to_f32 and back
     // (a check that splitting changes no bit)
     let mut pipe = model::models::inkling::pipe::Pipe::from_env(&m).unwrap_or_else(|e| fail(e));
@@ -234,10 +246,35 @@ fn main() {
         }
         let t3 = Instant::now();
         let mut text = Vec::new();
+        // ngram=N: how often a prompt-lookup draft (the token that followed the latest earlier match of the last N
+        // tokens, in the prompt and what is written so far) is the token written: the hit rate drafts would get
+        let ngram: usize = opt("ngram").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut hist: Vec<u32> = ids.clone();
+        let (mut tried, mut hit) = (0usize, 0usize);
+        let guess = |h: &[u32], k: usize| -> Option<u32> {
+            if k == 0 || h.len() <= k {
+                return None;
+            }
+            let tail = &h[h.len() - k..];
+            (0..h.len() - k).rev().find(|&i| &h[i..i + k] == tail).map(|i| h[i + k])
+        };
         for g in 0..gen_n {
             text.extend(tok.decode(next));
+            hist.push(next);
+            let draft = guess(&hist, ngram);
             fwd(&mut m, &[next], (ids.len() + g) as u32, &mut lg, false, true).unwrap_or_else(|e| fail(e));
             next = argmax(&lg) as u32;
+            if let Some(d) = draft {
+                tried += 1;
+                hit += (d == next) as usize;
+            }
+        }
+        if ngram > 0 {
+            println!(
+                "ngram {ngram} drafts: {tried} of {gen_n} steps had one, {hit} right ({:.0}% of steps, {:.0}% of drafts)",
+                100.0 * hit as f64 / gen_n as f64,
+                100.0 * hit as f64 / tried.max(1) as f64
+            );
         }
         let s = t3.elapsed().as_secs_f64();
         println!(

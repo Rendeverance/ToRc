@@ -266,10 +266,7 @@ unsafe fn pack<const T: u8>(w: &[u8], row_bytes: usize, r0: usize, nb: usize, pa
             _mm256_set1_epi8(12),
         );
         // IQ4_NL's levels plus 128 (1..241, unsigned), looked up by nibble
-        let lq = _mm256_add_epi8(
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(crate::IQ4_LEVELS.as_ptr().cast())),
-            sign,
-        );
+        let lq = _mm256_add_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(crate::IQ4_LEVELS.as_ptr().cast())), sign);
         // the 32 weights' nibbles, weights 0-15 then 16-31, from the 16 bytes at p
         let nibbles = |p: *const u8| {
             let q = _mm_loadu_si128(p as *const __m128i);
