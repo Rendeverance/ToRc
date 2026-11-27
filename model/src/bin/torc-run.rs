@@ -25,8 +25,17 @@ fn main() {
         args.iter().filter(|a| !OPTIONS.iter().any(|o| a.starts_with(o)) && !FLAGS.contains(&a.as_str())).collect();
     // a pipeline or expert worker reads no tokens, so the tokens file may be left out
     let serving = args.iter().any(|a| a.starts_with("serve-pipe=") || a.starts_with("serve-ep="));
-    // a pipeline worker loads ahead only its own layers (pipe::own_layers), so it says so before the model loads
-    if args.iter().any(|a| a.starts_with("serve-pipe=")) {
+    // an Inkling 2 file: a pipeline worker runs Inkling's own forward pass (below)
+    let inkling = pos.first().is_some_and(|p| {
+        format::read::Model::open(p)
+            .ok()
+            .and_then(|f| format::meta::Meta::parse(&f.metadata).ok())
+            .is_some_and(|mm| mm.str("general.architecture") == Some("inkling2_loop"))
+    });
+    // a pipeline worker loads ahead only its own layers (pipe::own_layers), so it says so before the model loads.
+    // Not Inkling's: own_layers counts layers by the qwen engine's split, and Inkling's split counts layer passes
+    // (its machines take TORC_CACHE_LAYERS when they need a share, as one machine does)
+    if args.iter().any(|a| a.starts_with("serve-pipe=")) && !inkling {
         model::pipe::set_worker();
     }
     let raw = match pos.get(1) {
@@ -55,10 +64,7 @@ fn main() {
     // serve-pipe=PORT on an Inkling 2 file: the worker runs Inkling's own forward pass over the same pipeline
     // (models/inkling/pipe.rs)
     if let Some(port) = args.iter().find_map(|a| a.strip_prefix("serve-pipe=")).and_then(|v| v.parse::<u16>().ok())
-        && format::read::Model::open(pos[0])
-            .ok()
-            .and_then(|f| format::meta::Meta::parse(&f.metadata).ok())
-            .is_some_and(|mm| mm.str("general.architecture") == Some("inkling2_loop"))
+        && inkling
     {
         let mut m = model::models::inkling::inkling::Ink::load(pos[0], n_ctx).unwrap_or_else(|e| {
             eprintln!("torc-run: {e}");
