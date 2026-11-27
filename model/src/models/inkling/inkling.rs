@@ -813,6 +813,81 @@ impl Ink {
         Ok(())
     }
 
+    /// Whether the state a saved chat needs is all in these f32 caches and the convolution state (not with the GPU
+    /// tier, which keeps a 16-bit copy of the keys and values beside them).
+    pub fn saves_whole_state(&self) -> bool {
+        self.pass.iter().all(|p| p.gkv.is_none())
+    }
+
+    /// The positions of pass `s`'s cache a sequence going on from `npos` reads: every one before it on a full pass,
+    /// the last `window` on a sliding-window pass.
+    fn kept_rows(&self, s: usize, npos: usize) -> std::ops::Range<usize> {
+        let h = &self.h;
+        let span = h.loop_end - h.loop_start;
+        let l = if s < h.n_layer { s } else { h.loop_start + (s - h.n_layer) % span };
+        (if h.swa[l] { npos.saturating_sub(h.window) } else { 0 })..npos
+    }
+
+    /// A chat's state after `npos` tokens, for a saved chat on disk (chat/saved.rs): `conv` (the convolution state at
+    /// npos, which a mark keeps), then each pass's keys and values at the positions going on from npos reads
+    /// (kept_rows), a key head at a time. As bytes: npos and conv's length (u32), then the f32s.
+    pub fn state_bytes_at(&self, npos: usize, conv: &[f32]) -> Vec<u8> {
+        let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
+        let mut v: Vec<f32> = conv.to_vec();
+        for (s, p) in self.pass.iter().enumerate() {
+            let rows = self.kept_rows(s, npos);
+            for c in [&p.k, &p.v] {
+                for g in 0..nkv {
+                    for q in rows.clone() {
+                        let at = (g * p.cap + q % p.cap) * hd;
+                        v.extend_from_slice(&c[at..at + hd]);
+                    }
+                }
+            }
+        }
+        let mut b = Vec::with_capacity(8 + v.len() * 4);
+        b.extend((npos as u32).to_le_bytes());
+        b.extend((conv.len() as u32).to_le_bytes());
+        for x in v {
+            b.extend(x.to_le_bytes());
+        }
+        b
+    }
+
+    /// Puts state_bytes_at back: the convolution state, and the keys and values at their positions. Fails, leaving
+    /// the state partly written, if the bytes are not this model's at this context.
+    pub fn set_state_bytes_at(&mut self, npos: usize, b: &[u8]) -> Result<()> {
+        let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
+        let word = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()) as usize;
+        let conv_len: usize = self.pass.iter().map(|p| p.hist.len()).sum();
+        let rows: usize = (0..self.pass.len()).map(|s| self.kept_rows(s, npos).len()).sum();
+        if npos > self.n_ctx as usize
+            || b.len() != 8 + 4 * (conv_len + 2 * nkv * hd * rows)
+            || word(0) != npos
+            || word(1) != conv_len
+        {
+            return err("a saved chat of another shape or length");
+        }
+        let f: Vec<f32> = b[8..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        self.set_conv_state(&f[..conv_len])?;
+        let mut at = conv_len;
+        for s in 0..self.pass.len() {
+            let r = self.kept_rows(s, npos);
+            let p = &mut self.pass[s];
+            for which in 0..2 {
+                for g in 0..nkv {
+                    for q in r.clone() {
+                        let o = (g * p.cap + q % p.cap) * hd;
+                        let c = if which == 0 { &mut p.k } else { &mut p.v };
+                        c[o..o + hd].copy_from_slice(&f[at..at + hd]);
+                        at += hd;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Forgets the sequence: every pass's convolution state back to zeros (keys and values are overwritten as the
     /// positions are read again).
     pub fn reset(&mut self) {

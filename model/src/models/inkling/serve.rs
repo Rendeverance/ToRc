@@ -39,6 +39,33 @@ struct Engine {
     kept: usize,
     timed: (usize, f64, f64, usize, f64),
     replies: u64,
+    /// chats saved on disk and loaded back (chat/saved.rs), on one machine without the GPU tier
+    saved: crate::chat::saved::Saved,
+}
+
+/// What saving a chat needs (chat/saved.rs): the model and the marks, since Inkling's state after a prompt is its
+/// keys and values plus the convolution state as it was at the prompt's end, which a mark keeps.
+struct Keep<'a> {
+    m: &'a mut Ink,
+    marks: &'a [(usize, Vec<f32>, usize)],
+}
+
+impl crate::chat::saved::Positional for Keep<'_> {
+    /// Empty when no mark is kept at npos (the ring has gone past it): the chat is then not saved.
+    fn state_bytes(&self, npos: usize) -> Vec<u8> {
+        match self.marks.iter().find(|mk| mk.0 == npos) {
+            Some(mk) => self.m.state_bytes_at(npos, &mk.1),
+            None => Vec::new(),
+        }
+    }
+    fn set_state_bytes(&mut self, npos: usize, b: &[u8]) -> format::Result<()> {
+        self.m.set_state_bytes_at(npos, b)
+    }
+    // the saved file's layer count is its state's: one per layer pass, the looped layers' later passes included
+    #[allow(clippy::misnamed_getters)]
+    fn n_layer(&self) -> usize {
+        self.m.h.n_pass
+    }
 }
 
 impl Engine {
@@ -140,12 +167,21 @@ impl Serve for Engine {
         // the longest prefix already read, kept one token short so the last prompt token runs for its logits
         let keep = self.seen.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
         let mut last = vec![0.0f32; self.nv];
+        // a chat saved on disk that the prompt begins with, when that is further on (and the chat being left saved,
+        // from its mark, before anything here moves the state)
+        let loaded = self.saved.begin(&mut Keep { m: &mut self.m, marks: &self.marks }, &ids, keep);
         // a mark gone back to through a broken link: the whole prompt is read again from a new connection
-        let (keep, mut recovered) = match self.rewind(keep) {
-            Ok(k) => (k, false),
-            Err(e) => {
-                self.recover(&ids, &mut last, e)?;
-                (0, true)
+        let (keep, mut recovered) = if loaded > keep {
+            // the marks past what the prompt and this machine share were over rows the load has written
+            self.marks.retain(|(p, _, _)| *p <= keep);
+            (loaded, false)
+        } else {
+            match self.rewind(keep) {
+                Ok(k) => (k, false),
+                Err(e) => {
+                    self.recover(&ids, &mut last, e)?;
+                    (0, true)
+                }
             }
         };
         self.seen = ids[..keep].to_vec();
@@ -181,6 +217,7 @@ impl Serve for Engine {
         if saved {
             self.marks.push((ids.len(), self.m.conv_state(), slot));
         }
+        self.saved.read(&ids);
         let tg = std::time::Instant::now();
         let (mut pend, mut n_out, mut n_think) = (Vec::<u8>::new(), 0usize, 0usize);
         let mut finish = "length";
@@ -253,7 +290,9 @@ impl Serve for Engine {
         self.replies
     }
 
-    fn idle(&mut self) {}
+    fn idle(&mut self) {
+        self.saved.idle(&mut Keep { m: &mut self.m, marks: &self.marks });
+    }
 }
 
 /// Loads an Inkling 2 file for torc-server: the worker pool is up already, `ctx` is the context length and `name`
@@ -294,6 +333,8 @@ pub fn open(path: &str, ctx: usize, name: Option<String>) -> Box<dyn Serve> {
         kept: 0,
         timed: (0, 0.0, 0.0, 0, 0.0),
         replies: 0,
+        // switched on below once it is known whether the model runs on one machine
+        saved: crate::chat::saved::Saved::new(false, &[0; 32], ""),
     };
     // a warm-up turn, so the first request does not pay the first-use costs
     {
@@ -306,6 +347,13 @@ pub fn open(path: &str, ctx: usize, name: Option<String>) -> Box<dyn Serve> {
         if e.pipe.is_some() && !crate::switches::given("TORC_BLOCK") {
             e.block = 256;
         }
+        // saved chats on disk: on one machine (a pipeline worker's half of the state is not saved with them) and
+        // without the GPU tier (whose 16-bit copy of the keys and values a load would not refill)
+        e.saved = crate::chat::saved::Saved::new(
+            e.pipe.is_none() && e.m.saves_whole_state(),
+            &e.m.w.file.header.model_id,
+            "inkling2",
+        );
         let mut last = vec![0.0f32; nv];
         let _ = e.fwd(&[0u32; 16], 0, Some(&mut last));
         let _ = e.fwd(&[0], 16, Some(&mut last));
