@@ -37,7 +37,11 @@ The switches are read once, when the program starts, so changing one means start
 | `TORC_BLOCK` | setting | the prompt block size the server reads with (else the tuned value, else the rule: 512 on the CPU, 256 with the NPU, or 1024 with the NPU on the Qwen3.6-35B and the other Qwen3.5 / 3.6 MoE models when the whole model is in memory, and 128 on two machines) |
 | `TORC_BLOCK_LONG` | setting | block size for long prompts |
 | `TORC_CHECKPOINT`, `TORC_CHECKPOINT_MIN` | development: `TORC_CHECKPOINT`; the rest setting | state checkpoints while reading a prompt (retry granularity; the fewest tokens worth one) |
-| `TORC_GEMM_MIN`, `TORC_PACKED_MIN` | development | from how many vectors the packed matrix kernels take over |
+| `TORC_LARGE_LAYERS` | setting | `a-b`: TORC_EXPERTS_LARGE copies only layers a..b (a two-machine Inkling's share; the rest stay untouched in the mapping) |
+| `TORC_INK_WAVE` | development | Inkling: `0` runs a prompt block's experts one at a time instead of as one wave (same bits) |
+| `TORC_INK_RING` | development | Inkling: `0` keeps every position in the sliding-window layers' cache; by default they keep a ring of their window plus 5,120 positions (same bits; going back to a saved mark further than that reads the prompt again). Off with `TORC_GPU_ATTN` |
+| `TORC_KV` | development | the attention cache's format: `f32`, `16` (sixteen-bit integers, a scale a row) or `8` (int8, a scale a row). Inkling (on the shared engine, fattn.rs, with its bias by distance and per-token sink): default `8` (`f32` keeps the numbers as computed, for a reference or a GPU path to match). The Qwen family: replaces its default (int8; sixteen bits for qwen4exp); not deepseek2. An f32 cache keeps attention on the CPU (the GPU tier takes 8 and 16) |
+| `TORC_GEMM_MIN`, `TORC_PACKED_MIN`, `TORC_GEMM_IQ4` | development | from how many vectors the packed matrix kernels take over; `TORC_GEMM_IQ4=0` keeps x86 IQ4_NL on the row kernels |
 | `TORC_MULTI`, `TORC_GROUPED`, `TORC_GROUPED_MAX` | development | multi-vector and grouped expert products |
 | `TORC_RC`, `TORC_RC_WIDE` | development | rows per task in the row-split products |
 | `TORC_FUSE` | development | fuses the down products into the gate/up sweep |
@@ -48,6 +52,7 @@ The switches are read once, when the program starts, so changing one means start
 | Switch | Kind | What it does |
 |---|---|---|
 | `TORC_DOT`, `TORC_DOTN` | development | dot-product kernel variant for router and dense rows |
+| `TORC_IQ4_ROWS` | development | IQ4_NL rows a pass for one vector on ARM (1, 2 the default, or 4; the same bits) |
 | `TORC_KMM`, `TORC_KMM_MIN`, `TORC_KMM8_MIN`, `TORC_KMM_PANEL`, `TORC_KMM_X86_MIN` | development | K-quant matrix kernels and their thresholds |
 | `TORC_MMLA`, `TORC_MMLA_MIN`, `TORC_MMLA8_MIN`, `TORC_MMLA_PANEL`, `TORC_VPANEL` | development | ARM i8mm (SMMLA) kernels and their thresholds |
 | `TORC_Q4X4`, `TORC_Q4X4_EXPERTS`, `TORC_Q4X4_HEAD`, `TORC_Q4X4_MIN`, `TORC_Q4X4_MAX` | setting: `TORC_Q4X4`; the rest development | repacked Q4_0 layout for i8mm machines |
@@ -81,7 +86,7 @@ The switches are read once, when the program starts, so changing one means start
 
 | Switch | Kind | What it does |
 |---|---|---|
-| `TORC_PIPE`, `TORC_PIPE_SPLIT`, `TORC_PIPE_PULL`, `TORC_PIPE_TIMEOUT`, `TORC_PIPE_FALLBACK`, `TORC_PIPE_TOPK` | development: `TORC_PIPE_TOPK`; the rest setting | the layer pipeline over two machines ([TWO-BOX.md](TWO-BOX.md)) |
+| `TORC_PIPE`, `TORC_PIPE_SPLIT`, `TORC_PIPE_PULL`, `TORC_PIPE_TIMEOUT`, `TORC_PIPE_FALLBACK`, `TORC_PIPE_TOPK` | development: `TORC_PIPE_TOPK`; the rest setting | the layer pipeline over two machines ([TWO-BOX.md](TWO-BOX.md)); for Inkling 2 the split counts layer passes (default 26 of 48) and the prompt is read in blocks of 256 |
 | `TORC_PIPE_BIND` | setting | on a worker: the address it listens on (default: every interface; a worker has no authentication) |
 | `TORC_PIPESPEC` | development | `0` turns pipelined speculation off |
 | `TORC_EP`, `TORC_EP_MIN_N` | development | expert-parallel worker and the smallest block worth sending |

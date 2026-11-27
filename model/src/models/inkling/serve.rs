@@ -16,8 +16,9 @@ use crate::api::Chat;
 use crate::serve::{Call, Reply, Serve};
 use serde_json::Value;
 
-/// The marks kept: the ends of the last prompts read.
+/// The marks kept: the ends of the last prompts read (on two machines, each in a worker mark slot of its own).
 const MARKS: usize = 4;
+const _: () = assert!(MARKS <= crate::pipe::MARK_SLOTS);
 
 struct Engine {
     m: Ink,
@@ -26,8 +27,11 @@ struct Engine {
     ctx: usize,
     /// the tokens the model has read, in order (its state is the one after them)
     seen: Vec<u32>,
-    /// positions the convolution state is kept for, oldest first: (tokens read, state)
-    marks: Vec<(usize, Vec<f32>)>,
+    /// positions the convolution state is kept for, oldest first: (tokens read, state, the pipeline worker's mark
+    /// slot holding its half)
+    marks: Vec<(usize, Vec<f32>, usize)>,
+    /// TORC_PIPE: the later layer passes on a second machine (pipe.rs)
+    pipe: Option<super::pipe::Pipe>,
     stops: Vec<u32>,
     name: String,
     /// the prompt is read in blocks of this many tokens (TORC_BLOCK, at most BLOCK_MAX)
@@ -35,6 +39,33 @@ struct Engine {
     kept: usize,
     timed: (usize, f64, f64, usize, f64),
     replies: u64,
+    /// chats saved on disk and loaded back (chat/saved.rs), on one machine without the GPU tier
+    saved: crate::chat::saved::Saved,
+}
+
+/// What saving a chat needs (chat/saved.rs): the model and the marks, since Inkling's state after a prompt is its
+/// keys and values plus the convolution state as it was at the prompt's end, which a mark keeps.
+struct Keep<'a> {
+    m: &'a mut Ink,
+    marks: &'a [(usize, Vec<f32>, usize)],
+}
+
+impl crate::chat::saved::Positional for Keep<'_> {
+    /// Empty when no mark is kept at npos (the ring has gone past it): the chat is then not saved.
+    fn state_bytes(&self, npos: usize) -> Vec<u8> {
+        match self.marks.iter().find(|mk| mk.0 == npos) {
+            Some(mk) => self.m.state_bytes_at(npos, &mk.1),
+            None => Vec::new(),
+        }
+    }
+    fn set_state_bytes(&mut self, npos: usize, b: &[u8]) -> format::Result<()> {
+        self.m.set_state_bytes_at(npos, b)
+    }
+    // the saved file's layer count is its state's: one per layer pass, the looped layers' later passes included
+    #[allow(clippy::misnamed_getters)]
+    fn n_layer(&self) -> usize {
+        self.m.h.n_pass
+    }
 }
 
 impl Engine {
@@ -44,13 +75,72 @@ impl Engine {
         if keep == self.seen.len() {
             return Ok(keep);
         }
-        self.marks.retain(|(p, _)| *p <= keep);
+        self.marks.retain(|(p, _, _)| *p <= keep);
         match self.marks.last() {
-            Some((p, state)) => {
+            Some((p, state, slot)) => {
                 self.m.set_conv_state(state)?;
+                if let Some(pp) = self.pipe.as_mut() {
+                    pp.load(*slot)?;
+                }
                 Ok(*p)
             }
             None => Ok(0),
+        }
+    }
+
+    /// After an error on the link to the pipeline worker: a new connection (the worker's states start from zero),
+    /// this machine's state from zero and no marks kept, then `toks` read again from position 0 with the last one's
+    /// logits into `last`. Up to 3 tries; on one machine nothing is retried (its errors are not the link's). The
+    /// bits do not depend on the blocks a sequence is read in, so the state is the one the error interrupted.
+    fn recover(&mut self, toks: &[u32], last: &mut [f32], e: format::Error) -> format::Result<()> {
+        if self.pipe.is_none() || toks.is_empty() {
+            return Err(e);
+        }
+        let mut err = e;
+        for tries in 1..=3 {
+            eprintln!(
+                "torc-server: {}; reconnecting, the {} tokens so far read again (try {tries} of 3)",
+                err.0,
+                toks.len()
+            );
+            self.marks.clear();
+            self.m.reset();
+            if let Some(pp) = self.pipe.as_mut() {
+                pp.forget_pending();
+            }
+            let r = crate::pipe::reconnect().and_then(|_| {
+                let mut p0 = 0;
+                while p0 < toks.len() {
+                    let p1 = (p0 + self.block).min(toks.len());
+                    let b = toks[p0..p1].to_vec();
+                    self.fwd(&b, p0 as u32, if p1 == toks.len() { Some(&mut *last) } else { None })?;
+                    p0 = p1;
+                }
+                Ok(())
+            });
+            match r {
+                Ok(()) => return Ok(()),
+                Err(e2) => err = e2,
+            }
+        }
+        Err(err)
+    }
+
+    /// A block through the model (both machines when piped), with the last row's logits into `last` when given; a
+    /// piped block without them does not wait for the worker.
+    fn fwd(&mut self, toks: &[u32], pos: u32, last: Option<&mut [f32]>) -> format::Result<()> {
+        // a mark whose window the sliding-window passes' ring is about to overwrite can't be gone back to any more
+        // (on two machines the worker's ring is the same length, so the same marks go there too)
+        let upto = pos as usize + toks.len() - 1;
+        let m = &self.m;
+        self.marks.retain(|(p, _, _)| !m.ring_lost(*p, upto));
+        match (self.pipe.as_mut(), last) {
+            (Some(pp), l) => pp.forward(&mut self.m, toks, pos, l),
+            (None, Some(l)) => self.m.forward(toks, pos, l, false),
+            (None, None) => {
+                let mut scratch = vec![0.0f32; self.nv];
+                self.m.forward(toks, pos, &mut scratch, false)
+            }
         }
     }
 }
@@ -76,22 +166,58 @@ impl Serve for Engine {
         let tp = std::time::Instant::now();
         // the longest prefix already read, kept one token short so the last prompt token runs for its logits
         let keep = self.seen.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
-        let keep = self.rewind(keep)?;
-        self.seen = ids[..keep].to_vec();
         let mut last = vec![0.0f32; self.nv];
+        // a chat saved on disk that the prompt begins with, when that is further on (and the chat being left saved,
+        // from its mark, before anything here moves the state)
+        let loaded = self.saved.begin(&mut Keep { m: &mut self.m, marks: &self.marks }, &ids, keep);
+        // a mark gone back to through a broken link: the whole prompt is read again from a new connection
+        let (keep, mut recovered) = if loaded > keep {
+            // the marks past what the prompt and this machine share were over rows the load has written
+            self.marks.retain(|(p, _, _)| *p <= keep);
+            (loaded, false)
+        } else {
+            match self.rewind(keep) {
+                Ok(k) => (k, false),
+                Err(e) => {
+                    self.recover(&ids, &mut last, e)?;
+                    (0, true)
+                }
+            }
+        };
+        self.seen = ids[..keep].to_vec();
         let mut p0 = keep;
-        while p0 < ids.len() {
+        while p0 < ids.len() && !recovered {
             let p1 = (p0 + self.block).min(ids.len());
-            self.m.forward(&ids[p0..p1], p0 as u32, &mut last, false)?;
+            // only the last block's logits are needed (a piped earlier block does not wait for the worker)
+            let ids_b = ids[p0..p1].to_vec();
+            if let Err(e) = self.fwd(&ids_b, p0 as u32, if p1 == ids.len() { Some(&mut last) } else { None }) {
+                self.recover(&ids, &mut last, e)?;
+                recovered = true;
+            }
             p0 = p1;
         }
+        // after a recovery the whole prompt was read again
+        let keep = if recovered { 0 } else { keep };
         let read = ids.len() - keep;
         let prompt_s = tp.elapsed().as_secs_f64();
         self.seen = ids.clone();
         if self.marks.len() == MARKS {
             self.marks.remove(0);
         }
-        self.marks.push((ids.len(), self.m.conv_state()));
+        // the worker keeps its half of the mark in a slot no other mark kept here uses (a mark the broken link could
+        // not take is not kept: the state itself is read again, so the reply goes on)
+        let slot = (0..MARKS).find(|k| self.marks.iter().all(|m| m.2 != *k)).unwrap_or(0);
+        let saved = match self.pipe.as_mut().map(|pp| pp.save(slot)) {
+            Some(Err(e)) => {
+                self.recover(&ids, &mut last, e)?;
+                false
+            }
+            _ => true,
+        };
+        if saved {
+            self.marks.push((ids.len(), self.m.conv_state(), slot));
+        }
+        self.saved.read(&ids);
         let tg = std::time::Instant::now();
         let (mut pend, mut n_out, mut n_think) = (Vec::<u8>::new(), 0usize, 0usize);
         let mut finish = "length";
@@ -122,7 +248,12 @@ impl Serve for Engine {
             if n_out == max || pos + 1 >= self.ctx {
                 break;
             }
-            self.m.forward(&[t], pos as u32, &mut last, false)?;
+            if let Err(e) = self.fwd(&[t], pos as u32, Some(&mut last)) {
+                // the reply so far and t read again from a new connection; the reply goes on from there
+                let mut toks = self.seen.clone();
+                toks.push(t);
+                self.recover(&toks, &mut last, e)?;
+            }
             self.seen.push(t);
             pos += 1;
         }
@@ -159,7 +290,9 @@ impl Serve for Engine {
         self.replies
     }
 
-    fn idle(&mut self) {}
+    fn idle(&mut self) {
+        self.saved.idle(&mut Keep { m: &mut self.m, marks: &self.marks });
+    }
 }
 
 /// Loads an Inkling 2 file for torc-server: the worker pool is up already, `ctx` is the context length and `name`
@@ -195,16 +328,35 @@ pub fn open(path: &str, ctx: usize, name: Option<String>) -> Box<dyn Serve> {
         marks: Vec::new(),
         stops,
         name,
-        block: crate::switches::num::<usize>("TORC_BLOCK").filter(|&b| b > 0).unwrap_or(64).min(BLOCK_MAX),
+        block: crate::switches::num::<usize>("TORC_BLOCK").filter(|&b| b > 0).unwrap_or(512).min(BLOCK_MAX),
+        pipe: None,
         kept: 0,
         timed: (0, 0.0, 0.0, 0, 0.0),
         replies: 0,
+        // switched on below once it is known whether the model runs on one machine
+        saved: crate::chat::saved::Saved::new(false, &[0; 32], ""),
     };
     // a warm-up turn, so the first request does not pay the first-use costs
     {
+        e.pipe = super::pipe::Pipe::from_env(&e.m).unwrap_or_else(|er| {
+            eprintln!("{}", er.0);
+            std::process::exit(1)
+        });
+        // two machines read in blocks of 256 unless TORC_BLOCK says otherwise: twice the blocks, so the two machines'
+        // halves overlap more
+        if e.pipe.is_some() && !crate::switches::given("TORC_BLOCK") {
+            e.block = 256;
+        }
+        // saved chats on disk: on one machine (a pipeline worker's half of the state is not saved with them) and
+        // without the GPU tier (whose 16-bit copy of the keys and values a load would not refill)
+        e.saved = crate::chat::saved::Saved::new(
+            e.pipe.is_none() && e.m.saves_whole_state(),
+            &e.m.w.file.header.model_id,
+            "inkling2",
+        );
         let mut last = vec![0.0f32; nv];
-        let _ = e.m.forward(&[0u32; 16], 0, &mut last, false);
-        let _ = e.m.forward(&[0], 16, &mut last, false);
+        let _ = e.fwd(&[0u32; 16], 0, Some(&mut last));
+        let _ = e.fwd(&[0], 16, Some(&mut last));
         e.m.reset();
     }
     eprintln!("torc-server: Inkling 2, ctx {ctx}, loaded in {:.1} s (stops {:?})", t0.elapsed().as_secs_f64(), e.stops);

@@ -29,7 +29,11 @@ use format::{BlockKind, Result, err};
 use kernels::{Q8, QK, ops as kops};
 
 /// The most tokens one call of forward takes.
-pub const BLOCK_MAX: usize = 256;
+pub const BLOCK_MAX: usize = 1024;
+
+/// Positions a sliding-window pass's ring keeps past its window and one block: how far a conversation can run on
+/// from a mark before going back to that mark means reading the prompt again (Ink::ring_lost).
+const RING_SLACK: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct InkHp {
@@ -198,14 +202,22 @@ struct ILayer {
     looped: Option<Loop>,
 }
 
-/// One layer pass's state: its keys and values at every position (so a prompt that extends an earlier one finds
-/// them), and the last three inputs of its four convolutions (keys, values, attention output, the experts' output),
-/// oldest first.
+/// One layer pass's state: its keys and values (so a prompt that extends an earlier one finds them) in the shared
+/// engine's cache (attn::KvCache, a key head at a time; TORC_KV picks its format, int8 by default; a ring of its last
+/// positions on a sliding-window pass that keeps one), and the last three inputs of its four convolutions (keys,
+/// values, attention output, the experts' output), oldest first.
 struct Pass {
-    k: Vec<f32>,
-    v: Vec<f32>,
+    kc: crate::attn::KvCache,
     cap: usize,
     hist: Vec<f32>,
+    /// TORC_GPU_ATTN=1 (gpu builds): the same keys and values at 16 bits with a scale a row, as the GPU tier takes
+    /// them (gpu::run_block_ink), kept beside kc
+    gkv: Option<crate::attn::KvCache>,
+}
+
+/// Whether prompt blocks' attention may go to the GPU tier (a gpu build with TORC_GPU_ATTN=1).
+fn gpu_attn() -> bool {
+    cfg!(feature = "gpu") && crate::switches::on("TORC_GPU_ATTN")
 }
 
 /// The time spent in each phase of forward, summed over calls (TORC_PROF=1).
@@ -231,6 +243,85 @@ pub struct Ink {
     out_norm: Vec<f32>,
     out_query: Vec<f32>,
     pub n_ctx: u32,
+    /// the sliding-window passes' cache length when they keep a ring of their last positions (None: every pass
+    /// keeps the whole context)
+    ring: Option<usize>,
+}
+
+/// What a token block's passes carry from one layer pass to the next (forward_range): the stream, the earlier
+/// blocks' outputs, from the loop's start its input (stream and blocks) and, from its second pass, the pass before's
+/// blocks and output. Each vector is n x d_model; to_f32 / from_f32 send it between machines.
+#[derive(Clone)]
+pub struct Carry {
+    pub x: Vec<f32>,
+    pub blocks: Vec<Vec<f32>>,
+    pub prelude: Option<(Vec<f32>, Vec<Vec<f32>>)>,
+    pub bank: Option<(Vec<Vec<f32>>, Vec<f32>)>,
+}
+
+impl Carry {
+    /// As words: a header of counts (blocks; prelude present and its blocks; bank present and its blocks) as f32
+    /// bits, then every vector in that order.
+    pub fn to_f32(&self) -> Vec<f32> {
+        let (pn, pb) = self.prelude.as_ref().map_or((0, 0), |p| (1, p.1.len()));
+        let (bn, bb) = self.bank.as_ref().map_or((0, 0), |b| (1, b.0.len()));
+        let mut v: Vec<f32> = [self.blocks.len(), pn, pb, bn, bb].iter().map(|&k| f32::from_bits(k as u32)).collect();
+        v.extend(&self.x);
+        for b in &self.blocks {
+            v.extend(b);
+        }
+        if let Some((px, pbs)) = &self.prelude {
+            v.extend(px);
+            for b in pbs {
+                v.extend(b);
+            }
+        }
+        if let Some((bbs, bo)) = &self.bank {
+            for b in bbs {
+                v.extend(b);
+            }
+            v.extend(bo);
+        }
+        v
+    }
+
+    /// The carry to_f32 made, for vectors of len floats each.
+    pub fn from_f32(v: &[f32], len: usize) -> Result<Carry> {
+        if v.len() < 5 {
+            return err("carry: too short");
+        }
+        let k: Vec<usize> = v[..5].iter().map(|f| f.to_bits() as usize).collect();
+        // the counts come over the link: a sum that overflows is a wrong length, not a wrap
+        let want = (|| {
+            let b = k[1].checked_mul(k[2].checked_add(1)?)?;
+            let c = k[3].checked_mul(k[4].checked_add(1)?)?;
+            1usize.checked_add(k[0])?.checked_add(b)?.checked_add(c)?.checked_mul(len)?.checked_add(5)
+        })();
+        if want != Some(v.len()) {
+            return err("carry: wrong length");
+        }
+        let mut at = 5;
+        let mut take = || {
+            let r = v[at..at + len].to_vec();
+            at += len;
+            r
+        };
+        let x = take();
+        let blocks = (0..k[0]).map(|_| take()).collect();
+        let prelude = if k[1] == 1 {
+            let px = take();
+            Some((px, (0..k[2]).map(|_| take()).collect()))
+        } else {
+            None
+        };
+        let bank = if k[3] == 1 {
+            let bbs: Vec<Vec<f32>> = (0..k[4]).map(|_| take()).collect();
+            Some((bbs, take()))
+        } else {
+            None
+        };
+        Ok(Carry { x, blocks, prelude, bank })
+    }
 }
 
 /// Runs f(i) for i in 0..n: on this thread for a single item, else over the pool (each item writes only its own
@@ -260,6 +351,9 @@ fn rms(out: &mut [f32], x: &[f32], eps: f32) {
         *o = v * scale;
     }
 }
+
+/// Whether the NPU tier runs Inkling's SITU feed-forwards (set at load), so its hot experts may go there.
+static SITU_NPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The product of two rows, summed in 16 lanes in a fixed order (so the bits do not depend on the machine's vector
 /// width): lane i takes every 16th pair from i, then the lanes are added in pairs.
@@ -336,22 +430,54 @@ fn mix(blocks: &[Vec<f32>], cur: &[f32], query: &[f32], n: usize, dm: usize) -> 
 /// A looped layer's input with the message of the pass before: (1 - forget) x + gain message, gain and forget each
 /// tanh of a rank-wide product of x and the message over their root mean squares. In place, n rows of dm.
 fn control(x: &mut [f32], msg: &[f32], c: &Ctrl, n: usize, dm: usize, rank: usize) {
+    // the rank-wide products first (each token's inputs over their root mean squares, then CTRL_SPLIT runs of the
+    // rank a token), then the gains and forgets in CTRL_SPLIT runs of the width a token: every number is the same dot
+    // as a token at a time, so the bits do not depend on n or on the split
+    let mut g = vec![0.0f32; n * 2 * dm];
+    {
+        let gp = SyncPtr::new(&mut g);
+        each(n, &|t| {
+            // SAFETY: item t owns token t's row of g
+            let gt = unsafe { gp.slice(t * 2 * dm, 2 * dm) };
+            rms(&mut gt[..dm], &x[t * dm..(t + 1) * dm], 1e-6);
+            rms(&mut gt[dm..], &msg[t * dm..(t + 1) * dm], 1e-6);
+        });
+    }
+    let mut low = vec![0.0f32; n * rank];
+    {
+        let lp = SyncPtr::new(&mut low);
+        let per = rank.div_ceil(CTRL_SPLIT);
+        each(n * CTRL_SPLIT, &|i| {
+            let (t, s) = (i / CTRL_SPLIT, i % CTRL_SPLIT);
+            let (r0, r1) = ((s * per).min(rank), ((s + 1) * per).min(rank));
+            let gt = &g[t * 2 * dm..(t + 1) * 2 * dm];
+            // SAFETY: item i owns ranks r0..r1 of token t
+            let lt = unsafe { lp.slice(t * rank + r0, r1 - r0) };
+            for (o, r) in lt.iter_mut().zip(r0..r1) {
+                *o = dot(&c.down[r * 2 * dm..(r + 1) * 2 * dm], gt);
+            }
+        });
+    }
     let xp = SyncPtr::new(x);
-    each(n, &|t| {
-        // SAFETY: item t owns token t's row of x
-        let xt = unsafe { xp.slice(t * dm, dm) };
-        let mt = &msg[t * dm..(t + 1) * dm];
-        let mut g = vec![0.0f32; 2 * dm];
-        rms(&mut g[..dm], xt, 1e-6);
-        rms(&mut g[dm..], mt, 1e-6);
-        let low: Vec<f32> = (0..rank).map(|r| dot(&c.down[r * 2 * dm..(r + 1) * 2 * dm], &g)).collect();
-        for i in 0..dm {
-            let gain = dot(&c.gain[i * rank..(i + 1) * rank], &low).tanh();
-            let forget = dot(&c.forget[i * rank..(i + 1) * rank], &low).tanh();
-            xt[i] = (xt[i] - forget * xt[i]) + gain * mt[i];
+    let per = dm.div_ceil(CTRL_SPLIT);
+    each(n * CTRL_SPLIT, &|i| {
+        let (t, s) = (i / CTRL_SPLIT, i % CTRL_SPLIT);
+        let (i0, i1) = ((s * per).min(dm), ((s + 1) * per).min(dm));
+        // SAFETY: item i owns numbers i0..i1 of token t's row of x
+        let xt = unsafe { xp.slice(t * dm + i0, i1 - i0) };
+        let mt = &msg[t * dm + i0..t * dm + i1];
+        let lt = &low[t * rank..(t + 1) * rank];
+        for (j, (xv, mv)) in xt.iter_mut().zip(mt).enumerate() {
+            let i = i0 + j;
+            let gain = dot(&c.gain[i * rank..(i + 1) * rank], lt).tanh();
+            let forget = dot(&c.forget[i * rank..(i + 1) * rank], lt).tanh();
+            *xv = (*xv - forget * *xv) + gain * mv;
         }
     });
 }
+
+/// How many runs a token's control is split into, so a single token's work spreads over the pool.
+const CTRL_SPLIT: usize = 16;
 
 /// A causal convolution of 4 taps with its residual, in place over n rows of c numbers, in token order: each
 /// number's last three inputs come from `hist` (3 x c, oldest first), which moves on. `taps` is c x 4, the last tap
@@ -385,6 +511,12 @@ fn convolve(x: &mut [f32], n: usize, c: usize, taps: &[f32], dynamic: Option<(&[
 
 impl Ink {
     pub fn load(path: &str, n_ctx: u32) -> Result<Ink> {
+        // ARM: the experts on large pages by default (TORC_EXPERTS_LARGE=0 turns it off). Small pages make the first
+        // pass slow and leave the experts' products waiting on address translation when each token asks for other
+        // experts; the mapped pages are handed back after the copy there (weights.rs), so only one copy is held
+        if cfg!(target_arch = "aarch64") && !crate::switches::given("TORC_EXPERTS_LARGE") {
+            crate::switches::set("TORC_EXPERTS_LARGE", "1");
+        }
         let w = Weights::load(path)?;
         let h = InkHp::from_meta(&w.file.metadata)?;
         crate::pipe::set_ident(
@@ -468,24 +600,71 @@ impl Ink {
             }
             layers.push(ly);
         }
-        // a layer pass's state: the passes after the first come after the layers, a looped stretch at a time
+        // a layer pass's state: the passes after the first come after the layers, a looped stretch at a time. A
+        // sliding-window pass reads only its last `window` positions, so it keeps a ring of window + a block +
+        // RING_SLACK of them (the cache is indexed by position modulo its length everywhere), not the whole context:
+        // at 32k positions the 40 such passes would otherwise hold 10.7 GB. TORC_INK_RING=0 keeps every position;
+        // so does the GPU tier, whose 16-bit copy shares the index
+        // the GPU tier's Inkling kernel is written for this file's shape: 16 numbers a relative vector, a bias table
+        // 1024 back
+        let card = gpu_attn() && h.n_rel == 16 && h.extent == 1024;
+        if gpu_attn() && !card {
+            eprintln!(
+                "TORC_GPU_ATTN: this Inkling file's attention shape isn't one the GPU tier runs; the CPU does it"
+            );
+        }
+        let ring = (!crate::switches::is("TORC_INK_RING", "0") && !card)
+            .then_some((h.window + BLOCK_MAX + RING_SLACK).next_multiple_of(256))
+            .filter(|&c| c < n_ctx as usize);
+        // the cache's format: TORC_KV, else int8 with a scale a row (a quarter of f32's bytes to read for each token
+        // written, which is most of writing at depth, for about the drift f32 shows). With TORC_GPU_ATTN the card
+        // keeps its 16-bit copy beside it, and the shared engine runs the CPU's share of each block
+        let kvf = crate::attn::kv_switch()?.unwrap_or(crate::attn::KvFmt::I8);
+        let span = h.loop_end - h.loop_start;
         let pass = (0..h.n_pass)
-            .map(|_| {
-                let cap = n_ctx as usize;
-                Pass { k: vec![0.0; cap * kvd], v: vec![0.0; cap * kvd], cap, hist: vec![0.0; 3 * (2 * kvd + 2 * dm)] }
+            .map(|s| {
+                let l = if s < h.n_layer { s } else { h.loop_start + (s - h.n_layer) % span };
+                let cap = match ring {
+                    Some(c) if h.swa[l] => c,
+                    _ => n_ctx as usize,
+                };
+                let mut kc = crate::attn::KvCache::with_fmt(h.n_head_kv, h.head_dim, cap, kvf);
+                kc.ring = cap < n_ctx as usize;
+                Pass {
+                    cap,
+                    hist: vec![0.0; 3 * (2 * kvd + 2 * dm)],
+                    gkv: card.then(|| crate::attn::KvCache::with(h.n_head_kv, h.head_dim, cap, true)),
+                    kc,
+                }
             })
             .collect();
         let tok_norm = w.need("token_embd_norm.weight")?.f32s()?;
         let out_norm = w.need("output_norm.weight")?.f32s()?;
         let out_query = w.need("output_res_query.weight")?.f32s()?;
-        Ok(Ink { h, w, layers, pass, tok_norm, out_norm, out_query, n_ctx })
+        // TORC_NPU=1: the dense products of big prompt blocks on the NPU (attention's q, gate, k, v and output),
+        // uploaded once for every pass that uses them, and with a usage profile (TORC_NPU_PROFILE, or this machine's
+        // own) each layer's most used experts too, whose feed-forwards the NPU runs with SITU; off, nothing changes
+        crate::npu::load(&w, h.n_layer as u32, &layers.iter().map(|ly: &ILayer| ly.group).collect::<Vec<_>>());
+        if crate::npu::up() {
+            let ok = crate::npu::set_situ(h.situ_beta, h.situ_lb);
+            SITU_NPU.store(ok, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("npu: SITU feed-forwards {}", if ok { "on" } else { "not available: no experts there" });
+        }
+        Ok(Ink { h, w, layers, pass, tok_norm, out_norm, out_query, n_ctx, ring })
+    }
+
+    /// Whether positions written up to `upto` have overwritten what going back to a mark after `p` tokens would read:
+    /// the sliding-window passes' ring holds each position until `cap` later ones, and reading on from p needs the
+    /// window before it. Always false when every pass keeps the whole context.
+    pub fn ring_lost(&self, p: usize, upto: usize) -> bool {
+        self.ring.is_some_and(|cap| upto + self.h.window >= p + 1 + cap)
     }
 
     pub fn n_vocab(&self) -> usize {
         self.h.n_vocab
     }
 
-    /// Every pass's convolution state, end to end: with the keys and values (kept by position), the model's whole
+    /// Every pass's convolution state, end to end: with the keys and values (in each pass's cache), the model's whole
     /// state after the tokens read so far. A prompt can go on from position p only with the state as it was at p.
     pub fn conv_state(&self) -> Vec<f32> {
         self.pass.iter().flat_map(|p| p.hist.iter().copied()).collect()
@@ -505,6 +684,86 @@ impl Ink {
         Ok(())
     }
 
+    /// Whether the state a saved chat needs is all in the passes' caches and the convolution state (not with the GPU
+    /// tier, which keeps a 16-bit copy of the keys and values beside them).
+    pub fn saves_whole_state(&self) -> bool {
+        self.pass.iter().all(|p| p.gkv.is_none())
+    }
+
+    /// The positions of pass `s`'s cache a sequence going on from `npos` reads: every one before it on a full pass,
+    /// the last `window` on a sliding-window pass.
+    fn kept_rows(&self, s: usize, npos: usize) -> std::ops::Range<usize> {
+        let h = &self.h;
+        let span = h.loop_end - h.loop_start;
+        let l = if s < h.n_layer { s } else { h.loop_start + (s - h.n_layer) % span };
+        (if h.swa[l] { (npos + 1).saturating_sub(h.window) } else { 0 })..npos
+    }
+
+    /// A chat's state after `npos` tokens, for a saved chat on disk (chat/saved.rs): `conv` (the convolution state at
+    /// npos, which a mark keeps), then each pass's keys and values at the positions going on from npos reads
+    /// (kept_rows), a key head at a time. As bytes: npos and conv's length (u32), conv's f32s, then each row in its
+    /// cache's format (attn::KvCache::put_row_bytes; f32 rows are 4 bytes a number).
+    pub fn state_bytes_at(&self, npos: usize, conv: &[f32]) -> Vec<u8> {
+        let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
+        let mut b = Vec::new();
+        b.extend((npos as u32).to_le_bytes());
+        b.extend((conv.len() as u32).to_le_bytes());
+        for x in conv {
+            b.extend(x.to_le_bytes());
+        }
+        for (s, p) in self.pass.iter().enumerate() {
+            let rows = self.kept_rows(s, npos);
+            for which in [false, true] {
+                for g in 0..nkv {
+                    for q in rows.clone() {
+                        p.kc.put_row_bytes(g, q, hd, which, &mut b);
+                    }
+                }
+            }
+        }
+        b
+    }
+
+    /// The bytes of one cache row of pass `s` in state_bytes_at.
+    fn row_bytes(&self, s: usize) -> usize {
+        self.pass[s].kc.row_bytes(self.h.head_dim)
+    }
+
+    /// Puts state_bytes_at back: the convolution state, and the keys and values at their positions. Fails, writing
+    /// nothing, if the bytes are not this model's at this context (every check comes before the first write).
+    pub fn set_state_bytes_at(&mut self, npos: usize, b: &[u8]) -> Result<()> {
+        let (nkv, hd) = (self.h.n_head_kv, self.h.head_dim);
+        let word = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()) as usize;
+        let conv_len: usize = self.pass.iter().map(|p| p.hist.len()).sum();
+        let kv_bytes: usize =
+            (0..self.pass.len()).map(|s| 2 * nkv * self.kept_rows(s, npos).len() * self.row_bytes(s)).sum();
+        if npos > self.n_ctx as usize
+            || b.len() < 8
+            || b.len() != 8 + 4 * conv_len + kv_bytes
+            || word(0) != npos
+            || word(1) != conv_len
+        {
+            return err("a saved chat of another shape or length");
+        }
+        let conv: Vec<f32> =
+            b[8..8 + 4 * conv_len].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        self.set_conv_state(&conv)?;
+        let mut at = 8 + 4 * conv_len;
+        for s in 0..self.pass.len() {
+            let (r, rb) = (self.kept_rows(s, npos), self.row_bytes(s));
+            let p = &mut self.pass[s];
+            for which in [false, true] {
+                for g in 0..nkv {
+                    for q in r.clone() {
+                        p.kc.set_row_bytes(g, q, hd, which, &b[at..at + rb]);
+                        at += rb;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Forgets the sequence: every pass's convolution state back to zeros (keys and values are overwritten as the
     /// positions are read again).
     pub fn reset(&mut self) {
@@ -517,61 +776,146 @@ impl Ink {
     /// pos0 - 1, as it is when the sequence is read in order, or put back by set_conv_state): writes the
     /// logits of the last one (or of all n when `all` is set, n x n_vocab) into logits.
     pub fn forward(&mut self, tokens: &[u32], pos0: u32, logits: &mut [f32], all: bool) -> Result<()> {
+        let total = self.n_calls();
+        self.forward_range(tokens, pos0, None, 0, total, Some((logits, all)))?;
+        Ok(())
+    }
+
+    /// The layer passes a token makes, in order: the prelude's layers, the looped layers loop_count times, the rest.
+    pub fn n_calls(&self) -> usize {
+        let h = &self.h;
+        h.loop_start + (h.loop_end - h.loop_start) * h.loop_count + (h.n_layer - h.loop_end)
+    }
+
+    /// Call c of n_calls: (the pass's state index, its layer, its loop pass or None outside the loop).
+    pub fn call(&self, c: usize) -> (usize, usize, Option<usize>) {
+        let h = &self.h;
+        let span = h.loop_end - h.loop_start;
+        if c < h.loop_start {
+            return (c, c, None);
+        }
+        let c2 = c - h.loop_start;
+        if c2 < span * h.loop_count {
+            let (pass, i) = (c2 / span, c2 % span);
+            let l = h.loop_start + i;
+            let s = if pass == 0 { l } else { h.n_layer + (pass - 1) * span + i };
+            return (s, l, Some(pass));
+        }
+        let l = h.loop_end + (c2 - span * h.loop_count);
+        (l, l, None)
+    }
+
+    /// The length of Carry::to_f32 for n tokens stopped before pass `from`: the header, then every vector it holds,
+    /// counted by walking the passes as forward_range does (the pipeline worker reads exactly this many).
+    pub fn carry_len(&self, from: usize, n: usize) -> usize {
+        // a control request (no tokens) carries nothing, not even the header
+        if n == 0 {
+            return 0;
+        }
+        let h = &self.h;
+        let (mut blocks, mut prelude, mut bank) = (0usize, None::<usize>, None::<usize>);
+        for ci in 0..from.min(self.n_calls()) {
+            let (_, l, pass) = self.call(ci);
+            if let Some(p) = pass
+                && l == h.loop_start
+            {
+                if p == 0 {
+                    prelude = Some(blocks);
+                } else if let Some(nb0) = prelude {
+                    bank = Some(blocks.saturating_sub(nb0 + 1));
+                    blocks = nb0;
+                }
+            }
+            if l.is_multiple_of(h.block) {
+                blocks += 1;
+            }
+        }
+        let vectors = 1 + blocks + prelude.map_or(0, |pb| 1 + pb) + bank.map_or(0, |bb| bb + 1);
+        5 + vectors * n * h.d_model
+    }
+
+    /// forward over layer passes from..to (of n_calls): from 0 it starts with the embedding, otherwise from `carry`
+    /// (what a run up to `from` returned); at n_calls it ends with the head into `out`. Returns the carry when it stops
+    /// short of the end. Two machines split a token's passes this way (pipe.rs) with the same steps in the same order
+    /// as one machine, so the same bits.
+    pub fn forward_range(
+        &mut self,
+        tokens: &[u32],
+        pos0: u32,
+        carry: Option<Carry>,
+        from: usize,
+        to: usize,
+        out: Option<(&mut [f32], bool)>,
+    ) -> Result<Option<Carry>> {
         let h = self.h.clone();
         let n = tokens.len();
         let _w = (n <= 16).then(crate::pool::Width::decode);
         let dm = h.d_model;
-        if n == 0 || n > BLOCK_MAX || pos0 as usize + n > self.n_ctx as usize {
-            return err("a block of 1 to 256 tokens inside the context");
+        let total = self.n_calls();
+        if n == 0 || n > BLOCK_MAX || pos0 as usize + n > self.n_ctx as usize || from > to || to > total {
+            return err(format!("a block of 1 to {BLOCK_MAX} tokens inside the context"));
         }
         if pos0 == 0 {
-            self.reset();
+            // a new sequence: the convolution state of the passes this run makes (only those: on a split, the passes
+            // before `from` have already read this block)
+            for ci in from..to {
+                let s = self.call(ci).0;
+                self.pass[s].hist.fill(0.0);
+            }
         }
-        let mut lap = crate::Laps::start(&PROF);
-        // the embedding (padded rows in the file), normed
         let emb = self.w.need("token_embd.weight")?;
         let (rb, nv) = (emb.row_bytes(), emb.shape().1);
-        let mut x = vec![0.0f32; n * dm];
-        let mut row = vec![0.0f32; emb.shape().0];
-        for (t, &tok) in tokens.iter().enumerate() {
-            if tok as usize >= h.n_vocab {
-                return err("token out of range");
+        let mut c = match carry {
+            Some(c) if from > 0 => c,
+            None if from == 0 => {
+                let mut lap = crate::Laps::start(&PROF);
+                // the embedding (padded rows in the file), normed
+                let mut x = vec![0.0f32; n * dm];
+                let mut row = vec![0.0f32; emb.shape().0];
+                for (t, &tok) in tokens.iter().enumerate() {
+                    if tok as usize >= h.n_vocab {
+                        return err("token out of range");
+                    }
+                    kops::dequantize(emb.t.ty, &emb.data[tok as usize * rb..(tok as usize + 1) * rb], &mut row);
+                    rms_norm(&mut x[t * dm..(t + 1) * dm], &row[..dm], &self.tok_norm, h.eps);
+                }
+                lap.lap(0);
+                Carry { x, blocks: Vec::new(), prelude: None, bank: None }
             }
-            kops::dequantize(emb.t.ty, &emb.data[tok as usize * rb..(tok as usize + 1) * rb], &mut row);
-            rms_norm(&mut x[t * dm..(t + 1) * dm], &row[..dm], &self.tok_norm, h.eps);
-        }
-        let mut blocks: Vec<Vec<f32>> = Vec::new();
-        lap.lap(0);
-        for l in 0..h.loop_start {
-            self.layer(l, l, &mut x, &mut blocks, None, pos0, n)?;
-        }
-        // every pass over the looped layers starts from here; from the second on, with the messages of the one before
-        let (prelude, prelude_blocks) = (x.clone(), blocks.clone());
-        let span = h.loop_end - h.loop_start;
-        for pass in 0..h.loop_count {
-            let mut bank: Option<(Vec<Vec<f32>>, Vec<f32>)> = None;
-            if pass > 0 {
-                // the pass before: its blocks after the first looped one, and its output
-                bank = Some((blocks[prelude_blocks.len() + 1..].to_vec(), std::mem::replace(&mut x, prelude.clone())));
-                blocks = prelude_blocks.clone();
+            _ => return err("forward_range: a carry is needed exactly when starting past the first pass"),
+        };
+        for ci in from..to {
+            let (s, l, pass) = self.call(ci);
+            if let Some(pass) = pass
+                && l == h.loop_start
+            {
+                if pass == 0 {
+                    // every pass over the looped layers starts from here
+                    c.prelude = Some((c.x.clone(), c.blocks.clone()));
+                } else {
+                    // from the second on, with the messages of the one before: its blocks after the first looped one,
+                    // and its output
+                    let (px, pb) = c.prelude.clone().unwrap();
+                    let nb0 = pb.len();
+                    c.bank = Some((c.blocks[nb0 + 1..].to_vec(), std::mem::replace(&mut c.x, px)));
+                    c.blocks = pb;
+                }
             }
-            for l in h.loop_start..h.loop_end {
-                let s = if pass == 0 { l } else { h.n_layer + (pass - 1) * span + (l - h.loop_start) };
-                let msg = match (&bank, &self.layers[l].looped) {
-                    (Some((b, out)), Some(lp)) => Some(mix(b, out, &lp.msg_query, n, dm)),
-                    _ => None,
-                };
-                self.layer(s, l, &mut x, &mut blocks, msg.as_deref(), pos0, n)?;
-            }
+            let msg = match (pass, &c.bank, &self.layers[l].looped) {
+                (Some(p), Some((b, o)), Some(lp)) if p > 0 => Some(mix(b, o, &lp.msg_query, n, dm)),
+                _ => None,
+            };
+            self.layer(s, l, &mut c.x, &mut c.blocks, msg.as_deref(), pos0, n)?;
         }
-        for l in h.loop_end..h.n_layer {
-            self.layer(l, l, &mut x, &mut blocks, None, pos0, n)?;
+        if to < total {
+            return Ok(Some(c));
         }
+        let Some((logits, all)) = out else { return Ok(None) };
         // the output: the mix, the norm, the head, the soft cap
         let mut lap = crate::Laps::start(&PROF);
         let first = if all { 0 } else { n - 1 };
         let m = n - first;
-        let mixed = mix(&blocks, &x, &self.out_query, n, dm);
+        let mixed = mix(&c.blocks, &c.x, &self.out_query, n, dm);
         let mut xo = vec![0.0f32; m * dm];
         for t in first..n {
             rms_norm(
@@ -593,7 +937,7 @@ impl Ink {
             }
         }
         lap.lap(0);
-        Ok(())
+        Ok(None)
     }
 
     /// Layer pass `s` (on layer `l`'s weights) over the block's streams `x`, with the pass before's messages (n x 4
@@ -675,24 +1019,52 @@ impl Ink {
         {
             let (tq, tr, ts, tg) =
                 (t_("attn_q.weight")?, t_("attn_rel.weight")?, t_("attn_sink_proj.weight")?, t_("attn_gate.weight")?);
-            apply_group_multi(
-                &mut [
-                    (Mat::of(&tq), &mut q[..]),
-                    (Mat::of(&tr), &mut rel[..]),
-                    (Mat::of(&ts), &mut sink[..]),
-                    (Mat::of(&tg), &mut gate[..]),
-                ],
-                qs[qi].view(),
-                n,
-            );
+            // TORC_NPU=1 (npu.rs): a big prompt block's q, gate, k and v products on the NPU, from the f32 inputs (not
+            // bit-identical: checked by tolerance); the small ones (relative vectors, sinks, the taps) stay here
+            if crate::npu::apply(&mut [(Mat::of(&tq), &mut q[..]), (Mat::of(&tg), &mut gate[..])], &ins[qi], n) {
+                apply_group_multi(&mut [(Mat::of(&tr), &mut rel[..]), (Mat::of(&ts), &mut sink[..])], qs[qi].view(), n);
+            } else {
+                apply_group_multi(
+                    &mut [
+                        (Mat::of(&tq), &mut q[..]),
+                        (Mat::of(&tr), &mut rel[..]),
+                        (Mat::of(&ts), &mut sink[..]),
+                        (Mat::of(&tg), &mut gate[..]),
+                    ],
+                    qs[qi].view(),
+                    n,
+                );
+            }
             let (tk, tv) = (t_("attn_k.weight")?, t_("attn_v.weight")?);
+            let npu_k = crate::npu::apply(&mut [(Mat::of(&tk), &mut kk[..])], &ins[ki], n);
+            let npu_v = crate::npu::apply(&mut [(Mat::of(&tv), &mut vv[..])], &ins[vi], n);
             if swa {
-                apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..])], qs[ki].view(), n);
-                apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..])], qs[vi].view(), n);
+                if !npu_k {
+                    apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..])], qs[ki].view(), n);
+                }
+                if !npu_v {
+                    apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..])], qs[vi].view(), n);
+                }
             } else {
                 let (pk, pv) = (t_("attn_k_conv_proj.weight")?, t_("attn_v_conv_proj.weight")?);
-                apply_group_multi(&mut [(Mat::of(&tk), &mut kk[..]), (Mat::of(&pk), &mut ktap[..])], qs[ki].view(), n);
-                apply_group_multi(&mut [(Mat::of(&tv), &mut vv[..]), (Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
+                if npu_k {
+                    apply_group_multi(&mut [(Mat::of(&pk), &mut ktap[..])], qs[ki].view(), n);
+                } else {
+                    apply_group_multi(
+                        &mut [(Mat::of(&tk), &mut kk[..]), (Mat::of(&pk), &mut ktap[..])],
+                        qs[ki].view(),
+                        n,
+                    );
+                }
+                if npu_v {
+                    apply_group_multi(&mut [(Mat::of(&pv), &mut vtap[..])], qs[vi].view(), n);
+                } else {
+                    apply_group_multi(
+                        &mut [(Mat::of(&tv), &mut vv[..]), (Mat::of(&pv), &mut vtap[..])],
+                        qs[vi].view(),
+                        n,
+                    );
+                }
             }
         }
         lap.lap(2);
@@ -706,7 +1078,14 @@ impl Ink {
         {
             let (qp, rp) = (SyncPtr::new(&mut q), SyncPtr::new(&mut rel));
             let (kp, vp) = (SyncPtr::new(&mut kk), SyncPtr::new(&mut vv));
-            let (ck, cv) = (SyncPtr::new(&mut st.k), SyncPtr::new(&mut st.v));
+            let gk = st.gkv.as_mut().map(|g| {
+                (
+                    SyncPtr::new(&mut g.k16),
+                    SyncPtr::new(&mut g.v16),
+                    SyncPtr::new(&mut g.k_scale),
+                    SyncPtr::new(&mut g.v_scale),
+                )
+            });
             each(n, &|t| {
                 let pos = pos0 as usize + t;
                 // the full-attention layers' queries grow slowly with the position
@@ -729,63 +1108,80 @@ impl Ink {
                     let c = vh.to_vec();
                     rms(vh, &c, h.eps);
                 }
-                let slot = (pos % cap) * kvd;
-                unsafe {
-                    ck.slice(slot, kvd).copy_from_slice(kt);
-                    cv.slice(slot, kvd).copy_from_slice(vt);
+                for g in (0..nkv).filter(|_| gk.is_some()) {
+                    let slot = (g * cap + pos % cap) * hd;
+                    if let Some((k16, v16, ks, vs)) = gk {
+                        let r = g * cap + pos % cap;
+                        // SAFETY: as above, the position's rows of the 16-bit copy
+                        unsafe {
+                            *ks.at(r) = crate::attn::quant16(&kt[g * hd..(g + 1) * hd], k16.slice(slot, hd));
+                            *vs.at(r) = crate::attn::quant16(&vt[g * hd..(g + 1) * hd], v16.slice(slot, hd));
+                        }
+                    }
                 }
             });
+        }
+        // then into the cache, in its format (TORC_KV; int8 by default)
+        for t in 0..n {
+            for g in 0..nkv {
+                let r = t * kvd + g * hd..t * kvd + (g + 1) * hd;
+                st.kc.put_row(g, pos0 as usize + t, hd, &kk[r.clone()], &vv[r]);
+            }
         }
         lap.lap(3);
         // 3. attention: each head's scores over the keys it sees, plus the bias by distance less the query's sink
         // logit, softmaxed with the sink's zero beside them
         let mut att = vec![0.0f32; n * qd];
         {
-            let ap = SyncPtr::new(&mut att);
-            let (ck, cv) = (&st.k, &st.v);
-            let scale = 1.0 / (hd as f32).sqrt();
-            let per = nh / nkv;
-            each(n, &|t| {
-                let pos = pos0 as usize + t;
-                let lo = if swa { (pos + 1).saturating_sub(h.window) } else { 0 };
-                // SAFETY: item t owns token t's row of att
-                let at = unsafe { ap.slice(t * qd, qd) };
-                let mut bias = vec![0.0f32; h.extent];
-                let mut sc = vec![0.0f32; pos + 1 - lo];
-                for hh in 0..nh {
-                    let (qh, rh) = (
-                        &q[t * qd + hh * hd..t * qd + (hh + 1) * hd],
-                        &rel[(t * nh + hh) * nr..(t * nh + hh + 1) * nr],
-                    );
-                    let g = hh / per;
-                    let sk = sink[t * nh + hh];
-                    for (d, b) in bias.iter_mut().enumerate() {
-                        *b = dot(&ly.rel_bias[d * nr..(d + 1) * nr], rh);
-                    }
-                    let mut mx = 0.0f32;
-                    for (i, p) in (lo..=pos).enumerate() {
-                        let d = pos - p;
-                        let k = &ck[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                        let b = if d < h.extent { bias[d] } else { 0.0 };
-                        sc[i] = dot(qh, k) * scale + (b - sk);
-                        mx = mx.max(sc[i]);
-                    }
-                    let mut sum = (-mx).exp();
-                    for v in sc.iter_mut() {
-                        *v = (*v - mx).exp();
-                        sum += *v;
-                    }
-                    let oh = &mut at[hh * hd..(hh + 1) * hd];
-                    for (i, p) in (lo..=pos).enumerate() {
-                        let wgt = sc[i] / sum;
-                        let v = &cv[(p % cap) * kvd + g * hd..(p % cap) * kvd + (g + 1) * hd];
-                        for (a, b) in oh.iter_mut().zip(v) {
-                            *a = wgt.mul_add(*b, *a);
-                        }
+            // the shared engine (fattn.rs) with Inkling's bias by distance and per-token sink (Extras), on the pass's
+            // cache (TORC_KV: f32, 16 or 8; int8 by default); then the output's gate
+            let kc = &st.kc;
+            let (scale, win) = (1.0 / (hd as f32).sqrt(), if swa { h.window } else { 0 });
+            let f = crate::fattn::Fattn::new(nh, nkv, hd, Some(scale), win);
+            // tokens a..b's extras (their rows of the relative vectors and sinks)
+            let ex = |a: usize, b: usize| crate::fattn::Extras {
+                rel: &rel[a * nh * nr..b * nh * nr],
+                relb: &ly.rel_bias,
+                nr,
+                ext: h.extent,
+                sink: &sink[a * nh..b * nh],
+            };
+            // TORC_GPU_ATTN=1: the card takes the block's first tokens from its 16-bit copy, the shared engine the rest
+            #[cfg(feature = "gpu")]
+            let on_gpu = match st.gkv.as_ref() {
+                Some(gkv) => {
+                    let ink = crate::gpu::InkExtras { rel: &rel, relb: &ly.rel_bias, snq: &sink };
+                    crate::gpu::run_block_ink(
+                        gkv,
+                        (nh, nkv, hd, scale, win),
+                        &ink,
+                        &q,
+                        qd,
+                        n,
+                        pos0 as usize,
+                        &mut att,
+                        &mut |a, b, o: &mut [f32]| {
+                            f.run_block_ex(kc, &q[a * qd..], qd, b - a, pos0 + a as u32, o, None, Some(&ex(a, b)))
+                        },
+                    )
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "gpu"))]
+            let on_gpu: Option<usize> = None;
+            match on_gpu {
+                Some(hi) => {
+                    if let Some(gkv) = st.gkv.as_mut() {
+                        gkv.gpu_lo = hi;
                     }
                 }
-                // the output's gate
-                for (a, g) in at.iter_mut().zip(&gate[t * qd..(t + 1) * qd]) {
+                None => f.run_block_ex(kc, &q, qd, n, pos0, &mut att, None, Some(&ex(0, n))),
+            }
+            let gp = SyncPtr::new(&mut att);
+            each(n, &|t| {
+                // SAFETY: item t owns token t's row of att
+                let o = unsafe { gp.slice(t * qd, qd) };
+                for (a, g) in o.iter_mut().zip(&gate[t * qd..(t + 1) * qd]) {
                     *a *= 1.0 / (1.0 + (-g).exp());
                 }
             });
@@ -794,7 +1190,9 @@ impl Ink {
         let mut out = vec![0.0f32; n * dm];
         {
             let two = t_("attn_output.weight")?;
-            apply_group_multi(&mut [(Mat::of(&two), &mut out[..])], quant(&att, n, qd).view(), n);
+            if !crate::npu::apply(&mut [(Mat::of(&two), &mut out[..])], &att, n) {
+                apply_group_multi(&mut [(Mat::of(&two), &mut out[..])], quant(&att, n, qd).view(), n);
+            }
         }
         convolve(&mut out, n, dm, &ly.attn_conv, None, ha);
         // a block's first layer starts a new stream; the one it leaves joins the blocks
@@ -824,13 +1222,31 @@ impl Ink {
         // by the scores alone over their sum, times the scale
         let mut choice: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
         {
+            // every token's sigmoid scores, CTRL_SPLIT runs of the experts a token (the same dot per expert, so the
+            // same bits), then the picks a token
+            let ne = h.n_expert;
+            let mut score = vec![0.0f32; n * ne];
+            {
+                let sp = SyncPtr::new(&mut score);
+                let per = ne.div_ceil(CTRL_SPLIT);
+                let xn = &xn;
+                each(n * CTRL_SPLIT, &|i| {
+                    let (t, s) = (i / CTRL_SPLIT, i % CTRL_SPLIT);
+                    let (e0, e1) = ((s * per).min(ne), ((s + 1) * per).min(ne));
+                    let xt = &xn[t * dm..(t + 1) * dm];
+                    // SAFETY: item i owns experts e0..e1 of token t's scores
+                    let st = unsafe { sp.slice(t * ne + e0, e1 - e0) };
+                    for (o, e) in st.iter_mut().zip(e0..e1) {
+                        *o = 1.0 / (1.0 + (-dot(&ly.router[e * dm..(e + 1) * dm], xt)).exp());
+                    }
+                });
+            }
             let cp = SyncPtr::new(&mut choice);
-            let xn = &xn;
+            let score = &score;
             each(n, &|t| {
-                let xt = &xn[t * dm..(t + 1) * dm];
-                let mut lg: Vec<(usize, f32, f32)> = (0..h.n_expert)
+                let mut lg: Vec<(usize, f32, f32)> = (0..ne)
                     .map(|e| {
-                        let p = 1.0 / (1.0 + (-dot(&ly.router[e * dm..(e + 1) * dm], xt)).exp());
+                        let p = score[t * ne + e];
                         (e, p + ly.pick_bias[e], p)
                     })
                     .collect();
@@ -841,6 +1257,7 @@ impl Ink {
                 unsafe { cp.slice(t, 1)[0] = lg.iter().map(|&(e, _, p)| (e, p / sum * h.w_scale)).collect() };
             });
         }
+        crate::npu::record(lw, &choice);
         lap.lap(6);
         let mut users: Vec<Vec<usize>> = vec![Vec::new(); h.n_expert];
         for (t, c) in choice.iter().enumerate() {
@@ -868,7 +1285,13 @@ impl Ink {
                 let mut jobs: Vec<(Mat, &mut [f32])> = Vec::with_capacity(2 * k);
                 for (i, part) in gu.chunks_mut(ffp).enumerate() {
                     let (pk, pack) = packs[i / 2];
-                    jobs.push((piece(pk, if i % 2 == 0 { &pack.gate } else { &pack.up }), part));
+                    let mut m = piece(pk, if i % 2 == 0 { &pack.gate } else { &pack.up });
+                    // only the expert's ff real rows: the converter pads gate and up to ffp rows of zeros, whose
+                    // outputs SITU never reads (each real row is the same dot product, so the same bits)
+                    let rb = m.data.len() / m.rows;
+                    m.data = &m.data[..ff * rb];
+                    m.rows = ff;
+                    jobs.push((m, part));
                 }
                 crate::moe::apply_group(&mut jobs, xq.view());
             }
@@ -898,8 +1321,86 @@ impl Ink {
                 ys[0].push((c.0, c.1, y[i * dm..(i + 1) * dm].to_vec()));
             }
         }
+        // the layer's hot experts with enough tokens go to the NPU (its graph, SITU in f32), started before the CPU
+        // takes the rest and collected after (TORC_NPU_HOT_MIN tokens at least; rows padded to 32s, at least 64)
+        let hot = if n > 1 && SITU_NPU.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::npu::hot(lw, n)
+        } else {
+            Vec::new()
+        };
+        let hot_min: usize = crate::switches::num("TORC_NPU_HOT_MIN").unwrap_or(1);
+        // (expert, NPU ids, first staging row, rows)
+        let mut on_npu: Vec<(usize, [i32; 3], usize, usize)> = Vec::new();
+        let mut hot_rows = 0;
+        for &(e, ids) in hot.iter().filter(|h| users[h.0].len() >= hot_min).take(64) {
+            let pad = users[e].len().div_ceil(32).max(2) * 32;
+            on_npu.push((e, ids, hot_rows, pad));
+            hot_rows += pad;
+        }
+        let mut hot_x = vec![0.0f32; hot_rows * dm];
+        let mut hot_y = vec![0.0f32; hot_rows * dm];
+        for &(e, _, r0, _) in &on_npu {
+            for (r, &t) in users[e].iter().enumerate() {
+                hot_x[(r0 + r) * dm..(r0 + r + 1) * dm].copy_from_slice(&xn[t * dm..(t + 1) * dm]);
+            }
+        }
+        let groups: Vec<crate::npu::Ffn> = on_npu
+            .iter()
+            .map(|&(_, ids, r0, pad)| crate::npu::Ffn {
+                ids,
+                x: hot_x[r0 * dm..].as_ptr(),
+                n: pad,
+                y: hot_y[r0 * dm..].as_mut_ptr(),
+            })
+            .collect();
+        // SAFETY: hot_x holds every group's rows (begin copies them in) and hot_y their outputs, untouched until
+        // finish below
+        let started = !groups.is_empty() && unsafe { crate::npu::begin_ffns(&groups, dm) };
+        let mut skip = vec![false; h.n_expert];
+        if started {
+            for &(e, ..) in &on_npu {
+                skip[e] = true;
+            }
+        }
+        // a block's experts (those not on the NPU) as one wave, as the shared MoE layer runs them (moe::run_ejobs):
+        // every expert's gate and up chunks in one sweep of the pool, then every token's SITU, then every down chunk,
+        // instead of an expert at a time with three fork-joins each. The same products and the same SITU, so the same
+        // bits.
+        // TORC_INK_WAVE=0 keeps an expert at a time.
+        let wave = n > 1 && !crate::switches::is("TORC_INK_WAVE", "0");
+        if wave {
+            let ids: Vec<u32> =
+                (0..h.n_expert).filter(|&e| !users[e].is_empty() && !skip[e]).map(|e| e as u32).collect();
+            if !ids.is_empty() {
+                let packs = self.w.experts_of(lw, ly.group, &ids)?;
+                let xq = quant(&xn, n, dm);
+                let mut jobs = Vec::with_capacity(ids.len());
+                let mut g0 = 0;
+                for (i, &e) in ids.iter().enumerate() {
+                    let (pk, pack) = packs[i];
+                    let toks = users[e as usize].clone();
+                    let k = toks.len();
+                    jobs.push(crate::moe::EJob { mats: crate::moe::mats_of(pk, pack), toks, g0 });
+                    g0 += k;
+                }
+                let mut dall = vec![0.0f32; g0 * dm];
+                let (beta, lb) = (h.situ_beta, h.situ_lb);
+                let situ = |gt: f32, ut: f32| {
+                    let act = beta * (gt / beta).tanh() * (1.0 / (1.0 + (-gt).exp()));
+                    act * if lb > 0.0 { lb * (ut / lb).tanh() } else { ut }
+                };
+                crate::moe::run_ejobs_with(false, situ, &jobs, xq.view(), dm / QK, dm, &mut dall);
+                for (j, &e) in jobs.iter().zip(&ids) {
+                    let e = e as usize;
+                    for (i, &t) in j.toks.iter().enumerate() {
+                        let wgt = choice[t].iter().find(|c| c.0 == e).map_or(0.0, |c| c.1);
+                        ys[t].push((e, wgt, dall[(j.g0 + i) * dm..(j.g0 + i + 1) * dm].to_vec()));
+                    }
+                }
+            }
+        }
         for (e, toks) in users.iter().enumerate() {
-            if toks.is_empty() || n == 1 {
+            if toks.is_empty() || n == 1 || skip[e] || wave {
                 continue;
             }
             let m = toks.len();
@@ -941,6 +1442,18 @@ impl Ink {
             for (i, &t) in toks.iter().enumerate() {
                 let wgt = choice[t].iter().find(|c| c.0 == e).map_or(0.0, |c| c.1);
                 ys[t].push((e, wgt, y[i * dm..(i + 1) * dm].to_vec()));
+            }
+        }
+        if started {
+            if crate::npu::finish() {
+                for &(e, _, r0, _) in &on_npu {
+                    for (r, &t) in users[e].iter().enumerate() {
+                        let wgt = choice[t].iter().find(|c| c.0 == e).map_or(0.0, |c| c.1);
+                        ys[t].push((e, wgt, hot_y[(r0 + r) * dm..(r0 + r + 1) * dm].to_vec()));
+                    }
+                }
+            } else {
+                return err("npu: the hot experts' graph failed");
             }
         }
         lap.lap(7);

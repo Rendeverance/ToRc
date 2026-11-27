@@ -65,8 +65,9 @@ struct Params {
     pad: [u32; 2],
 }
 
-/// A compiled kernel's shape: head dim, query heads per KV head, 16-bit cache, sinks, the indexer's picks.
-type Shape = (usize, usize, bool, bool, bool);
+/// A compiled kernel's shape: head dim, query heads per KV head, 16-bit cache, sinks, the indexer's picks, Inkling's
+/// extras (a sink a query and a bias by distance: run_block_ink).
+type Shape = (usize, usize, bool, bool, bool, bool);
 
 /// The kernel and its merge for one shape, and the shape's tokens per workgroup.
 struct Pipes {
@@ -106,8 +107,8 @@ impl Kern {
     fn of(s: Shape, nkv: usize, window: usize) -> Kern {
         static GENERIC: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| crate::switches::is("TORC_GPU_KERNEL", "generic"));
-        let (hd, g, k16, sink, qsa) = s;
-        let plain = window == 0 && !sink && !qsa;
+        let (hd, g, k16, sink, qsa, ink) = s;
+        let plain = window == 0 && !sink && !qsa && !ink;
         if *GENERIC {
             Kern::Generic
         } else if plain && hd == 256 && g == 8 && !k16 {
@@ -195,6 +196,10 @@ struct Io {
     /// the GPU tokens' pool flags and pool counts (qwen4exp)
     sel: Option<(wgpu::Buffer, u64)>,
     nv: Option<(wgpu::Buffer, u64)>,
+    /// Inkling: the GPU tokens' relative vectors and sinks, and the layer's bias table
+    rel: Option<(wgpu::Buffer, u64)>,
+    snq: Option<(wgpu::Buffer, u64)>,
+    relb: Option<(wgpu::Buffer, u64)>,
 }
 
 /// `slot`'s buffer, made again (a power of two in size) when smaller than `bytes`.
@@ -348,7 +353,7 @@ impl Gpu {
     /// kernel is its file as it is.
     fn kernel(&mut self, k: Kern, s: Shape) -> &Pipes {
         if !self.kerns.contains_key(&(k, s)) {
-            let (hd, g, k16, sink, qsa) = s;
+            let (hd, g, k16, sink, qsa, ink) = s;
             let kw = if k16 { hd / 2 } else { hd / 4 };
             // keys per value chunk: the largest power of two with vc x hd / 4 vec4s within sa's 512
             let vc = 1usize << (512 / (hd / 4)).ilog2();
@@ -365,7 +370,8 @@ impl Gpu {
                 Kern::Generic => {
                     let body = include_str!("gpu_attn.wgsl")
                         .replace("/*SINK*/", if sink { "" } else { "//" })
-                        .replace("/*QSA*/", if qsa { "" } else { "//" });
+                        .replace("/*QSA*/", if qsa { "" } else { "//" })
+                        .replace("/*INK*/", if ink { "" } else { "//" });
                     // rows laid out by the power of two at or above g (gpu_attn.wgsl says why)
                     let gp = g.next_power_of_two();
                     let src = format!(
@@ -401,13 +407,14 @@ impl Gpu {
     /// 0 means adapt switched the GPU off for it (too slow): it stays off.
     fn state(&mut self, at: Use) -> &mut Share {
         if !self.shares.contains_key(&at) {
-            let (k, (hd, g, k16, sink, qsa), windowed) = at;
+            let (k, (hd, g, k16, sink, qsa, ink), windowed) = at;
             let what = format!(
-                "{} {hd}x{g}{}{}{}{}",
+                "{} {hd}x{g}{}{}{}{}{}",
                 k.name(),
                 if k16 { " 16-bit" } else { "" },
                 if sink { " sinks" } else { "" },
                 if qsa { " picks" } else { "" },
+                if ink { " inkling" } else { "" },
                 if windowed { " window" } else { "" }
             );
             let key = format!("gpu_share_permille {} {what}", self.name);
@@ -578,23 +585,87 @@ pub fn run_block(
     pos0: usize,
     out: &mut [f32],
 ) -> Option<usize> {
+    // the CPU's part, tokens t0..t1 of the block (with their picks, qwen4exp)
+    let qsa = kv.qsa && kv.ix_npool > 0 && kv.nv.len() >= n && kv.sel.len() >= n * kv.ix_npool;
+    let mut cpu = |t0: usize, t1: usize, o: &mut [f32]| {
+        let sel = qsa.then(|| crate::fattn::Sel {
+            rows: &kv.sel[t0 * kv.ix_npool..],
+            nv: &kv.nv[t0..],
+            stride: kv.ix_npool,
+            kp: kv.ix_kp,
+        });
+        f.run_block(kv, &q[t0 * qd..], qd, t1 - t0, (pos0 + t0) as u32, o, sel.as_ref());
+    };
+    run_with(kv, f.shape(), f.sinks(), None, q, qd, n, pos0, out, &mut cpu)
+}
+
+/// Inkling's attention for the GPU (its own CPU attention, inkling.rs): each score also gets the query's distance bias
+/// (rel . relb[d] for d < 1024: rel the block's [n][nh][16], relb the layer's [1024][16]) less the query's sink (snq,
+/// [n][nh]), and the softmax a zero logit beside the keys. kv holds the pass's keys and values at 16 bits, as
+/// KvCache; `cpu(t0, t1, out)` runs tokens t0..t1 of the block on the CPU (the GPU's share is the first tokens).
+/// None, with nothing done, when the tier is off or does not take the block. Not bit-identical (fast mode).
+#[allow(clippy::too_many_arguments)]
+pub fn run_block_ink(
+    kv: &KvCache,
+    shape: (usize, usize, usize, f32, usize),
+    ink: &InkExtras,
+    q: &[f32],
+    qd: usize,
+    n: usize,
+    pos0: usize,
+    out: &mut [f32],
+    cpu: &mut dyn FnMut(usize, usize, &mut [f32]),
+) -> Option<usize> {
+    let zeros = vec![0f32; shape.0];
+    run_with(kv, shape, Some(&zeros), Some(ink), q, qd, n, pos0, out, cpu)
+}
+
+/// Inkling's extras for run_block_ink.
+pub struct InkExtras<'a> {
+    pub rel: &'a [f32],
+    pub relb: &'a [f32],
+    pub snq: &'a [f32],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with(
+    kv: &KvCache,
+    fshape: (usize, usize, usize, f32, usize),
+    sinks: Option<&[f32]>,
+    ink: Option<&InkExtras>,
+    q: &[f32],
+    qd: usize,
+    n: usize,
+    pos0: usize,
+    out: &mut [f32],
+    cpu: &mut dyn FnMut(usize, usize, &mut [f32]),
+) -> Option<usize> {
     let (min, from) = *LIMITS;
+    // Inkling's blocks go to the card from the first one unless TORC_GPU_FROM says otherwise (its short prompts gain
+    // from the card too, unlike the shared default of 4096 keys)
+    let from = if ink.is_some() && !crate::switches::given("TORC_GPU_FROM") { 0 } else { from };
     if n < min || pos0 + n < from || OFF.load(Ordering::Relaxed) {
         return None;
     }
     let g = gpu()?;
-    let (nh, nkv, hd, scale, window) = f.shape();
+    let (nh, nkv, hd, scale, window) = fshape;
     if hd % 64 != 0 || hd > 576 || nkv == 0 || nh % nkv != 0 || nh / nkv > 64 || qd != nh * hd || kv.cap == 0 {
         return None;
     }
+    // the card's kernels read int8 or sixteen-bit rows by position: an f32 cache or a ring (TORC_KV) stays on the CPU
+    if kv.fmt() == crate::attn::KvFmt::F32 || kv.ring {
+        return None;
+    }
     let k16 = !kv.k16.is_empty();
-    let sinks = f.sinks();
     // the indexer's picks for this block's tokens (qwen4exp), as attn.rs's select_of hands them to the CPU kernel
     let qsa = kv.qsa && kv.ix_npool > 0 && kv.nv.len() >= n && kv.sel.len() >= n * kv.ix_npool;
     if kv.qsa && !qsa {
         return None;
     }
-    let shape: Shape = (hd, nh / nkv, k16, sinks.is_some(), qsa);
+    if ink.is_some_and(|x| x.rel.len() < n * nh * 16 || x.snq.len() < n * nh || x.relb.len() != 1024 * 16) {
+        return None;
+    }
+    let shape: Shape = (hd, nh / nkv, k16, sinks.is_some(), qsa, ink.is_some());
     let kern = Kern::of(shape, nkv, window);
     let at: Use = (kern, shape, window > 0);
     let mut g = g.lock().unwrap();
@@ -686,6 +757,11 @@ pub fn run_block(
         grow(&g.dev, &mut g.io.sk, (nh * 4) as u64, st | U::COPY_DST);
         grow(&g.dev, &mut g.io.sel, (mmax * kv.ix_npool.max(1)).next_multiple_of(4) as u64, st | U::COPY_DST);
         grow(&g.dev, &mut g.io.nv, (mmax * 4) as u64, st | U::COPY_DST);
+        if ink.is_some() {
+            grow(&g.dev, &mut g.io.rel, (mmax * nh * 16 * 4) as u64, st | U::COPY_DST);
+            grow(&g.dev, &mut g.io.snq, (mmax * nh * 4) as u64, st | U::COPY_DST);
+            grow(&g.dev, &mut g.io.relb, (1024 * 16 * 4) as u64, st | U::COPY_DST);
+        }
         if let Some(e) = oom(scope) {
             turn_off(g, &format!("the GPU has no room for a block's work buffers: {e}"));
             return None;
@@ -700,6 +776,11 @@ pub fn run_block(
     if let Some(s) = sinks {
         g.queue.write_buffer(skb, 0, bytemuck::cast_slice(s));
     }
+    let inkb = ink.map(|x| {
+        let (rel, snq, relb) = (buf(&g.io.rel), buf(&g.io.snq), buf(&g.io.relb));
+        g.queue.write_buffer(relb, 0, bytemuck::cast_slice(x.relb));
+        (rel, snq, relb)
+    });
     let ly = &g.layers[&key];
     let pp = &g.kerns[&(kern, shape)];
     fn e(i: u32, b: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -716,6 +797,10 @@ pub fn run_block(
             rows.resize(rows.len().next_multiple_of(4), 0);
             g.queue.write_buffer(selb, 0, &rows);
             g.queue.write_buffer(nvb, 0, bytemuck::cast_slice(&kv.nv[a..b]));
+        }
+        if let (Some(x), Some((rel, snq, _))) = (ink, inkb) {
+            g.queue.write_buffer(rel, 0, bytemuck::cast_slice(&x.rel[a * nh * 16..b * nh * 16]));
+            g.queue.write_buffer(snq, 0, bytemuck::cast_slice(&x.snq[a * nh..b * nh]));
         }
         let pr = Params {
             n: mc as u32,
@@ -745,6 +830,11 @@ pub fn run_block(
         if qsa {
             me.push(e(10, selb));
             me.push(e(11, nvb));
+        }
+        if let Some((rel, snq, relb)) = inkb {
+            me.push(e(12, rel));
+            me.push(e(13, relb));
+            me.push(e(14, snq));
         }
         let bg = g.dev.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -783,16 +873,9 @@ pub fn run_block(
         g.queue.submit([enc.finish()]);
     }
     let t1 = std::time::Instant::now();
-    // the CPU's tokens while the GPU runs
+    // the CPU's tokens while the GPU runs (with their picks, qwen4exp: the caller's cpu)
     if m < n {
-        // the CPU's tokens keep their picks too (rows from token m on)
-        let sel = qsa.then(|| crate::fattn::Sel {
-            rows: &kv.sel[m * kv.ix_npool..],
-            nv: &kv.nv[m..],
-            stride: kv.ix_npool,
-            kp: kv.ix_kp,
-        });
-        f.run_block(kv, &q[m * qd..], qd, n - m, (pos0 + m) as u32, &mut out[m * qd..], sel.as_ref());
+        cpu(m, n, &mut out[m * qd..n * qd]);
     }
     let t2 = std::time::Instant::now();
     let sl = rb.slice(..bytes);
@@ -808,9 +891,7 @@ pub fn run_block(
     if read.is_none() {
         // the GPU failed partway (out of memory in a submission, a lost device): its tokens again on the CPU, so the
         // block is still right, and the tier off from here
-        let sel =
-            qsa.then(|| crate::fattn::Sel { rows: &kv.sel[..], nv: &kv.nv[..], stride: kv.ix_npool, kp: kv.ix_kp });
-        f.run_block(kv, q, qd, m, pos0 as u32, &mut out[..m * qd], sel.as_ref());
+        cpu(0, m, &mut out[..m * qd]);
         turn_off(&mut g, &fault.unwrap_or_else(|| "its result could not be read back".to_string()));
         return Some(hi);
     }
@@ -838,9 +919,7 @@ pub fn run_block(
     // TORC_GPU_CHECK=1: the GPU's tokens again on the CPU, and the largest difference (debugging the tier)
     if crate::switches::on("TORC_GPU_CHECK") {
         let mut c = vec![0f32; m * qd];
-        let sel =
-            qsa.then(|| crate::fattn::Sel { rows: &kv.sel[..], nv: &kv.nv[..], stride: kv.ix_npool, kp: kv.ix_kp });
-        f.run_block(kv, q, qd, m, pos0 as u32, &mut c, sel.as_ref());
+        cpu(0, m, &mut c);
         let (mut d, mut a) = (0f32, 0f32);
         for (x, y) in out[..m * qd].iter().zip(&c) {
             d = d.max((x - y).abs());

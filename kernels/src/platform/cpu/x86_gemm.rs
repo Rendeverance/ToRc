@@ -1,19 +1,19 @@
-//! x86_gemm.rs - packed GEMM for the 32-weight block types (Q4_0, Q8_0, MXFP4) against many vectors, with VNNI:
+//! x86_gemm.rs - packed GEMM for the 32-weight block types (Q4_0, Q8_0, MXFP4, IQ4_NL) against many vectors, with VNNI:
 //! AVX-VNNI, or AVX512-VNNI's form of the same instruction on 256-bit registers (x86mm::vnni).
 //!
-//! The weights of 8 rows are packed once per call into a panel: every 32-weight block of the 8 rows is
-//! transposed so that each dword lane of a register holds one row's four weights, unsigned (Q4_0 as its
-//! nibbles 0..15, Q8_0 plus 128, MXFP4 as its doubled level plus 12), beside the 8 rows' scales as floats. A
-//! register-blocked microkernel then computes 8 rows x MR vectors with its accumulators in registers: per
-//! block, eight `vpdpbusd` leave each row's integer sum in its own lane, the offset (8, 128 or 12 times the
-//! block's activation sum) is taken off, exactly, and one fused multiply-add puts the block on that row's
-//! float accumulator.
+//! The weights of 8 rows are packed once per call into a panel: every 32-weight block of the 8 rows is transposed so
+//! that each dword lane of a register holds one row's four weights, unsigned (Q4_0 as its nibbles 0..15, Q8_0 plus 128,
+//! MXFP4 as its doubled level plus 12, IQ4_NL as its level plus 128), beside the 8 rows' scales as floats. A
+//! register-blocked microkernel then computes 8 rows x MR vectors with its accumulators in registers: per block, eight
+//! `vpdpbusd` leave each row's integer sum in its own lane, the offset (8, 128, 12 or 128 times the block's activation
+//! sum) is taken off, exactly, and one fused multiply-add puts the block on that row's float accumulator.
 //!
 //! The float steps per row and vector are the scalar reference's (`q4_0_dot_scalar`): block position k (0..7)
 //! of every 256 has its own accumulator, acc_k = fma(d_w * d_x, isum, acc_k), blocks in order, and the eight
 //! are summed pairwise at the end, ((0+4) + (2+6)) + ((1+5) + (3+7)). The microkernel runs position k across
 //! all blocks before moving to k + 1, so it needs one accumulator per vector instead of eight. Every result has
-//! the same bits as the single-vector kernels (MXFP4's: x86mm's lanes_pass and neon::mxfp4_matmul).
+//! the same bits as the single-vector kernels (MXFP4's and IQ4_NL's: x86mm's lanes_pass, whose lane k is block
+//! position k with the same fma and the same fold).
 
 use crate::Groups32;
 use core::arch::x86_64::*;
@@ -23,10 +23,11 @@ const Q8_0_BYTES: usize = 34;
 /// Vectors a microkernel call holds in registers: 8 for the packed weights, MR accumulators, the rest scratch.
 const MR: usize = 4;
 
-/// The weight types (gemm's T): Q4_0, Q8_0, MXFP4.
+/// The weight types (gemm's T): Q4_0, Q8_0, MXFP4, IQ4_NL.
 const Q4_0: u8 = 0;
 const Q8_0: u8 = 1;
 const MXFP4: u8 = 2;
+const IQ4_NL: u8 = 3;
 
 /// One 32-weight block of a panel's 8 rows: w[j] lane r = weights 4j..4j+3 of row r (unsigned bytes), d lane
 /// r = row r's scale.
@@ -92,6 +93,23 @@ pub unsafe fn gemm_mxfp4(
     unsafe { run::<MXFP4>(w, row_bytes, rows, x, nv, y, y_stride) }
 }
 
+/// Rows of IQ4_NL (18-byte blocks: an fp16 scale and 32 four-bit indices into IQ4_LEVELS) against nv vectors, as
+/// [`gemm_q4_0`] (the Inkling and Flash Next experts' type).
+///
+/// # Safety
+/// As [`gemm_q4_0`].
+pub unsafe fn gemm_iq4_nl(
+    w: &[u8],
+    row_bytes: usize,
+    rows: usize,
+    x: &[Groups32],
+    nv: usize,
+    y: *mut f32,
+    y_stride: usize,
+) {
+    unsafe { run::<IQ4_NL>(w, row_bytes, rows, x, nv, y, y_stride) }
+}
+
 /// The thread's panel and offsets, then the product in the VNNI form the CPU has.
 unsafe fn run<const T: u8>(
     w: &[u8],
@@ -103,7 +121,7 @@ unsafe fn run<const T: u8>(
     y_stride: usize,
 ) {
     let bytes = match T {
-        Q4_0 => Q4_0_BYTES,
+        Q4_0 | IQ4_NL => Q4_0_BYTES,
         Q8_0 => Q8_0_BYTES,
         _ => crate::MXFP4_BLOCK,
     };
@@ -114,7 +132,7 @@ unsafe fn run<const T: u8>(
     // of the block's 32 activations (exact in i32)
     let times = match T {
         Q4_0 => 8,
-        Q8_0 => 128,
+        Q8_0 | IQ4_NL => 128,
         _ => 12,
     };
     OFFSETS.with_borrow_mut(|off| {
@@ -233,7 +251,7 @@ unsafe fn transpose8(r: &[__m256i; 8]) -> [__m256i; 8] {
 #[inline(always)]
 unsafe fn pack<const T: u8>(w: &[u8], row_bytes: usize, r0: usize, nb: usize, panel: &mut [PackedBlock]) {
     let bytes = match T {
-        Q4_0 => Q4_0_BYTES,
+        Q4_0 | IQ4_NL => Q4_0_BYTES,
         Q8_0 => Q8_0_BYTES,
         _ => crate::MXFP4_BLOCK,
     };
@@ -245,6 +263,8 @@ unsafe fn pack<const T: u8>(w: &[u8], row_bytes: usize, r0: usize, nb: usize, pa
             _mm256_broadcastsi128_si256(_mm_loadu_si128(crate::MXFP4_LEVELS.as_ptr().cast())),
             _mm256_set1_epi8(12),
         );
+        // IQ4_NL's levels plus 128 (1..241, unsigned), looked up by nibble
+        let lq = _mm256_add_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(crate::IQ4_LEVELS.as_ptr().cast())), sign);
         // the 32 weights' nibbles, weights 0-15 then 16-31, from the 16 bytes at p
         let nibbles = |p: *const u8| {
             let q = _mm_loadu_si128(p as *const __m128i);
@@ -263,6 +283,7 @@ unsafe fn pack<const T: u8>(w: &[u8], row_bytes: usize, r0: usize, nb: usize, pa
             let row = |r: usize| match T {
                 Q8_0 => _mm256_xor_si256(_mm256_loadu_si256(at(r).add(2) as *const __m256i), sign),
                 Q4_0 => nibbles(at(r).add(2)),
+                IQ4_NL => _mm256_shuffle_epi8(lq, nibbles(at(r).add(2))),
                 _ => _mm256_shuffle_epi8(lv, nibbles(at(r).add(1))),
             };
             pb.w = transpose8(&[row(0), row(1), row(2), row(3), row(4), row(5), row(6), row(7)]);

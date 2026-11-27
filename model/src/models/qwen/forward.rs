@@ -181,6 +181,11 @@ impl Model {
         crate::tune::set_reads_block();
         // the tiled attention path is this architecture's default on ARM (fattn::set_tile_default)
         crate::fattn::set_tile_default(h.arch == "qwen35moe");
+        // TORC_KV (the attention cache's format, attn::kv_switch): a bad value refuses the load, and deepseek2's latent
+        // attention (mla.rs) keeps its own
+        if crate::attn::kv_switch()?.is_some() && h.mla.is_some() {
+            return Err(format::Error("TORC_KV: not for multi-head latent attention (deepseek2)".into()));
+        }
         crate::pipe::set_shape(h.n_layer, h.d_model, h.hc);
         crate::pipe::set_ident(
             &w.file.header.model_id,
@@ -1893,4 +1898,51 @@ fn head_split_at(rows: usize) -> Option<usize> {
     let f = (*F)?;
     let r0 = (((rows as f64) * (1.0 - f)) as usize) / 64 * 64;
     (r0 > 0 && r0 < rows).then_some(r0)
+}
+
+/// The qwen engine as a pipeline worker (pipe.rs): its own methods, and its streams as the request's rows.
+impl crate::pipe::Worker for Model {
+    fn n_ctx(&self) -> usize {
+        Model::n_ctx(self)
+    }
+    fn res_len(&self, _l0: usize, n: usize) -> usize {
+        n * self.stream_width()
+    }
+    fn clear_states(&mut self) {
+        Model::clear_states(self)
+    }
+    fn clear_marks(&mut self) {
+        Model::clear_marks(self)
+    }
+    fn worker_mark(&mut self, op: u32, key: u64, l0: usize, npos: usize) -> Result<bool> {
+        Model::worker_mark(self, op, key, l0, npos)
+    }
+    fn head_rows(&self, xq: Q8s, r0: usize, r1: usize) -> Result<Vec<f32>> {
+        Model::head_rows(self, xq, r0, r1)
+    }
+    fn hc_back(
+        &mut self,
+        tokens: &[u32],
+        pos0: u32,
+        l0: usize,
+        res: Vec<f32>,
+        want: u32,
+        early: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Result<Vec<f32>> {
+        Model::hc_back(self, tokens, pos0, l0, res, want, early)
+    }
+    fn prof(&self) -> Option<Prof> {
+        Some(self.prof)
+    }
+    fn prof_reset(&mut self) {
+        self.prof = Default::default();
+    }
+    fn cache_stats(&self) -> Option<crate::ecache::Stats> {
+        self.w.cache.as_ref().map(|c| c.stats())
+    }
+    fn usage_flush(&self) {
+        if let Some(c) = &self.w.cache {
+            c.usage_flush();
+        }
+    }
 }

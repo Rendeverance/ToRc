@@ -27,6 +27,49 @@ don't fit are read from the SSDs as they are needed.
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | CPU + NPU | 70.8 / 19 | 74.3 / 17.3 | 83.5 / 17.3 | 62.2 / 16.1 | 68.6 / 16.1 | 53.6 / 15.6 |
 
+## Inkling 2 Mini (IQ4_NL)
+
+ggml-org's IQ4_NL file, converted with `torc convert-gguf`. Attention keeps an int8 cache (the default for Inkling,
+see `TORC_KV`), and the sliding-window layers keep only their window. Replies are 128 tokens at every length here,
+and the figures up to 4k are the average of two warm requests (single requests from 8k). llama.cpp was measured to
+8k only.
+
+**One Snapdragon X mini PC: X1-26-100 (8 Oryon cores), 32 GB, Hexagon NPU**
+
+| | short | 1k | 4k | 8k | 16k | 32k |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| CPU | 76.3 / 18.7 | 74.2 / 17.9 | 67.5 / 17.1 | 64.8 / 16.1 | 58.9 / 14.6 | 52.3 / 12.4 |
+| CPU + NPU | 89.2 / 18.4 | 83.2 / 17.6 | 75.4 / 16.9 | 75.4 / 16.1 | 66.6 / 14.4 | 57.8 / 12.3 |
+| llama.cpp (CPU) | 56.3 / 13.3 | 52.4 / 12.1 | 48.5 / 9.8 | 47.2 / 7.4 | - | - |
+
+**Two Snapdragon X mini PCs over USB4: the same, 32 GB each**
+
+| | short | 1k | 4k | 8k | 16k | 32k |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| CPU | 105.5 / 17.2 | 116.2 / 16.7 | 126.1 / 16.2 | 122.8 / 15.4 | 115.7 / 14.2 | 102.5 / 11.9 |
+| CPU + NPU | 119.5 / 16.8 | 124.9 / 17.0 | 134.8 / 15.9 | 138.7 / 15.4 | 123.3 / 13.9 | 108.4 / 12.0 |
+
+**Laptop: Ryzen 7 7840HS (8 cores), 32 GB DDR5-5600, Radeon 780M (integrated), RTX 4070 Laptop 8 GB**
+
+| | short | 1k | 4k | 8k | 16k | 32k |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| CPU | 61.5 / 11.6 | 59.5 / 11.4 | 55.3 / 11.2 | 55.1 / 10.9 | 52.2 / 10.4 | 46.7 / 9.2 |
+| CPU + GPU (Radeon 780M, integrated) | 58.3 / 11.3 | 59.4 / 11.4 | 59.2 / 11.1 | 57.1 / 10.4 | 53.6 / 10.1 | 50.0 / 9.1 |
+| llama.cpp (CPU) | 36.2 / 10.0 | 33.8 / 9.4 | 32.2 / 8.6 | 31.6 / 7.5 | - | - |
+
+The RTX 4070 measured slower than the CPU alone for Inkling's attention on this laptop, so ToRc switches it off.
+
+**Workstation: Core i9-13900K (8P + 16E), 96 GB DDR5-6000, ToRc at 8 threads**
+
+| | short | 1k | 4k | 8k | 16k | 32k |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| CPU | 80.9 / 15.8 | 81.8 / 15.5 | 76.7 / 15.1 | 75.0 / 14.7 | 71.1 / 13.9 | 65.5 / 12.1 |
+| CPU + GPU (Radeon AI PRO R9700*) | 78.9 / 15.7 | 81.1 / 15.5 | 80.3 / 15.1 | 81.0 / 14.5 | 80.1 / 13.8 | 79.0 / 12.3 |
+| llama.cpp (CPU, 8 threads: its best write) | 58.3 / 12.6 | 56.4 / 12.0 | 52.5 / 11.0 | 49.6 / 10.1 | - | - |
+| llama.cpp (CPU, 32 threads: its best read) | 80.2 / 10.3 | 79.8 / 9.7 | 73.8 / 9.0 | 69.1 / 8.6 | - | - |
+
+*The R9700 takes a share of attention only; the experts stay on the CPU.
+
 ## Qwen3.6-35B-A3B (Q4_0)
 
 **One Snapdragon X mini PC: X1-26-100 (8 Oryon cores), 32 GB, Hexagon NPU, Adreno X1-45**

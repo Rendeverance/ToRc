@@ -102,6 +102,8 @@ pub struct Npu {
     stage: Vec<f32>,
     /// the feed-forward's activation: GEGLU (gemma4) once set_geglu has found that the backend takes it, else SwiGLU
     geglu: bool,
+    /// Inkling's SITU instead (set_situ): beta x tanh(g / beta) x sigmoid(g) x lb x tanh(u / lb) (u alone when lb = 0)
+    situ: Option<(f32, f32)>,
     /// the helper that flushes a started graph to the DSP and waits for it, so the caller's thread is free in the
     /// meantime
     go: Option<mpsc::Sender<()>>,
@@ -166,6 +168,7 @@ impl Npu {
             busy: false,
             stage: Vec::new(),
             geglu: false,
+            situ: None,
             go: Some(go),
             done,
             helper: Some(helper),
@@ -375,6 +378,31 @@ impl Npu {
         ok
     }
 
+    /// The feed-forward groups' activation as Inkling's SITU with these constants. Returns false, leaving the
+    /// activation as it was, when the backend does not take tanh or mul.
+    pub fn set_situ(&mut self, beta: f32, lb: f32) -> bool {
+        let f = &self.g.f;
+        // room for the five objects below (a context too small for them aborts in ggml)
+        let c = self.g.meta_ctx(8, false);
+        if c.is_null() {
+            return false;
+        }
+        // SAFETY: a metadata context made here
+        let ok = unsafe {
+            let a = (f.ggml_new_tensor_2d)(c, ggml::F32, 768, 64);
+            let b = (f.ggml_new_tensor_2d)(c, ggml::F32, 768, 64);
+            let ok = (f.ggml_backend_supports_op)(self.g.be, (f.ggml_tanh)(c, a))
+                && (f.ggml_backend_supports_op)(self.g.be, (f.ggml_mul)(c, a, b))
+                && (f.ggml_backend_supports_op)(self.g.be, (f.ggml_add)(c, a, b));
+            (f.ggml_free)(c);
+            ok
+        };
+        if ok {
+            self.situ = Some((beta, lb));
+        }
+        ok
+    }
+
     /// Starts the groups as one graph, so the NPU works while the caller does; [`Npu::finish`] waits and writes the
     /// outputs. Returns false, with nothing started, when the graph cannot be made (the caller then computes on the
     /// CPU).
@@ -386,7 +414,8 @@ impl Npu {
         if self.busy || g.is_empty() {
             return false;
         }
-        let nodes: usize = g.iter().map(|x| 1 + x.n_mm + if x.ffn_y.is_null() { 0 } else { 4 }).sum();
+        let ffn_nodes = if self.situ.is_some() { 14 } else { 4 };
+        let nodes: usize = g.iter().map(|x| 1 + x.n_mm + if x.ffn_y.is_null() { 0 } else { ffn_nodes }).sum();
         if nodes > GRAPH {
             return false;
         }
@@ -427,8 +456,21 @@ impl Npu {
                 if !x.ffn_y.is_null() {
                     let gate = (f.ggml_mul_mat)(c, self.w[x.ffn[0] as usize].t, xt);
                     let up = (f.ggml_mul_mat)(c, self.w[x.ffn[1] as usize].t, xt);
-                    let h =
-                        if self.geglu { (f.ggml_geglu_split)(c, gate, up) } else { (f.ggml_swiglu_split)(c, gate, up) };
+                    let h = if let Some((beta, lb)) = self.situ {
+                        // SITU from tanh alone: sigmoid(g) = (1 + tanh(g / 2)) / 2, so with A = tanh(g / beta) x
+                        // tanh(u / lb) the activation is (beta lb / 2) (A + A tanh(g / 2)) (lb = 0: u in place of lb
+                        // tanh(u / lb), and beta / 2 outside)
+                        let tg = (f.ggml_tanh)(c, (f.ggml_scale)(c, gate, 1.0 / beta));
+                        let tu = if lb > 0.0 { (f.ggml_tanh)(c, (f.ggml_scale)(c, up, 1.0 / lb)) } else { up };
+                        let a = (f.ggml_mul)(c, tg, tu);
+                        let s = (f.ggml_tanh)(c, (f.ggml_scale)(c, gate, 0.5));
+                        let both = (f.ggml_add)(c, a, (f.ggml_mul)(c, a, s));
+                        (f.ggml_scale)(c, both, 0.5 * beta * if lb > 0.0 { lb } else { 1.0 })
+                    } else if self.geglu {
+                        (f.ggml_geglu_split)(c, gate, up)
+                    } else {
+                        (f.ggml_swiglu_split)(c, gate, up)
+                    };
                     let d = &self.w[x.ffn[2] as usize];
                     let y = (f.ggml_mul_mat)(c, d.t, h);
                     (f.ggml_set_output)(y);

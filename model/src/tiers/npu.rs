@@ -437,6 +437,10 @@ mod imp {
     pub fn set_geglu() -> bool {
         TIER.get().is_some_and(|t| t.lock().unwrap().npu.set_geglu(true))
     }
+
+    pub fn set_situ(beta: f32, lb: f32) -> bool {
+        TIER.get().is_some_and(|t| t.lock().unwrap().npu.set_situ(beta, lb))
+    }
 }
 
 #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), any(windows, target_os = "linux"))))]
@@ -468,6 +472,9 @@ mod imp {
         false
     }
     pub fn set_geglu() -> bool {
+        false
+    }
+    pub fn set_situ(_: f32, _: f32) -> bool {
         false
     }
 }
@@ -527,6 +534,12 @@ pub fn set_geglu() -> bool {
     let ok = imp::set_geglu();
     GEGLU.store(ok, std::sync::atomic::Ordering::Relaxed);
     ok
+}
+
+/// Inkling: the feed-forwards the NPU runs use SITU with these constants for the whole run. Returns false, keeping
+/// SwiGLU, when the tier is down or the NPU cannot do it (then no expert of Inkling's may go there).
+pub fn set_situ(beta: f32, lb: f32) -> bool {
+    imp::set_situ(beta, lb)
 }
 
 /// Whether [`set_geglu`] took effect.

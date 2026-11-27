@@ -109,8 +109,13 @@ pub fn dot_rows(ty: u32, w: &[u8], rb: usize, x: Q8s, y: &mut [f32]) {
         static IQ: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::arch::is_aarch64_feature_detected!("dotprod"));
         if ty == 20 && *IQ {
+            // TORC_IQ4_ROWS=4 (or 1): that many rows a pass instead of 2 (an experiment; every row keeps
+            // iq4nl_dot's steps, so the same bits)
+            static R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                crate::switches::num::<usize>("TORC_IQ4_ROWS").filter(|r| [1, 2, 4].contains(r)).unwrap_or(2)
+            });
             // SAFETY: FEAT_DotProd was checked above; the kernel asserts the slice sizes
-            return unsafe { kernels::neon::iq4nl_dot_rows(w, rb, y.len(), x.g, y, 2) };
+            return unsafe { kernels::neon::iq4nl_dot_rows(w, rb, y.len(), x.g, y, *R) };
         }
         // Q8_0: bit-identical to the reference (parity test), as are Q6_K and Q4_1 below
         static Q8: std::sync::LazyLock<bool> =
@@ -689,17 +694,24 @@ unsafe fn dot_multi_rows(
         return;
     }
     // Q8_0 the same way (the resident Q8_0 products: ssm_out, k, v and the shared expert), and MXFP4 (gpt-oss's
-    // experts) by the packed GEMM alone
+    // experts) and IQ4_NL (the Inkling and Flash Next experts) by the packed GEMM alone, with the same bits as
+    // x86mm's lanes_pass (parity test). IQ4_NL went through x86mm alone before, which reads a row's weights again for
+    // every 4 vectors, so a prompt's experts were bound by memory and gained nothing from more threads. TORC_GEMM_IQ4=0
+    // keeps x86mm
+    #[cfg(target_arch = "x86_64")]
+    static IQ4: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !crate::switches::is("TORC_GEMM_IQ4", "0"));
     #[cfg(target_arch = "x86_64")]
     {
         let vnni = kernels::x86mm::vnni();
         let packed = vnni > 0 && nv >= 2 && nv >= *PACKED_MIN;
-        if ty == 8 && (packed || vnni == 1 && nv >= 2) || ty == 39 && packed {
+        if ty == 8 && (packed || vnni == 1 && nv >= 2) || (ty == 39 || ty == 20 && *IQ4) && packed {
             let r8 = rows / 8 * 8;
             unsafe {
                 if r8 > 0 && packed {
                     if ty == 8 {
                         kernels::x86_gemm::gemm_q8_0(&w[..r8 * row_bytes], row_bytes, r8, x.g, nv, y, y_stride);
+                    } else if ty == 20 {
+                        kernels::x86_gemm::gemm_iq4_nl(&w[..r8 * row_bytes], row_bytes, r8, x.g, nv, y, y_stride);
                     } else {
                         kernels::x86_gemm::gemm_mxfp4(&w[..r8 * row_bytes], row_bytes, r8, x.g, nv, y, y_stride);
                     }
@@ -1810,6 +1822,20 @@ pub(crate) fn mats_of<'a>(pack: &'a [u8], shape: &format::Pack) -> [Mat<'a>; 3] 
 /// activations (quantised as ggml does when `hc` is set), then down, with each pair's output going into its row (g0 +
 /// i) of dall (dm wide).
 pub(crate) fn run_ejobs(hc: bool, gelu: bool, jobs: &[EJob], xq: Q8s, nb: usize, dm: usize, dall: &mut [f32]) {
+    run_ejobs_with(hc, |g, u| crate::act::glu(gelu, g, u), jobs, xq, nb, dm, dall)
+}
+
+/// run_ejobs with the hidden activation act(gate, up) of the caller's (Inkling's SITU); run_ejobs passes the GLU, so
+/// its callers make the same calls as before.
+pub(crate) fn run_ejobs_with<A: Fn(f32, f32) -> f32 + Sync>(
+    hc: bool,
+    act: A,
+    jobs: &[EJob],
+    xq: Q8s,
+    nb: usize,
+    dm: usize,
+    dall: &mut [f32],
+) {
     let mut np = 0;
     let p0: Vec<usize> = jobs
         .iter()
@@ -1909,7 +1935,7 @@ pub(crate) fn run_ejobs(hc: bool, gelu: bool, jobs: &[EJob], xq: Q8s, nb: usize,
                 (&gu[p * 2 * ffmax..p * 2 * ffmax + ff], &gu[p * 2 * ffmax + ffmax..p * 2 * ffmax + ffmax + ff]);
             let mut h = vec![0.0f32; fq];
             for r in 0..ff {
-                h[r] = crate::act::glu(gelu, gt[r], up[r]);
+                h[r] = act(gt[r], up[r]);
             }
             // SAFETY: pair p owns blocks hoff[p]..hoff[p + 1]
             let q = unsafe { hp.slice(hoff[p], fq / QK) };

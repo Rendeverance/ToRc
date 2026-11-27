@@ -868,7 +868,7 @@ fn x86_packed_gemm_matches() {
     }
     let mut rng = Rng(67);
     for (nb, rows) in [(2usize, 64usize), (8, 40)] {
-        for (ty, name) in [(2u32, "gemm_q4_0"), (8, "gemm_q8_0"), (39, "gemm_mxfp4")] {
+        for (ty, name) in [(2u32, "gemm_q4_0"), (8, "gemm_q8_0"), (39, "gemm_mxfp4"), (20, "gemm_iq4_nl")] {
             let (w, rb) = weights(&mut rng, ty, rows, nb);
             for nv in [1usize, 3, 4, 5, 8, 9, 17] {
                 let xq = quantized(&mut rng, nv, nb);
@@ -879,6 +879,7 @@ fn x86_packed_gemm_matches() {
                     match ty {
                         2 => kernels::x86_gemm::gemm_q4_0(&w[..r8 * rb], rb, r8, &xq.g, nv, y.as_mut_ptr(), rows),
                         8 => kernels::x86_gemm::gemm_q8_0(&w[..r8 * rb], rb, r8, &xq.g, nv, y.as_mut_ptr(), rows),
+                        20 => kernels::x86_gemm::gemm_iq4_nl(&w[..r8 * rb], rb, r8, &xq.g, nv, y.as_mut_ptr(), rows),
                         _ => kernels::x86_gemm::gemm_mxfp4(&w[..r8 * rb], rb, r8, &xq.g, nv, y.as_mut_ptr(), rows),
                     }
                 }

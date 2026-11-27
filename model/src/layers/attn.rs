@@ -60,13 +60,41 @@ impl AttnEngine {
     }
 }
 
+/// The number format of a cache's keys and values (KvCache::fmt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvFmt {
+    /// int8 with a scale a row (k, v): the Qwen family's and Gemma's
+    I8,
+    /// sixteen-bit integers with a scale a row (k16, v16): qwen4exp's
+    I16,
+    /// f32 as computed, scale 1 (k32, v32): Inkling's on the shared engine (TORC_KV)
+    F32,
+}
+
+/// TORC_KV: the cache format a model with a choice keeps (f32, 16 or 8), or None when unset (the model's own default).
+/// Inkling 2 (inkling.rs): its cache's format (default int8) on the shared engine (fattn.rs).
+pub fn kv_switch() -> Result<Option<KvFmt>> {
+    match crate::switches::get("TORC_KV").as_deref() {
+        None | Some("") => Ok(None),
+        Some("f32") => Ok(Some(KvFmt::F32)),
+        Some("16") => Ok(Some(KvFmt::I16)),
+        Some("8") => Ok(Some(KvFmt::I8)),
+        Some(o) => err(format!("TORC_KV={o}: f32, 16 or 8")),
+    }
+}
+
 /// One layer's cache: n_head_kv x n_ctx x head_dim bytes, with a scale per (KV head, position). For qwen4exp (kv_f16)
-/// the numbers are held at sixteen bits in k16 / v16 instead, and k and v are empty.
+/// the numbers are held at sixteen bits in k16 / v16 instead, and k and v are empty; in the f32 format (KvFmt::F32)
+/// in k32 / v32, with every scale 1. With `ring`, position p is kept at slot p % cap (a sliding-window layer that keeps
+/// only its last cap positions; fattn reads it so when the window and the block fit in cap).
 pub struct KvCache {
     pub k: Vec<i8>,
     pub v: Vec<i8>,
     pub k16: Vec<i16>,
     pub v16: Vec<i16>,
+    pub k32: Vec<f32>,
+    pub v32: Vec<f32>,
+    pub ring: bool,
     pub k_scale: Vec<f32>,
     pub v_scale: Vec<f32>,
     pub cap: usize,
@@ -85,11 +113,134 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    /// Positions 0..npos as bytes (for Model::layer_states): K and V (int8, or 16 bits for qwen4exp) head by head (the
-    /// two machines' caches may hold different contexts), their scales, then the whole indexer.
+    /// The keys' and values' number format.
+    pub fn fmt(&self) -> KvFmt {
+        if !self.k32.is_empty() {
+            KvFmt::F32
+        } else if !self.k16.is_empty() {
+            KvFmt::I16
+        } else {
+            KvFmt::I8
+        }
+    }
+
+    /// The row (within a head's cap rows) that position p is kept at.
+    #[inline(always)]
+    pub fn slot(&self, p: usize) -> usize {
+        if self.ring { p % self.cap } else { p }
+    }
+
+    /// Writes position `pos`'s key and value rows for KV head `h` (hd numbers each) in the cache's format: int8 and
+    /// sixteen bits with a scale a row (quant8 / quant16, as attn_fill_kv), f32 as they are with scale 1. Lowers
+    /// gpu_lo to pos.
+    pub fn put_row(&mut self, h: usize, pos: usize, hd: usize, k: &[f32], v: &[f32]) {
+        let r = h * self.cap + self.slot(pos);
+        let at = r * hd;
+        match self.fmt() {
+            KvFmt::F32 => {
+                self.k32[at..at + hd].copy_from_slice(&k[..hd]);
+                self.v32[at..at + hd].copy_from_slice(&v[..hd]);
+                (self.k_scale[r], self.v_scale[r]) = (1.0, 1.0);
+            }
+            KvFmt::I16 => {
+                self.k_scale[r] = quant16(&k[..hd], &mut self.k16[at..at + hd]);
+                self.v_scale[r] = quant16(&v[..hd], &mut self.v16[at..at + hd]);
+            }
+            KvFmt::I8 => {
+                self.k_scale[r] = quant8(&k[..hd], &mut self.k[at..at + hd]);
+                self.v_scale[r] = quant8(&v[..hd], &mut self.v[at..at + hd]);
+            }
+        }
+        self.gpu_lo = self.gpu_lo.min(pos);
+    }
+
+    /// The bytes of one row in put_row_bytes: hd numbers in the cache's format (f32: 4 bytes each, and no scale; int8
+    /// and sixteen bits: 1 or 2 bytes each, then the row's scale).
+    pub fn row_bytes(&self, hd: usize) -> usize {
+        match self.fmt() {
+            KvFmt::F32 => 4 * hd,
+            KvFmt::I16 => 2 * hd + 4,
+            KvFmt::I8 => hd + 4,
+        }
+    }
+
+    /// Appends position `pos`'s key row (values row when `v`) of KV head `h` as bytes (row_bytes of them, little
+    /// endian): a saved chat's rows of a cache that keeps only some positions (a ring).
+    pub fn put_row_bytes(&self, h: usize, pos: usize, hd: usize, v: bool, b: &mut Vec<u8>) {
+        let r = h * self.cap + self.slot(pos);
+        let at = r * hd;
+        match self.fmt() {
+            KvFmt::F32 => {
+                for x in &(if v { &self.v32 } else { &self.k32 })[at..at + hd] {
+                    b.extend(x.to_le_bytes());
+                }
+                return;
+            }
+            KvFmt::I16 => {
+                for x in &(if v { &self.v16 } else { &self.k16 })[at..at + hd] {
+                    b.extend(x.to_le_bytes());
+                }
+            }
+            KvFmt::I8 => b.extend((if v { &self.v } else { &self.k })[at..at + hd].iter().map(|&x| x as u8)),
+        }
+        b.extend((if v { self.v_scale[r] } else { self.k_scale[r] }).to_le_bytes());
+    }
+
+    /// Puts back a row put_row_bytes wrote, from the start of `b` (which holds at least row_bytes). Lowers gpu_lo.
+    pub fn set_row_bytes(&mut self, h: usize, pos: usize, hd: usize, v: bool, b: &[u8]) {
+        let r = h * self.cap + self.slot(pos);
+        let at = r * hd;
+        let n = match self.fmt() {
+            KvFmt::F32 => {
+                let d = if v { &mut self.v32 } else { &mut self.k32 };
+                for (x, c) in d[at..at + hd].iter_mut().zip(b.chunks_exact(4)) {
+                    *x = f32::from_le_bytes(c.try_into().unwrap());
+                }
+                if v {
+                    self.v_scale[r] = 1.0;
+                } else {
+                    self.k_scale[r] = 1.0;
+                }
+                self.gpu_lo = self.gpu_lo.min(pos);
+                return;
+            }
+            KvFmt::I16 => {
+                let d = if v { &mut self.v16 } else { &mut self.k16 };
+                for (x, c) in d[at..at + hd].iter_mut().zip(b.chunks_exact(2)) {
+                    *x = i16::from_le_bytes([c[0], c[1]]);
+                }
+                2 * hd
+            }
+            KvFmt::I8 => {
+                let d = if v { &mut self.v } else { &mut self.k };
+                for (x, &c) in d[at..at + hd].iter_mut().zip(b) {
+                    *x = c as i8;
+                }
+                hd
+            }
+        };
+        let s = f32::from_le_bytes(b[n..n + 4].try_into().unwrap());
+        if v {
+            self.v_scale[r] = s;
+        } else {
+            self.k_scale[r] = s;
+        }
+        self.gpu_lo = self.gpu_lo.min(pos);
+    }
+
+    /// Positions 0..npos as bytes (for Model::layer_states): K and V (int8, or 16 bits for qwen4exp, or f32) head by
+    /// head (the two machines' caches may hold different contexts), their scales, then the whole indexer.
     pub fn put_bytes(&self, hd: usize, npos: usize, b: &mut Vec<u8>) {
         let (nh, cap) = (self.k_scale.len() / self.cap.max(1), self.cap);
-        if self.k16.is_empty() {
+        if self.fmt() == KvFmt::F32 {
+            for x in [&self.k32, &self.v32] {
+                for h in 0..nh {
+                    for v in &x[h * cap * hd..(h * cap + npos) * hd] {
+                        b.extend(v.to_le_bytes());
+                    }
+                }
+            }
+        } else if self.k16.is_empty() {
             for x in [&self.k, &self.v] {
                 for h in 0..nh {
                     b.extend(x[h * cap * hd..(h * cap + npos) * hd].iter().map(|&v| v as u8));
@@ -146,7 +297,16 @@ impl KvCache {
             }
             Ok(r)
         };
-        if self.k16.is_empty() {
+        if self.fmt() == KvFmt::F32 {
+            for x in [&mut self.k32, &mut self.v32] {
+                for h in 0..nh {
+                    let r = need(npos * hd * 4)?;
+                    for (d, c) in x[h * cap * hd..(h * cap + npos) * hd].iter_mut().zip(r.chunks_exact(4)) {
+                        *d = f32::from_le_bytes(c.try_into().unwrap());
+                    }
+                }
+            }
+        } else if self.k16.is_empty() {
             for x in [&mut self.k, &mut self.v] {
                 for h in 0..nh {
                     let r = need(npos * hd)?;
@@ -202,20 +362,32 @@ impl KvCache {
         Ok(())
     }
 
+    /// The Qwen family's cache: int8, or sixteen bits for qwen4exp (and TORC_KV16), unless TORC_KV names a format
+    /// (the model's load refuses a bad TORC_KV first, through kv_switch).
     pub fn new(h: &Hparams, n_ctx: usize) -> KvCache {
-        Self::with(h.n_head_kv as usize, h.head_dim as usize, n_ctx, h.hc > 0 || h.kv16 || *KV16)
+        let dflt = if h.hc > 0 || h.kv16 || *KV16 { KvFmt::I16 } else { KvFmt::I8 };
+        let fmt = kv_switch().ok().flatten().unwrap_or(dflt);
+        Self::with_fmt(h.n_head_kv as usize, h.head_dim as usize, n_ctx, fmt)
     }
 
     /// A cache of any geometry: n_head_kv heads of head_dim and n_ctx positions, at sixteen bits when `kv_f16` is set.
     pub fn with(n_head_kv: usize, head_dim: usize, n_ctx: usize, kv_f16: bool) -> KvCache {
+        Self::with_fmt(n_head_kv, head_dim, n_ctx, if kv_f16 { KvFmt::I16 } else { KvFmt::I8 })
+    }
+
+    /// A cache of any geometry in any format (with ring off).
+    pub fn with_fmt(n_head_kv: usize, head_dim: usize, n_ctx: usize, fmt: KvFmt) -> KvCache {
         let n = n_head_kv * n_ctx;
         let len = n * head_dim;
-        let (l8, l16) = if kv_f16 { (0, len) } else { (len, 0) };
+        let pick = |f: KvFmt| if fmt == f { len } else { 0 };
         KvCache {
-            k: vec![0; l8],
-            v: vec![0; l8],
-            k16: vec![0; l16],
-            v16: vec![0; l16],
+            k: vec![0; pick(KvFmt::I8)],
+            v: vec![0; pick(KvFmt::I8)],
+            k16: vec![0; pick(KvFmt::I16)],
+            v16: vec![0; pick(KvFmt::I16)],
+            k32: vec![0.0; pick(KvFmt::F32)],
+            v32: vec![0.0; pick(KvFmt::F32)],
+            ring: false,
             k_scale: vec![0.0; n],
             v_scale: vec![0.0; n],
             cap: n_ctx,
@@ -492,9 +664,10 @@ pub fn attn_fill_kv(
     let tp = std::time::Instant::now();
     let half = (h.n_rot / 2) as usize;
     kv.gpu_lo = kv.gpu_lo.min(pos0 as usize);
-    let (cap, wide) = (kv.cap, !kv.k16.is_empty());
+    let (cap, fmt) = (kv.cap, kv.fmt());
     let (kp, vp) = (SyncPtr::new(&mut kv.k[..]), SyncPtr::new(&mut kv.v[..]));
     let (k16p, v16p) = (SyncPtr::new(&mut kv.k16[..]), SyncPtr::new(&mut kv.v16[..]));
+    let (k32p, v32p) = (SyncPtr::new(&mut kv.k32[..]), SyncPtr::new(&mut kv.v32[..]));
     let (ksp, vsp) = (SyncPtr::new(&mut kv.k_scale[..]), SyncPtr::new(&mut kv.v_scale[..]));
     let kkp = SyncPtr::new(&mut kk[..]);
     crate::pool::par_for(n.div_ceil(8), &|c| {
@@ -506,13 +679,15 @@ pub fn attn_fill_kv(
             unsafe {
                 let row = KvRow {
                     cap,
-                    wide,
+                    fmt,
                     pos: pos as usize,
                     hd,
                     k: &kp,
                     v: &vp,
                     k16: &k16p,
                     v16: &v16p,
+                    k32: &k32p,
+                    v32: &v32p,
                     k_scale: &ksp,
                     v_scale: &vsp,
                 };
@@ -548,9 +723,10 @@ fn attn_block_core(
     // and its cache row (position pos0 + t) is written by no other token, so the bits are those of the sequential loop
     let tp = std::time::Instant::now();
     kv.gpu_lo = kv.gpu_lo.min(pos0 as usize);
-    let (cap, wide) = (kv.cap, !kv.k16.is_empty());
+    let (cap, fmt) = (kv.cap, kv.fmt());
     let (kp, vp) = (SyncPtr::new(&mut kv.k[..]), SyncPtr::new(&mut kv.v[..]));
     let (k16p, v16p) = (SyncPtr::new(&mut kv.k16[..]), SyncPtr::new(&mut kv.v16[..]));
+    let (k32p, v32p) = (SyncPtr::new(&mut kv.k32[..]), SyncPtr::new(&mut kv.v32[..]));
     let (ksp, vsp) = (SyncPtr::new(&mut kv.k_scale[..]), SyncPtr::new(&mut kv.v_scale[..]));
     let (qp, gp, kkp) = (SyncPtr::new(&mut q[..]), SyncPtr::new(&mut gate[..]), SyncPtr::new(&mut kk[..]));
     crate::pool::par_for(n.div_ceil(8), &|c| {
@@ -563,13 +739,15 @@ fn attn_block_core(
             unsafe {
                 let row = KvRow {
                     cap,
-                    wide,
+                    fmt,
                     pos: pos as usize,
                     hd,
                     k: &kp,
                     v: &vp,
                     k16: &k16p,
                     v16: &v16p,
+                    k32: &k32p,
+                    v32: &v32p,
                     k_scale: &ksp,
                     v_scale: &vsp,
                 };
@@ -619,13 +797,15 @@ fn attn_block_core(
 /// A position's cache rows, written through the pool's shared pointers (attn_block_core).
 struct KvRow<'a> {
     cap: usize,
-    wide: bool,
+    fmt: KvFmt,
     pos: usize,
     hd: usize,
     k: &'a SyncPtr<i8>,
     v: &'a SyncPtr<i8>,
     k16: &'a SyncPtr<i16>,
     v16: &'a SyncPtr<i16>,
+    k32: &'a SyncPtr<f32>,
+    v32: &'a SyncPtr<f32>,
     k_scale: &'a SyncPtr<f32>,
     v_scale: &'a SyncPtr<f32>,
 }
@@ -689,12 +869,21 @@ unsafe fn kv_prep_row(h: &Hparams, ly: &AttnLayer, kv: &KvRow, cs: &[f32], sn: &
         let at = (hh * kv.cap + kv.pos) * kv.hd;
         let sc = hh * kv.cap + kv.pos;
         unsafe {
-            if !kv.wide {
-                *kv.k_scale.at(sc) = quant8(k, kv.k.slice(at, hd));
-                *kv.v_scale.at(sc) = quant8(&vv[hh * hd..(hh + 1) * hd], kv.v.slice(at, hd));
-            } else {
-                *kv.k_scale.at(sc) = quant16(k, kv.k16.slice(at, hd));
-                *kv.v_scale.at(sc) = quant16(&vv[hh * hd..(hh + 1) * hd], kv.v16.slice(at, hd));
+            match kv.fmt {
+                KvFmt::I8 => {
+                    *kv.k_scale.at(sc) = quant8(k, kv.k.slice(at, hd));
+                    *kv.v_scale.at(sc) = quant8(&vv[hh * hd..(hh + 1) * hd], kv.v.slice(at, hd));
+                }
+                KvFmt::I16 => {
+                    *kv.k_scale.at(sc) = quant16(k, kv.k16.slice(at, hd));
+                    *kv.v_scale.at(sc) = quant16(&vv[hh * hd..(hh + 1) * hd], kv.v16.slice(at, hd));
+                }
+                // TORC_KV=f32: the rows as they are, scale 1
+                KvFmt::F32 => {
+                    kv.k32.slice(at, hd).copy_from_slice(k);
+                    kv.v32.slice(at, hd).copy_from_slice(&vv[hh * hd..(hh + 1) * hd]);
+                    (*kv.k_scale.at(sc), *kv.v_scale.at(sc)) = (1.0, 1.0);
+                }
             }
         }
     }
@@ -730,15 +919,8 @@ fn attn_prep(
     for hh in 0..nkv {
         let k = &mut kk[hh * hd..(hh + 1) * hd];
         norm_rope(h, k, &ly.k_norm, n_rot, cs, sn);
-        let at = (hh * kv.cap + row) * hd;
-        let sc = hh * kv.cap + row;
-        if kv.k16.is_empty() {
-            kv.k_scale[sc] = quant8(k, &mut kv.k[at..at + hd]);
-            kv.v_scale[sc] = quant8(&vv[hh * hd..(hh + 1) * hd], &mut kv.v[at..at + hd]);
-        } else {
-            kv.k_scale[sc] = quant16(k, &mut kv.k16[at..at + hd]);
-            kv.v_scale[sc] = quant16(&vv[hh * hd..(hh + 1) * hd], &mut kv.v16[at..at + hd]);
-        }
+        // quant8 / quant16 (or the f32 rows, TORC_KV=f32) into the cache at its position, as kv_prep_row
+        kv.put_row(hh, row, hd, k, &vv[hh * hd..(hh + 1) * hd]);
     }
 }
 
@@ -1008,6 +1190,9 @@ mod kv_bytes_tests {
             v: if k16 { vec![] } else { (0..n).map(|i| (i % 241) as i8).collect() },
             k16: if k16 { (0..n).map(|i| (i % 30011) as i16).collect() } else { vec![] },
             v16: if k16 { (0..n).map(|i| (i % 30013) as i16 - 9000).collect() } else { vec![] },
+            k32: vec![],
+            v32: vec![],
+            ring: false,
             k_scale: (0..nh * cap).map(|i| i as f32 * 0.5).collect(),
             v_scale: (0..nh * cap).map(|i| i as f32 * 0.25).collect(),
             cap,

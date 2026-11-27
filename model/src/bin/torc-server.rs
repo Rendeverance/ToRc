@@ -1162,9 +1162,8 @@ fn main() {
         std::process::exit(2);
     }
     if a[1] == "--archs" {
-        // the list the app shows when it can't run a file: one family that runs is not announced yet
-        let shown: Vec<&str> = model::models::ARCHS.iter().copied().filter(|a| *a != "inkling2_loop").collect();
-        println!("{}", shown.join(" "));
+        // the list the app shows when it can't run a file
+        println!("{}", model::models::ARCHS.join(" "));
         return;
     }
     // --tokenize: the ids of a text, special tokens matched, with the model's BOS when it has one (for checking the
