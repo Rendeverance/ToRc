@@ -61,6 +61,44 @@ impl Engine {
         }
     }
 
+    /// After an error on the link to the pipeline worker: a new connection (the worker's states start from zero),
+    /// this machine's state from zero and no marks kept, then `toks` read again from position 0 with the last one's
+    /// logits into `last`. Up to 3 tries; on one machine nothing is retried (its errors are not the link's). The
+    /// bits do not depend on the blocks a sequence is read in, so the state is the one the error interrupted.
+    fn recover(&mut self, toks: &[u32], last: &mut [f32], e: format::Error) -> format::Result<()> {
+        if self.pipe.is_none() || toks.is_empty() {
+            return Err(e);
+        }
+        let mut err = e;
+        for tries in 1..=3 {
+            eprintln!(
+                "torc-server: {}; reconnecting, the {} tokens so far read again (try {tries} of 3)",
+                err.0,
+                toks.len()
+            );
+            self.marks.clear();
+            self.m.reset();
+            if let Some(pp) = self.pipe.as_mut() {
+                pp.forget_pending();
+            }
+            let r = crate::pipe::reconnect().and_then(|_| {
+                let mut p0 = 0;
+                while p0 < toks.len() {
+                    let p1 = (p0 + self.block).min(toks.len());
+                    let b = toks[p0..p1].to_vec();
+                    self.fwd(&b, p0 as u32, if p1 == toks.len() { Some(&mut *last) } else { None })?;
+                    p0 = p1;
+                }
+                Ok(())
+            });
+            match r {
+                Ok(()) => return Ok(()),
+                Err(e2) => err = e2,
+            }
+        }
+        Err(err)
+    }
+
     /// A block through the model (both machines when piped), with the last row's logits into `last` when given; a
     /// piped block without them does not wait for the worker.
     fn fwd(&mut self, toks: &[u32], pos: u32, last: Option<&mut [f32]>) -> format::Result<()> {
@@ -101,29 +139,48 @@ impl Serve for Engine {
         let tp = std::time::Instant::now();
         // the longest prefix already read, kept one token short so the last prompt token runs for its logits
         let keep = self.seen.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
-        let keep = self.rewind(keep)?;
-        self.seen = ids[..keep].to_vec();
         let mut last = vec![0.0f32; self.nv];
+        // a mark gone back to through a broken link: the whole prompt is read again from a new connection
+        let (keep, mut recovered) = match self.rewind(keep) {
+            Ok(k) => (k, false),
+            Err(e) => {
+                self.recover(&ids, &mut last, e)?;
+                (0, true)
+            }
+        };
+        self.seen = ids[..keep].to_vec();
         let mut p0 = keep;
-        while p0 < ids.len() {
+        while p0 < ids.len() && !recovered {
             let p1 = (p0 + self.block).min(ids.len());
             // only the last block's logits are needed (a piped earlier block does not wait for the worker)
             let ids_b = ids[p0..p1].to_vec();
-            self.fwd(&ids_b, p0 as u32, if p1 == ids.len() { Some(&mut last) } else { None })?;
+            if let Err(e) = self.fwd(&ids_b, p0 as u32, if p1 == ids.len() { Some(&mut last) } else { None }) {
+                self.recover(&ids, &mut last, e)?;
+                recovered = true;
+            }
             p0 = p1;
         }
+        // after a recovery the whole prompt was read again
+        let keep = if recovered { 0 } else { keep };
         let read = ids.len() - keep;
         let prompt_s = tp.elapsed().as_secs_f64();
         self.seen = ids.clone();
         if self.marks.len() == MARKS {
             self.marks.remove(0);
         }
-        // the worker keeps its half of the mark in a slot no other mark kept here uses
+        // the worker keeps its half of the mark in a slot no other mark kept here uses (a mark the broken link could
+        // not take is not kept: the state itself is read again, so the reply goes on)
         let slot = (0..MARKS).find(|k| self.marks.iter().all(|m| m.2 != *k)).unwrap_or(0);
-        if let Some(pp) = self.pipe.as_mut() {
-            pp.save(slot)?;
+        let saved = match self.pipe.as_mut().map(|pp| pp.save(slot)) {
+            Some(Err(e)) => {
+                self.recover(&ids, &mut last, e)?;
+                false
+            }
+            _ => true,
+        };
+        if saved {
+            self.marks.push((ids.len(), self.m.conv_state(), slot));
         }
-        self.marks.push((ids.len(), self.m.conv_state(), slot));
         let tg = std::time::Instant::now();
         let (mut pend, mut n_out, mut n_think) = (Vec::<u8>::new(), 0usize, 0usize);
         let mut finish = "length";
@@ -154,7 +211,12 @@ impl Serve for Engine {
             if n_out == max || pos + 1 >= self.ctx {
                 break;
             }
-            self.fwd(&[t], pos as u32, Some(&mut last))?;
+            if let Err(e) = self.fwd(&[t], pos as u32, Some(&mut last)) {
+                // the reply so far and t read again from a new connection; the reply goes on from there
+                let mut toks = self.seen.clone();
+                toks.push(t);
+                self.recover(&toks, &mut last, e)?;
+            }
             self.seen.push(t);
             pos += 1;
         }

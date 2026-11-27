@@ -45,6 +45,11 @@ impl Pipe {
         Ok(Some(Pipe { split, pending: 0, topk }))
     }
 
+    /// After a new connection (pipe::reconnect): the old one's unread replies are gone with it.
+    pub fn forget_pending(&mut self) {
+        self.pending = 0;
+    }
+
     fn drain(&mut self, s: &mut std::net::TcpStream) -> Result<()> {
         while self.pending > 0 {
             sp::recv(s, &mut [])?;
